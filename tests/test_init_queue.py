@@ -69,3 +69,36 @@ def test_refresh_records_injected_failing_outcome_and_later_ok_clears_it(tmp_pat
     st = core_mod.read_state(state_file)
     assert st["providers"]["anthropic"]["fetch"]["core"]["error"] is None
     assert st["providers"]["anthropic"]["fetch"]["core"]["last_ok_at"] == now + 60
+
+
+def test_live_fetch_path_classifies_none_unavailable_and_exception(tmp_path, monkeypatch):
+    """Real refresh() fetch branch (snapshots=None) with a stubbed core fetcher: None and
+    unavailable snapshots are failures, a raising fetcher is fetch_error, a snapshot is ok."""
+    import types
+    tmp_home = tmp_path / ".hermes"
+    plugin_mod, core_mod = _load_plugin(tmp_home, monkeypatch)
+    now = time.time()
+    good = types.SimpleNamespace(fetched_at=now, unavailable_reason=None, plan=None, details=[],
+                                 windows=[types.SimpleNamespace(label="Current week", used_percent=10.0, resets_at=None)])
+    results = {"anthropic": None, "openai-codex": good}
+    def fake_fetch(p):
+        r = results[p]
+        if isinstance(r, Exception):
+            raise r
+        return r
+    fake = types.ModuleType("agent.account_usage"); fake.fetch_account_usage = fake_fetch
+    monkeypatch.setitem(sys.modules, "agent", types.ModuleType("agent"))
+    monkeypatch.setitem(sys.modules, "agent.account_usage", fake)
+    state_file = tmp_home / "cache" / "quota-router" / "state.json"
+    fetch = lambda p: core_mod.read_state(state_file)["providers"][p]["fetch"]["core"]
+
+    plugin_mod.refresh()
+    assert fetch("anthropic")["error"]["kind"] == "no_data"
+    assert fetch("openai-codex")["error"] is None and fetch("openai-codex")["last_ok_at"]
+
+    results["anthropic"] = types.SimpleNamespace(unavailable_reason="not oauth", windows=[])
+    results["openai-codex"] = RuntimeError("boom")
+    plugin_mod.refresh()
+    assert fetch("anthropic")["error"]["kind"] == "unavailable"
+    assert fetch("openai-codex")["error"]["kind"] == "fetch_error"
+    assert "boom" in fetch("openai-codex")["error"]["message"]

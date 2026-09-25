@@ -95,7 +95,8 @@ test("chipSummary builds provider + scoped summary from v1 fixture", () => {
 	// codex weekly at 100% used -> 0% left
 	assert.match(summary, /C 0% left/);
 	// scoped Fable window at 0% used -> 100% remaining
-	assert.match(summary, /Fable 100%/);
+	assert.match(summary, /Fable 100% left/);
+	assert.doesNotMatch(summary, /week \(model\)/);
 });
 
 test("chipSummary handles empty/missing providers", () => {
@@ -105,10 +106,10 @@ test("chipSummary handles empty/missing providers", () => {
 });
 
 test("toneForMode maps mode to StatusDot tone", () => {
-	assert.equal(pure.toneForMode("normal"), "ok");
-	assert.equal(pure.toneForMode("shift"), "warning");
-	assert.equal(pure.toneForMode("internal"), "error");
-	assert.equal(pure.toneForMode("unknown"), "ok");
+	assert.equal(pure.toneForMode("normal"), "good");
+	assert.equal(pure.toneForMode("shift"), "warn");
+	assert.equal(pure.toneForMode("internal"), "bad");
+	assert.equal(pure.toneForMode("unknown"), "good");
 });
 
 test("v2 fixture payload is distinguishable by v field (version mismatch path)", () => {

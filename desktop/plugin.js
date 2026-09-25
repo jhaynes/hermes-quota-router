@@ -118,19 +118,19 @@ function chipSummary(payload) {
 			if (r == null) continue;
 			if (scopedBest == null || r < scopedBest) {
 				scopedBest = r;
-				scopedLabel = w.label || w.scope;
+				scopedLabel = w.scope || w.label;
 			}
 		}
 	}
-	if (scopedBest != null) parts.push(`${scopedLabel} ${scopedBest}%`);
+	if (scopedBest != null) parts.push(`${scopedLabel} ${scopedBest}% left`);
 	return parts.join(" · ");
 }
 
-/** Overall StatusDot tone for the payload's mode. */
+/** Overall StatusDot tone for the payload's mode (SDK StatusTone: good | muted | warn | bad). */
 function toneForMode(mode) {
-	if (mode === "shift") return "warning";
-	if (mode === "internal") return "error";
-	return "ok";
+	if (mode === "shift") return "warn";
+	if (mode === "internal") return "bad";
+	return "good";
 }
 
 // END PURE
@@ -224,7 +224,7 @@ function QuotaChip() {
 	if (isError) {
 		return jsx(Tip, {
 			label: error?.message || "quota-router error",
-			children: jsx(StatusDot, { tone: "error" }),
+			children: jsx(StatusDot, { tone: "bad" }),
 		});
 	}
 	if (!data || !data.providers) {

@@ -6,6 +6,7 @@ Host-level quota awareness for `anthropic` and `openai-codex`.
 - **Usage tiers:** `/usage` snapshots are sorted into ok, tight or exhausted, with hysteresis. Thresholds are 85/75 for tight and 97/90 for exhausted, with a 15-minute dwell. A window that resets within 30 minutes can't escalate a tier.
 - **Mode:** normal, shift (one provider constrained) or internal (both constrained).
 - **Alerts:** at 75% and 90%, once per window per reset cycle.
+- **Alert queue:** only `hermes quota-router refresh` (the cron path) **drains** and delivers pending alert/transition lines. A manual refresh (`/quota refresh`, `hermes quota-router status --refresh`) folds fresh usage in and enqueues any new lines, but leaves the queue for the next cron run to deliver — it no longer swallows them. Delivery is **at-most-once**: drained lines are removed from state immediately, so if the cron script's delivery step then fails, those lines are lost, not retried.
 - **Surfaces:** `hermes quota-router status [--refresh] | refresh | path`, `/quota [refresh]`.
 
 State lives at `<root HERMES_HOME>/cache/quota-router/state.json` and is shared by every profile on the host.

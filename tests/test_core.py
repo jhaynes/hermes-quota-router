@@ -302,6 +302,58 @@ def test_tier_unaffected_by_fetch_failure_with_stale_snapshot():
     assert st["providers"]["anthropic"]["tier"] == "ok"
 
 
+LIMITS = [
+    {"kind": "session", "percent": 27, "resets_at": "2026-09-26T01:20:00+00:00", "scope": None},
+    {"kind": "weekly_all", "percent": 34, "resets_at": "2026-10-01T10:00:00+00:00", "scope": None},
+    {"kind": "weekly_scoped", "percent": 92, "resets_at": "2026-10-01T10:00:00+00:00",
+     "scope": {"model": {"id": None, "display_name": "Fable"}, "surface": None}},
+    {"kind": "weekly_scoped", "percent": 5, "scope": {"model": {"display_name": "Fable"}}},  # dup, lower -> dropped
+    {"kind": "weekly_scoped", "percent": "x", "scope": {"model": {"display_name": "Bad"}}},  # non-numeric -> skipped
+    {"kind": "weekly_scoped", "percent": True, "scope": {"model": {"display_name": "Bool"}}},  # bool -> skipped
+    {"kind": "weekly_scoped", "percent": float("nan"), "scope": {"model": {"display_name": "NaN"}}},
+    {"kind": "weekly_scoped", "percent": 150, "scope": {"model": {"display_name": "Over"}}},  # clamp to 100
+    {"kind": "weekly_scoped", "percent": -5, "scope": {"model": {"display_name": "Under"}}},  # clamp to 0
+    {"kind": "weekly_scoped", "percent": 50, "scope": {"model": {"display_name": "Opus"}}},  # skip: core covers it
+    {"kind": "weekly_scoped", "percent": 50, "scope": {"model": {"display_name": "sonnet"}}},  # skip, case-insens
+    {"kind": "weekly_scoped", "percent": 10, "scope": {"model": {"display_name": ""}}},  # empty name -> skipped
+    {"kind": "weekly_scoped", "percent": 10, "scope": {}},  # no model -> skipped
+    "garbage",
+]
+
+
+def test_parse_scoped_limits_keeps_only_new_scoped_windows():
+    ws = core.parse_scoped_limits({"limits": LIMITS})
+    by_scope = {w["scope"]: w for w in ws}
+    assert by_scope["Fable"]["label"] == "Fable week (model)"
+    assert by_scope["Fable"]["used_percent"] == 92.0
+    assert isinstance(by_scope["Fable"]["resets_at"], float)
+    assert by_scope["Over"]["used_percent"] == 100.0
+    assert by_scope["Under"]["used_percent"] == 0.0
+    assert "Bad" not in by_scope and "Bool" not in by_scope and "NaN" not in by_scope
+    assert "Opus" not in by_scope and "sonnet" not in by_scope.keys()
+    assert not any(k.lower() == "opus" or k.lower() == "sonnet" for k in by_scope)
+    assert core.parse_scoped_limits({}) == [] and core.parse_scoped_limits(None) == []
+
+
+def test_scoped_windows_alert_but_do_not_move_tier_or_block():
+    st = core.empty_state()
+    s = snap(("Current week", 10.0, NOW + 3 * 24 * H))
+    s["windows"].append({"label": "Fable week (model)", "used_percent": 99.0,
+                         "resets_at": NOW + 3 * 24 * H, "scope": "Fable"})
+    lines = core.apply_refresh(st, {"anthropic": s}, NOW, CFG)
+    assert st["providers"]["anthropic"]["tier"] == "ok"
+    assert any("Fable week" in l and "≥90%" in l for l in lines)
+
+
+def test_percent_tier_and_block_until_exclude_scope_windows():
+    windows = [{"label": "Current week", "used": 10.0, "resets_at": NOW + 5 * H},
+               {"label": "Fable week (model)", "used": 100.0, "resets_at": NOW + 2 * H, "scope": "Fable"}]
+    assert core.percent_tier(windows, "ok", NOW, CFG) == "ok"
+    # The scoped 100% window (soonest reset) must be excluded; the only remaining window's
+    # reset time wins instead of the scoped one or the TTL fallback.
+    assert core.block_until(windows, NOW, CFG) == NOW + 5 * H
+
+
 def test_refresh_drain_interleave_never_loses_or_duplicates(tmp_path, monkeypatch):
     path = tmp_path / "cache" / "quota-router" / "state.json"
     results = {"drained": [], "errors": []}

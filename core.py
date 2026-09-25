@@ -148,7 +148,8 @@ def normalize_snapshot(snapshot: Any, now: float) -> dict:
         if used is None:
             continue
         windows.append({"label": str(wget("label") or "?"), "used": float(used),
-                        "resets_at": _epoch(wget("resets_at", None) or wget("reset_at", None))})
+                        "resets_at": _epoch(wget("resets_at", None) or wget("reset_at", None)),
+                        "scope": wget("scope", None)})
     details = [str(d) for d in (get("details") or ())]
     return {"fetched_at": _epoch(get("fetched_at")) or now, "windows": windows,
             "unavailable": get("unavailable_reason"), "plan": get("plan"), "details": details}
@@ -157,7 +158,11 @@ def normalize_snapshot(snapshot: Any, now: float) -> dict:
 # ── policy ─────────────────────────────────────────────────────────────────────
 
 def percent_tier(windows: Iterable[dict], current: str, now: float, cfg: dict) -> str:
-    """Tier implied by usage percentages alone, with enter/leave hysteresis per level."""
+    """Tier implied by usage percentages alone, with enter/leave hysteresis per level.
+
+    Model-scoped windows (``scope`` set) are display+alert only and never feed the tier.
+    """
+    windows = [w for w in windows if not w.get("scope")]
     escalating = [w for w in windows
                   if not (w.get("resets_at") and w["resets_at"] - now < cfg["ignore_reset_within_s"])]
     all_windows = list(windows)
@@ -201,7 +206,11 @@ def compute_mode(tiers: dict) -> str:
 
 
 def block_until(windows: list, observed_at: float, cfg: dict) -> float:
-    """Reset time of the most-used window at/after the block, else observed_at + block_ttl_s."""
+    """Reset time of the most-used window at/after the block, else observed_at + block_ttl_s.
+
+    Model-scoped windows are excluded: a scoped 100% window must not set the wrong block expiry.
+    """
+    windows = [w for w in windows if not w.get("scope")]
     future = [w for w in windows if w.get("resets_at") and w["resets_at"] > observed_at]
     if future:
         top = max(future, key=lambda w: w["used"])
@@ -309,6 +318,110 @@ def record_error(state: dict, *, provider: str, status_code: Any, reason: Any, m
     return None if had else f"quota-router: observed hard quota block on {provider} until {datetime.fromtimestamp(until):%a %H:%M}"
 
 
+# Adapted from rarf/hermes-quota-plugin quota_providers/builtin.py (MIT, © Ronald Reis et al.)
+_SKIP_SCOPE_NAMES = {"opus", "sonnet"}
+
+
+def parse_scoped_limits(payload: Any) -> list[dict]:
+    """Extract Anthropic model-scoped weekly windows from a raw ``/api/oauth/usage`` payload.
+
+    Only ``kind == "weekly_scoped"`` entries with a non-empty ``scope.model.display_name`` are
+    kept. Entries named ``opus``/``sonnet`` (case-insensitive) are skipped: core already reports
+    those and they feed the tier. ``percent`` must be a real, finite, non-bool number; it is
+    clamped to 0..100 rather than rejected out of range. Duplicate names keep the highest percent.
+    ``resets_at`` is normalized to an epoch float (or ``None``). Returned dicts never change the
+    tier: readers must filter on ``scope`` themselves (``percent_tier``, ``block_until``).
+    """
+    if not isinstance(payload, dict):
+        return []
+    limits = payload.get("limits")
+    if not isinstance(limits, list):
+        return []
+    best: dict[str, dict] = {}
+    for entry in limits:
+        if not isinstance(entry, dict) or entry.get("kind") != "weekly_scoped":
+            continue
+        scope = entry.get("scope")
+        model = (scope or {}).get("model") if isinstance(scope, dict) else None
+        name = (model or {}).get("display_name") if isinstance(model, dict) else None
+        if not isinstance(name, str) or not name.strip():
+            continue
+        name = name.strip()
+        if name.lower() in _SKIP_SCOPE_NAMES:
+            continue
+        pct = entry.get("percent")
+        if isinstance(pct, bool) or not isinstance(pct, (int, float)):
+            continue
+        pct = float(pct)
+        if pct != pct or pct in (float("inf"), float("-inf")):  # NaN / inf
+            continue
+        pct = max(0.0, min(100.0, pct))
+        existing = best.get(name)
+        if existing is not None and existing["used_percent"] >= pct:
+            continue
+        best[name] = {"label": f"{name} week (model)", "used_percent": pct,
+                      "resets_at": _epoch(entry.get("resets_at")), "scope": name}
+    return list(best.values())
+
+
+_SECRET_PATTERNS = None
+
+
+def scrub(text: str) -> str:
+    """Redact bearer tokens / API keys that might leak into an error message."""
+    import re
+    global _SECRET_PATTERNS
+    if _SECRET_PATTERNS is None:
+        _SECRET_PATTERNS = [re.compile(p) for p in
+                            (r"Bearer\s+\S+", r"sk-ant-\S+", r"oat\w*-\S+")]
+    for pat in _SECRET_PATTERNS:
+        text = pat.sub("[redacted]", text)
+    return text
+
+
+def is_stale(snapshot: Optional[dict], now: float, cfg: dict) -> bool:
+    if not snapshot:
+        return True
+    age = now - float(snapshot.get("fetched_at") or 0)
+    return age > cfg["stale_after_s"]
+
+
+def status_payload(state: dict, now: float, cfg: dict, host: str) -> dict:
+    """Machine-readable status for the desktop widget: see the plan's JSON contract."""
+    providers = {}
+    for p in WATCHED:
+        ps = state["providers"].get(p) or {}
+        snap = ps.get("snapshot") or {}
+        fetch = ps.get("fetch") or {}
+        core_fetch = fetch.get("core") or {}
+        scoped_fetch = fetch.get("scoped") or {}
+        windows = [{"label": w["label"], "used": w["used"], "resets_at": w.get("resets_at"),
+                   "scope": w.get("scope"), "affects_tier": not w.get("scope")}
+                  for w in (snap.get("windows") or [])]
+        block = state["blocks"].get(p)
+        block_out = {"until": block["until"], "message": block.get("message", "")[:200]} \
+            if active_block(block, now) else None
+        providers[p] = {
+            "tier": ps.get("tier", "ok"),
+            "fetched_at": snap.get("fetched_at"),
+            "stale": is_stale(snap, now, cfg) if snap else True,
+            "plan": snap.get("plan"),
+            "windows": windows,
+            "block": block_out,
+            "fetch": {"core": {"last_ok_at": core_fetch.get("last_ok_at"),
+                               "error": core_fetch.get("error")},
+                     "scoped": {"last_ok_at": scoped_fetch.get("last_ok_at"),
+                               "error": scoped_fetch.get("error")}},
+            "details": snap.get("details") or [],
+        }
+    errs = [{"at": e["at"], "provider": e["provider"], "status": e.get("status"),
+            "reason": e.get("reason"), "message": e.get("message", "")[:200]}
+           for e in (state.get("errors") or [])[-5:]]
+    return {"v": 1, "host": host, "now": now, "mode": state.get("mode", "normal"),
+           "mode_since": state.get("mode_since"), "providers": providers,
+           "recent_errors": errs, "pending_count": len(state.get("pending") or [])}
+
+
 def note_fetch(state: dict, provider: str, *, slot: str = "core", ok: bool, kind: Optional[str] = None,
                message: str = "", now: float, cfg: dict) -> None:
     """Record a fetch outcome for ``provider``/``slot`` (``'core'`` or ``'scoped'``).
@@ -330,10 +443,11 @@ def note_fetch(state: dict, provider: str, *, slot: str = "core", ok: bool, kind
             queue(state, f"quota-router: {provider} usage fetch recovered")
         return
     since = (fslot.get("error") or {}).get("since", now)
-    fslot["error"] = {"since": since, "at": now, "kind": kind, "message": (message or "")[:200]}
+    message = scrub(message or "")
+    fslot["error"] = {"since": since, "at": now, "kind": kind, "message": message[:200]}
     if slot == "core" and not fslot.get("alerted") and now - since >= cfg["stale_after_s"]:
         mins = int((now - since) // 60)
-        queue(state, f"quota-router: {provider} usage unavailable for {mins}m+ ({kind}: {(message or '')[:80]})")
+        queue(state, f"quota-router: {provider} usage unavailable for {mins}m+ ({kind}: {message[:80]})")
         fslot["alerted"] = True
 
 
@@ -356,12 +470,20 @@ def render_status(state: dict, now: float, cfg: dict) -> str:
         ps = state["providers"].get(p) or {}
         snap = ps.get("snapshot") or {}
         age = now - float(snap.get("fetched_at") or 0) if snap else None
-        stale = age is None or age > cfg["stale_after_s"]
+        stale = is_stale(snap, now, cfg) if snap else True
         out.append(f"{p}: tier={ps.get('tier', 'ok')}"
                    + (f"  snapshot {int(age // 60)}m old{' (STALE — ignored)' if stale else ''}" if age is not None else "  no snapshot"))
-        for w in snap.get("windows") or []:
+        core_windows = [w for w in (snap.get("windows") or []) if not w.get("scope")]
+        scoped_windows = [w for w in (snap.get("windows") or []) if w.get("scope")]
+        for w in core_windows:
             reset = datetime.fromtimestamp(w["resets_at"]).strftime("%a %H:%M") if w.get("resets_at") else "?"
             out.append(f"    {w['label']:<16} {w['used']:5.1f}%  resets {reset}")
+        if scoped_windows:
+            out.append("    model limits:")
+            for w in scoped_windows:
+                reset = datetime.fromtimestamp(w["resets_at"]).strftime("%a %H:%M") if w.get("resets_at") else "?"
+                stale_tag = " (stale)" if w.get("stale") else ""
+                out.append(f"        {w['label']:<24} {w['used']:5.1f}%  resets {reset}{stale_tag}")
         for d in snap.get("details") or []:
             out.append(f"    {d}")
         b = state["blocks"].get(p)

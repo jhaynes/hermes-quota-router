@@ -383,3 +383,14 @@ def test_refresh_drain_interleave_never_loses_or_duplicates(tmp_path, monkeypatc
     delivered, left = alerts(results["drained"]), alerts(final["pending"])
     assert not (delivered & left)                      # nothing both delivered and still queued
     assert len(delivered | left) == 30                 # one ≥75% alert per thread's window, none lost
+
+
+def test_scoped_stale_flag_survives_to_status_and_json():
+    st = core.empty_state()
+    s = snap(("Current week", 10.0, NOW + 3 * 24 * H))
+    s["windows"].append({"label": "Fable week (model)", "used_percent": 40.0, "resets_at": NOW + 3 * 24 * H,
+                         "scope": "Fable", "stale": True})
+    core.apply_refresh(st, {"anthropic": s}, NOW, CFG)
+    w = [w for w in core.status_payload(st, NOW, CFG, "h")["providers"]["anthropic"]["windows"] if w["scope"]][0]
+    assert w["stale"] is True and w["affects_tier"] is False
+    assert "(stale)" in core.render_status(st, NOW, CFG)

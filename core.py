@@ -149,7 +149,8 @@ def normalize_snapshot(snapshot: Any, now: float) -> dict:
             continue
         windows.append({"label": str(wget("label") or "?"), "used": float(used),
                         "resets_at": _epoch(wget("resets_at", None) or wget("reset_at", None)),
-                        "scope": wget("scope", None)})
+                        "scope": wget("scope", None),
+                        **({"stale": True} if wget("stale", False) else {})})
     details = [str(d) for d in (get("details") or ())]
     return {"fetched_at": _epoch(get("fetched_at")) or now, "windows": windows,
             "unavailable": get("unavailable_reason"), "plan": get("plan"), "details": details}
@@ -396,7 +397,8 @@ def status_payload(state: dict, now: float, cfg: dict, host: str) -> dict:
         core_fetch = fetch.get("core") or {}
         scoped_fetch = fetch.get("scoped") or {}
         windows = [{"label": w["label"], "used": w["used"], "resets_at": w.get("resets_at"),
-                   "scope": w.get("scope"), "affects_tier": not w.get("scope")}
+                   "scope": w.get("scope"), "affects_tier": not w.get("scope"),
+                   "stale": bool(w.get("stale"))}
                   for w in (snap.get("windows") or [])]
         block = state["blocks"].get(p)
         block_out = {"until": block["until"], "message": block.get("message", "")[:200]} \

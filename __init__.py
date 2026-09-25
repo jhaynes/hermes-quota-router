@@ -121,8 +121,12 @@ def refresh(now: float | None = None, snapshots: dict | None = None, drain: bool
             if reason:
                 outcomes[p] = (False, "unavailable", str(reason))
                 continue
-            if snap is not None:
-                snapshots[p] = snap
+            if snap is None:
+                # Core's fetch_account_usage swallows every exception and also returns None when no
+                # credential resolves, so None is a failed fetch, never a success.
+                outcomes[p] = (False, "no_data", "usage fetch returned nothing (fetch error or no credential)")
+                continue
+            snapshots[p] = snap
             outcomes[p] = (True, None, "")
     elif outcomes is None:
         outcomes = {p: (True, None, "") for p in snapshots}

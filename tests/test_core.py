@@ -238,4 +238,7 @@ def test_refresh_drain_interleave_never_loses_or_duplicates(tmp_path, monkeypatc
     assert not results["errors"]
     assert len(results["drained"]) == len(set(results["drained"]))
     final = json.loads(path.read_text())
-    assert isinstance(final["pending"], list)
+    alerts = lambda ls: {l for l in ls if l.startswith("⚠️")}
+    delivered, left = alerts(results["drained"]), alerts(final["pending"])
+    assert not (delivered & left)                      # nothing both delivered and still queued
+    assert len(delivered | left) == 30                 # one ≥75% alert per thread's window, none lost

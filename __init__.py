@@ -21,6 +21,7 @@ What it deliberately does NOT do
 from __future__ import annotations
 
 import importlib.util
+import json
 import logging
 import sys
 import time
@@ -102,6 +103,58 @@ def _on_api_success(provider=None, **_kw):
 
 # ── refresh / status ───────────────────────────────────────────────────────────
 
+SCOPED_THROTTLE_S = 300
+
+
+def _anthropic_headers(token: str) -> dict:
+    """Headers for the Anthropic ``/api/oauth/usage`` GET — must match core's
+    ``agent/account_usage.py:595-598`` exactly."""
+    return {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "anthropic-beta": "oauth-2025-04-20",
+        "User-Agent": "claude-code/2.1.0",
+    }
+
+
+def _fetch_anthropic_scoped():
+    """Fetch and parse Anthropic model-scoped weekly limits, or ``None`` to skip (no token /
+    non-OAuth). Raises on a real fetch failure — callers record ``scoped_error`` and continue.
+    Never logs the token or the raw payload.
+    """
+    import urllib.request
+    from agent.anthropic_credentials import resolve_anthropic_token, _is_oauth_token
+    token = resolve_anthropic_token()
+    if not token or not _is_oauth_token(token):
+        return None
+    core = _core()
+    req = urllib.request.Request("https://api.anthropic.com/api/oauth/usage",
+                                 headers=_anthropic_headers(token), method="GET")
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        payload = json.loads(resp.read().decode("utf-8"))
+    return core.parse_scoped_limits(payload)
+
+
+def _fetch_anthropic_scoped_outcome():
+    """(ok, kind, message, windows|None). Wraps the credential import so an import failure maps
+    to a display-only ``scoped_error: {kind: 'import'}`` instead of crashing refresh()."""
+    try:
+        windows = _fetch_anthropic_scoped()
+    except ImportError as exc:
+        return False, "import", f"{type(exc).__name__}: {exc}", None
+    except Exception as exc:
+        return False, "scoped_error", f"{type(exc).__name__}: {str(exc)[:200]}", None
+    if windows is None:
+        return True, None, "", None  # skipped: no token / not OAuth, not an error
+    return True, None, "", windows
+
+
+def _snap_dict(core, snap, now):
+    """Normalize a core snapshot (object or dict or None) to the plain dict shape."""
+    return core.normalize_snapshot(snap, now)
+
+
 def refresh(now: float | None = None, snapshots: dict | None = None, drain: bool = False,
             outcomes: dict | None = None) -> list[str]:
     core = _core()
@@ -130,10 +183,73 @@ def refresh(now: float | None = None, snapshots: dict | None = None, drain: bool
             outcomes[p] = (True, None, "")
     elif outcomes is None:
         outcomes = {p: (True, None, "") for p in snapshots}
+
     cfg = _cfg()
+    core_anthropic_ok = outcomes.get("anthropic", (False, None, ""))[0] and "anthropic" in snapshots
+    scoped_windows = None
+    scoped_outcome = None
+    if core_anthropic_ok:
+        prior = core.read_state(core.state_path())
+        pstate = prior["providers"].get("anthropic") or {}
+        last_scoped_fetch = ((pstate.get("fetch") or {}).get("scoped") or {}).get("scoped_fetched_at")
+        throttled = last_scoped_fetch is not None and now - last_scoped_fetch < SCOPED_THROTTLE_S
+        if not throttled:
+            ok, kind, message, windows = _fetch_anthropic_scoped_outcome()
+            scoped_outcome = (ok, kind, message)
+            if ok and windows is not None:
+                scoped_windows = windows
+
     with core.locked_state(core.state_path()) as st:
         for p, (ok, kind, message) in outcomes.items():
             core.note_fetch(st, p, ok=ok, kind=kind, message=message, now=now, cfg=cfg)
+        if core_anthropic_ok:
+            pstate = st["providers"].setdefault("anthropic", {"tier": "ok", "tier_since": now})
+            fetch = pstate.setdefault("fetch", {})
+            scoped_slot = fetch.setdefault("scoped", {"last_ok_at": None, "error": None, "alerted": False})
+            if scoped_outcome is not None:
+                ok, kind, message = scoped_outcome
+                core.note_fetch(st, "anthropic", slot="scoped", ok=ok, kind=kind, message=message,
+                                now=now, cfg=cfg)
+                scoped_slot["scoped_fetched_at"] = now
+                if scoped_windows is not None:
+                    scoped_slot["scoped_windows"] = scoped_windows
+                    scoped_slot["scoped_windows_fetched_at"] = now
+            # Merge fresh-or-carried scoped windows into the anthropic snapshot, dropping any
+            # that are older than stale_after_s.
+            carried = scoped_slot.get("scoped_windows") or []
+            carried_age = now - float(scoped_slot.get("scoped_windows_fetched_at") or 0)
+            if carried and carried_age <= cfg["stale_after_s"]:
+                extra = [dict(w, stale=carried_age > 0 and scoped_windows is None) for w in carried]
+                snap = snapshots.get("anthropic")
+
+                def _wget(w, k, d=None):
+                    return w.get(k, d) if isinstance(w, dict) else getattr(w, k, d)
+
+                if snap is not None:
+                    raw_windows = list((snap.get("windows") if isinstance(snap, dict) else snap.windows) or [])
+                else:
+                    raw_windows = []
+                names = {_wget(w, "scope") for w in raw_windows}
+                extra = [w for w in extra if w.get("scope") not in names]
+                if isinstance(snap, dict):
+                    snap = dict(snap)
+                    snap["windows"] = raw_windows + extra
+                    snapshots["anthropic"] = snap
+                elif snap is not None:
+                    import types as _types
+                    extra_ns = [_types.SimpleNamespace(**w) for w in extra]
+                    snapshots["anthropic"] = _types.SimpleNamespace(
+                        fetched_at=getattr(snap, "fetched_at", now),
+                        unavailable_reason=getattr(snap, "unavailable_reason", None),
+                        plan=getattr(snap, "plan", None),
+                        details=list(getattr(snap, "details", None) or []),
+                        windows=raw_windows + extra_ns,
+                    )
+                else:
+                    snapshots["anthropic"] = {
+                        "fetched_at": now, "unavailable_reason": None, "plan": None,
+                        "details": [], "windows": extra,
+                    }
         core.apply_refresh(st, snapshots, now, cfg)
         return core.drain_pending(st) if drain else []
 
@@ -145,10 +261,22 @@ def status_text(fetch: bool = False) -> str:
     return core.render_status(core.read_state(core.state_path()), time.time(), _cfg())
 
 
+def status_json_line(fetch: bool = False) -> str:
+    """Build the ``QRJSON <payload>`` line for ``status --json``. Never drains the queue."""
+    core = _core()
+    if fetch:
+        refresh(drain=False)
+    import socket
+    now = time.time()
+    payload = core.status_payload(core.read_state(core.state_path()), now, _cfg(), socket.gethostname())
+    return "QRJSON " + json.dumps(payload)
+
+
 def _cli_setup(sub):
     sp = sub.add_subparsers(dest="qr_cmd")
     s = sp.add_parser("status", help="Show quota state (add --refresh to fetch live usage first)")
     s.add_argument("--refresh", action="store_true")
+    s.add_argument("--json", action="store_true", help="Print one QRJSON <payload> line for the desktop widget")
     sp.add_parser("refresh", help="Fetch live usage; print only new alerts/transitions (cron-friendly)")
     sp.add_parser("path", help="Print the host-level state file path")
 
@@ -161,6 +289,9 @@ def _cli_handler(args):
         return 0
     if cmd == "path":
         print(_core().state_path())
+        return 0
+    if getattr(args, "json", False):
+        print(status_json_line(fetch=getattr(args, "refresh", False)))
         return 0
     print(status_text(fetch=getattr(args, "refresh", False)))
     return 0

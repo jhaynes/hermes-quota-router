@@ -102,22 +102,34 @@ def _on_api_success(provider=None, **_kw):
 
 # ── refresh / status ───────────────────────────────────────────────────────────
 
-def refresh(now: float | None = None, snapshots: dict | None = None, drain: bool = False) -> list[str]:
+def refresh(now: float | None = None, snapshots: dict | None = None, drain: bool = False,
+            outcomes: dict | None = None) -> list[str]:
     core = _core()
     now = time.time() if now is None else now
     if snapshots is None:
         from agent.account_usage import fetch_account_usage
         snapshots = {}
+        outcomes = {}
         for p in core.WATCHED:
             try:
                 snap = fetch_account_usage(p)
             except Exception as exc:
                 logger.warning("quota-router: usage fetch for %s failed: %s", p, exc)
-                snap = None
-            if snap is not None and not getattr(snap, "unavailable_reason", None):
+                outcomes[p] = (False, "fetch_error", f"{type(exc).__name__}: {exc}")
+                continue
+            reason = snap is not None and getattr(snap, "unavailable_reason", None)
+            if reason:
+                outcomes[p] = (False, "unavailable", str(reason))
+                continue
+            if snap is not None:
                 snapshots[p] = snap
+            outcomes[p] = (True, None, "")
+    elif outcomes is None:
+        outcomes = {p: (True, None, "") for p in snapshots}
     cfg = _cfg()
     with core.locked_state(core.state_path()) as st:
+        for p, (ok, kind, message) in outcomes.items():
+            core.note_fetch(st, p, ok=ok, kind=kind, message=message, now=now, cfg=cfg)
         core.apply_refresh(st, snapshots, now, cfg)
         return core.drain_pending(st) if drain else []
 

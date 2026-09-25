@@ -52,3 +52,20 @@ def test_refresh_drain_true_returns_alert_and_drain_false_leaves_queue(tmp_path,
     after = core_mod.read_state(state_file)["pending"]
     # No new ≥75% alert re-fires in the same reset cycle, and nothing already queued is lost.
     assert after == before
+
+
+def test_refresh_records_injected_failing_outcome_and_later_ok_clears_it(tmp_path, monkeypatch):
+    tmp_home = tmp_path / ".hermes"
+    plugin_mod, core_mod = _load_plugin(tmp_home, monkeypatch)
+    now = 1_800_000_000.0
+
+    plugin_mod.refresh(now=now, snapshots={}, outcomes={
+        "anthropic": (False, "fetch_error", "boom")}, drain=False)
+    state_file = tmp_home / "cache" / "quota-router" / "state.json"
+    st = core_mod.read_state(state_file)
+    assert st["providers"]["anthropic"]["fetch"]["core"]["error"]["kind"] == "fetch_error"
+
+    plugin_mod.refresh(now=now + 60, snapshots={}, outcomes={"anthropic": (True, None, "")}, drain=False)
+    st = core_mod.read_state(state_file)
+    assert st["providers"]["anthropic"]["fetch"]["core"]["error"] is None
+    assert st["providers"]["anthropic"]["fetch"]["core"]["last_ok_at"] == now + 60

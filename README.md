@@ -1,0 +1,37 @@
+# quota-router
+
+Host-level quota awareness for `anthropic` and `openai-codex`.
+
+- **Observed blocks:** `api_request_error` records a hard quota error, and the next successful request from that provider clears it (`post_api_request`).
+- **Usage tiers:** `/usage` snapshots are sorted into ok, tight or exhausted, with hysteresis. Thresholds are 85/75 for tight and 97/90 for exhausted, with a 15-minute dwell. A window that resets within 30 minutes can't escalate a tier.
+- **Mode:** normal, shift (one provider constrained) or internal (both constrained).
+- **Alerts:** at 75% and 90%, once per window per reset cycle.
+- **Surfaces:** `hermes quota-router status [--refresh] | refresh | path`, `/quota [refresh]`.
+
+State lives at `<root HERMES_HOME>/cache/quota-router/state.json` and is shared by every profile on the host.
+
+## Deliberately out of scope
+
+- **Error classification override.** Hermes already switches to fallback immediately on rate-limit and billing errors when the credential pool can't rotate (`agent/turn_recovery.py::route_classified_error`).
+- **Routing before a session starts.** There is no hook for it yet. Actual routing comes from the `fallback_providers` chains in root and worker profiles. Routing before start needs an upstream `resolve_session_route`-style hook (not yet proposed).
+
+## Install on a host
+
+```
+hermes plugins install jhaynes/hermes-quota-router --enable
+# optional: share with named profiles (one host-level state file either way)
+for p in <profiles>; do mkdir -p ~/.hermes/profiles/$p/plugins; ln -sfn ~/.hermes/plugins/<installed-dir> ~/.hermes/profiles/$p/plugins/quota-router; hermes -p $p plugins enable quota-router; done
+cp scripts/quota-router-refresh.py ~/.hermes/scripts/
+hermes cron create "every 15m" --name "Quota router: usage refresh + alerts" --script quota-router-refresh.py --no-agent --deliver local
+```
+
+## Tests
+
+```
+~/.hermes/hermes-agent/venv/bin/python -m pytest -q -p no:cacheprovider tests/   # policy
+~/.hermes/hermes-agent/venv/bin/python tests/e2e_live.py                          # real hooks + real anthropic call; restores state
+```
+
+## Rollback
+
+`hermes plugins disable quota-router` (root and each profile), `hermes cron remove <id>`, then delete `cache/quota-router/`.

@@ -157,3 +157,85 @@ def test_corrupt_state_file_recovers(tmp_path):
     path = tmp_path / "state.json"
     path.write_text("{not json")
     assert core.read_state(path)["mode"] == "normal"
+
+
+def test_old_state_file_without_pending_still_loads(tmp_path):
+    path = tmp_path / "state.json"
+    old = core.empty_state()
+    old.pop("pending")
+    path.write_text(json.dumps(old))
+    st = core.read_state(path)
+    assert st["pending"] == []
+
+
+def test_manual_refresh_does_not_swallow_alerts():
+    st = core.empty_state()
+    core.apply_refresh(st, {"anthropic": snap(("Current week", 80.0, NOW + 3 * 24 * H))}, NOW, CFG)
+    assert any("≥75%" in l for l in st["pending"])
+    drained = core.drain_pending(st)
+    assert any("≥75%" in l for l in drained) and st["pending"] == []
+    core.apply_refresh(st, {"anthropic": snap(("Current week", 81.0, NOW + 3 * 24 * H))}, NOW + 60, CFG)
+    assert not any("≥75%" in l for l in st["pending"])
+
+
+def test_pending_is_bounded():
+    st = core.empty_state()
+    for i in range(80):
+        core.queue(st, f"line {i}")
+    assert len(st["pending"]) == 50 and st["pending"][-1] == "quota-router: line 79"
+
+
+def test_queue_prefixes_non_deliverable_lines():
+    st = core.empty_state()
+    core.queue(st, "hello")
+    assert st["pending"] == ["quota-router: hello"]
+
+
+def test_queue_dedupes_pending_lines():
+    st = core.empty_state()
+    core.queue(st, "⚠️ same", "⚠️ same")
+    core.queue(st, "⚠️ same")
+    assert st["pending"] == ["⚠️ same"]
+
+
+def test_queue_ignores_empty_lines():
+    st = core.empty_state()
+    core.queue(st, "", None, "quota-router: ok")
+    assert st["pending"] == ["quota-router: ok"]
+
+
+def test_queue_evicts_non_alert_lines_before_alert_lines():
+    st = core.empty_state()
+    core.queue(st, "⚠️ alert 0")
+    for i in range(1, 60):
+        core.queue(st, f"quota-router: transition {i}")
+    assert "⚠️ alert 0" in st["pending"]
+    assert len(st["pending"]) == 50
+
+
+def test_refresh_drain_interleave_never_loses_or_duplicates(tmp_path, monkeypatch):
+    path = tmp_path / "cache" / "quota-router" / "state.json"
+    results = {"drained": [], "errors": []}
+    lock = threading.Lock()
+
+    def do_refresh(i, drain):
+        try:
+            with core.locked_state(path) as st:
+                lines = core.apply_refresh(
+                    st, {"anthropic": snap((f"w{i}", 76.0 + (i % 5), NOW + (100 + i) * H))},
+                    NOW + i, CFG)
+                if drain:
+                    drained = core.drain_pending(st)
+                    with lock:
+                        results["drained"].extend(drained)
+        except Exception as exc:  # pragma: no cover - surfaced via assertion
+            with lock:
+                results["errors"].append(exc)
+
+    ts = [threading.Thread(target=do_refresh, args=(i, i % 2 == 0)) for i in range(30)]
+    [t.start() for t in ts]
+    [t.join() for t in ts]
+    assert not results["errors"]
+    assert len(results["drained"]) == len(set(results["drained"]))
+    final = json.loads(path.read_text())
+    assert isinstance(final["pending"], list)

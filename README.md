@@ -51,6 +51,32 @@ hermes cron create "every 15m" --name "Quota router: usage refresh + alerts" --s
 ~/.hermes/hermes-agent/venv/bin/python tests/e2e_live.py                          # real hooks + real anthropic call; restores state
 ```
 
+## Desktop widget
+
+The desktop half of this package (`desktop/plugin.js`) ships alongside the
+Python plugin but stays **off by default** — enable it in **Settings →
+Plugins** after installing, then run **⌘K → Reload desktop plugins** if it
+doesn't appear within a few seconds.
+
+Once enabled it adds:
+
+- **Status-bar chip** — lowest remaining % for each configured provider
+  (`A 55% left · C 0% left`), plus the lowest remaining scoped/model window
+  if one exists (`· Fable 100%`). The dot tone follows the router's mode
+  (normal/shift/internal). Hover for a full breakdown of every window, any
+  active block, and fetch errors; click to open the Quota pane/route.
+- **Quota pane** (right dock) and **`/quota` route** — one card per
+  provider: tier badge, a bar per usage window with remaining % and reset
+  countdown, a "Model limits" section for scoped windows, a block banner
+  and fetch-error line when present, and a footer showing host, fetch
+  time, snapshot age, and the 120s poll cadence, with a manual Refresh
+  button.
+
+Requires the backend `hermes quota-router status --json` (≥0.2.0) on the
+same host; an outdated or missing backend surfaces as an in-widget error
+with a `hermes plugins enable quota-router` hint rather than failing
+silently.
+
 ## Rollback
 
 `hermes plugins disable quota-router` (root and each profile), `hermes cron remove <id>`, then delete `cache/quota-router/`.

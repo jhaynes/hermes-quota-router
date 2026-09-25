@@ -1,0 +1,71 @@
+{
+  "v": 1,
+  "host": "mac-mini",
+  "now": 1758830000,
+  "mode": "shift",
+  "mode_since": 1758820000,
+  "providers": {
+    "anthropic": {
+      "tier": "tight",
+      "fetched_at": 1758829990,
+      "stale": false,
+      "plan": "Max 20x",
+      "windows": [
+        {
+          "label": "5h session",
+          "used": 45,
+          "resets_at": 1758833600,
+          "scope": null,
+          "affects_tier": true
+        },
+        {
+          "label": "weekly",
+          "used": 15,
+          "resets_at": 1759420000,
+          "scope": null,
+          "affects_tier": true
+        },
+        {
+          "label": "Fable",
+          "used": 0,
+          "resets_at": 1759420000,
+          "scope": "fable",
+          "affects_tier": false,
+          "stale": false
+        }
+      ],
+      "block": null,
+      "fetch": {
+        "core": { "last_ok_at": 1758829990, "error": null },
+        "scoped": {
+          "last_ok_at": 1758820000,
+          "error": { "since": 1758825000, "at": 1758829000, "kind": "timeout", "message": "scoped fetch timed out" }
+        }
+      },
+      "details": []
+    },
+    "openai-codex": {
+      "tier": "exhausted",
+      "fetched_at": 1758829995,
+      "stale": true,
+      "plan": "Pro",
+      "windows": [
+        {
+          "label": "weekly",
+          "used": 100,
+          "resets_at": null,
+          "scope": null,
+          "affects_tier": true
+        }
+      ],
+      "block": { "until": 1759000000, "message": "Codex weekly limit reached" },
+      "fetch": {
+        "core": { "last_ok_at": 1758829995, "error": null },
+        "scoped": { "last_ok_at": null, "error": null }
+      },
+      "details": ["banked reset pending"]
+    }
+  },
+  "recent_errors": ["scoped fetch timed out for anthropic"],
+  "pending_count": 3
+}

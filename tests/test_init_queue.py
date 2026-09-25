@@ -10,29 +10,29 @@ from pathlib import Path
 _root = Path(__file__).resolve().parents[1]
 
 
-def _load_plugin(tmp_home):
+def _load_plugin(tmp_home, monkeypatch):
     """Load a fresh copy of __init__.py + core.py, isolated from any cached module and
     pointed at a tmp HERMES_HOME so state never touches the real file."""
     core_spec = importlib.util.spec_from_file_location("qr_core_initcase", _root / "core.py")
     core_mod = importlib.util.module_from_spec(core_spec)
-    sys.modules["qr_core_initcase"] = core_mod
+    monkeypatch.setitem(sys.modules, "qr_core_initcase", core_mod)
     core_spec.loader.exec_module(core_mod)
 
     plugin_spec = importlib.util.spec_from_file_location("qr_plugin_initcase", _root / "__init__.py")
     plugin_mod = importlib.util.module_from_spec(plugin_spec)
-    sys.modules["qr_plugin_initcase"] = plugin_mod
+    monkeypatch.setitem(sys.modules, "qr_plugin_initcase", plugin_mod)
     plugin_spec.loader.exec_module(plugin_mod)
 
     # Force the plugin's lazily-imported core module to our tmp-bound instance, and pin
     # state_path()/root_home() to the tmp home regardless of the real environment.
-    sys.modules["quota_router_core"] = core_mod
+    monkeypatch.setitem(sys.modules, "quota_router_core", core_mod)
     core_mod.state_path = lambda hermes_home=None: tmp_home / "cache" / "quota-router" / "state.json"
     return plugin_mod, core_mod
 
 
 def test_refresh_drain_true_returns_alert_and_drain_false_leaves_queue(tmp_path, monkeypatch):
     tmp_home = tmp_path / ".hermes"
-    plugin_mod, core_mod = _load_plugin(tmp_home)
+    plugin_mod, core_mod = _load_plugin(tmp_home, monkeypatch)
     now = 1_800_000_000.0
     snap = {"fetched_at": now, "windows": [
         {"label": "Current week", "used_percent": 80.0, "resets_at": now + 3 * 24 * 3600}]}
@@ -51,4 +51,4 @@ def test_refresh_drain_true_returns_alert_and_drain_false_leaves_queue(tmp_path,
     assert empty_drain == []
     after = core_mod.read_state(state_file)["pending"]
     # No new ≥75% alert re-fires in the same reset cycle, and nothing already queued is lost.
-    assert set(before).issubset(set(after)) or after == before
+    assert after == before

@@ -50,9 +50,43 @@ def state_path(hermes_home: Optional[str | Path] = None) -> Path:
     return root_home(hermes_home) / "cache" / "quota-router" / "state.json"
 
 
+PENDING_CAP = 50
+
+
 def empty_state() -> dict:
     return {"version": 1, "providers": {}, "mode": "normal", "mode_since": 0.0, "alerts_sent": {},
-            "transitions": [], "blocks": {}, "errors": []}
+            "transitions": [], "blocks": {}, "errors": [], "pending": []}
+
+
+def _is_deliverable(line: str) -> bool:
+    return line.startswith("⚠️") or line.startswith("quota-router:")
+
+
+def queue(state: dict, *lines: str) -> None:
+    """Append deliverable lines to ``state['pending']``: enforce a deliverable prefix, dedupe
+    already-pending lines, and cap at ``PENDING_CAP`` evicting oldest non-alert lines first."""
+    pending = list(state.get("pending") or [])
+    for line in lines:
+        if not line:
+            continue
+        if not _is_deliverable(line):
+            line = f"quota-router: {line}"
+        if line in pending:
+            continue
+        pending.append(line)
+    while len(pending) > PENDING_CAP:
+        for i, line in enumerate(pending):
+            if not line.startswith("⚠️"):
+                pending.pop(i)
+                break
+        else:
+            pending.pop(0)
+    state["pending"] = pending
+
+
+def drain_pending(state: dict) -> list[str]:
+    out, state["pending"] = list(state.get("pending") or []), []
+    return out
 
 
 @contextlib.contextmanager
@@ -206,6 +240,7 @@ def apply_refresh(state: dict, snapshots: dict, now: float, cfg: dict) -> list[s
         pstate["snapshot"] = normalize_snapshot(snap, now)
         lines += alert_lines(provider, pstate["snapshot"]["windows"], state["alerts_sent"], cfg)
     lines += recompute(state, now, cfg)
+    queue(state, *lines)
     return lines
 
 

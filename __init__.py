@@ -71,7 +71,9 @@ def _on_api_error(provider=None, model=None, status_code=None, reason=None, erro
             line = core.record_error(st, provider=prov, status_code=status_code, reason=rsn, message=msg,
                                      model=model or "", now=now, cfg=_cfg())
             lines = core.recompute(st, now, _cfg())
-        for ln in ([line] if line else []) + lines:
+            all_lines = ([line] if line else []) + lines
+            core.queue(st, *all_lines)
+        for ln in all_lines:
             logger.warning(ln)
     except Exception as exc:  # observer: fail open
         logger.debug("quota-router: record_error failed: %s", exc)
@@ -90,7 +92,9 @@ def _on_api_success(provider=None, **_kw):
     try:
         with core.locked_state(path) as st:
             if core.clear_block_on_success(st, prov, now):
-                for ln in [f"quota-router: {prov} served a request again; block cleared"] + core.recompute(st, now, _cfg()):
+                lines = [f"quota-router: {prov} served a request again; block cleared"] + core.recompute(st, now, _cfg())
+                core.queue(st, *lines)
+                for ln in lines:
                     logger.warning(ln)
     except Exception as exc:
         logger.debug("quota-router: clear failed: %s", exc)
@@ -98,7 +102,7 @@ def _on_api_success(provider=None, **_kw):
 
 # ── refresh / status ───────────────────────────────────────────────────────────
 
-def refresh(now: float | None = None, snapshots: dict | None = None) -> list[str]:
+def refresh(now: float | None = None, snapshots: dict | None = None, drain: bool = False) -> list[str]:
     core = _core()
     now = time.time() if now is None else now
     if snapshots is None:
@@ -114,13 +118,14 @@ def refresh(now: float | None = None, snapshots: dict | None = None) -> list[str
                 snapshots[p] = snap
     cfg = _cfg()
     with core.locked_state(core.state_path()) as st:
-        return core.apply_refresh(st, snapshots, now, cfg)
+        core.apply_refresh(st, snapshots, now, cfg)
+        return core.drain_pending(st) if drain else []
 
 
 def status_text(fetch: bool = False) -> str:
     core = _core()
     if fetch:
-        refresh()
+        refresh(drain=False)
     return core.render_status(core.read_state(core.state_path()), time.time(), _cfg())
 
 
@@ -135,7 +140,7 @@ def _cli_setup(sub):
 def _cli_handler(args):
     cmd = getattr(args, "qr_cmd", None) or "status"
     if cmd == "refresh":
-        for ln in refresh():
+        for ln in refresh(drain=True):
             print(ln)
         return 0
     if cmd == "path":

@@ -309,6 +309,34 @@ def record_error(state: dict, *, provider: str, status_code: Any, reason: Any, m
     return None if had else f"quota-router: observed hard quota block on {provider} until {datetime.fromtimestamp(until):%a %H:%M}"
 
 
+def note_fetch(state: dict, provider: str, *, slot: str = "core", ok: bool, kind: Optional[str] = None,
+               message: str = "", now: float, cfg: dict) -> None:
+    """Record a fetch outcome for ``provider``/``slot`` (``'core'`` or ``'scoped'``).
+
+    Success clears the error and, if there was a previously-alerted core incident, queues a
+    recovery line. Failure preserves ``error.since`` from the first failure of the incident (a
+    change of ``kind`` does not reset it) and, for ``slot == 'core'`` only, queues one alert once
+    the incident has lasted ``cfg['stale_after_s']``.
+    """
+    pstate = state["providers"].setdefault(provider, {"tier": "ok", "tier_since": now})
+    fetch = pstate.setdefault("fetch", {})
+    fslot = fetch.setdefault(slot, {"last_ok_at": None, "error": None, "alerted": False})
+    if ok:
+        had_alerted = bool(fslot.get("error") and fslot.get("alerted"))
+        fslot["last_ok_at"] = now
+        fslot["error"] = None
+        fslot["alerted"] = False
+        if had_alerted and slot == "core":
+            queue(state, f"quota-router: {provider} usage fetch recovered")
+        return
+    since = (fslot.get("error") or {}).get("since", now)
+    fslot["error"] = {"since": since, "at": now, "kind": kind, "message": (message or "")[:200]}
+    if slot == "core" and not fslot.get("alerted") and now - since >= cfg["stale_after_s"]:
+        mins = int((now - since) // 60)
+        queue(state, f"quota-router: {provider} usage unavailable for {mins}m+ ({kind}: {(message or '')[:80]})")
+        fslot["alerted"] = True
+
+
 def clear_block_on_success(state: dict, provider: str, now: float) -> bool:
     """A served request is authoritative: drop the block AND the dwell hold it caused, so the
     tier falls straight back to what usage percentages say."""
@@ -339,6 +367,18 @@ def render_status(state: dict, now: float, cfg: dict) -> str:
         b = state["blocks"].get(p)
         if active_block(b, now):
             out.append(f"    OBSERVED BLOCK until {datetime.fromtimestamp(b['until']):%a %H:%M}: {b.get('message', '')[:120]}")
+        fetch = ps.get("fetch") or {}
+        core_err = (fetch.get("core") or {}).get("error")
+        if core_err:
+            fage = int((now - float(core_err.get("at") or now)) // 60)
+            since_str = datetime.fromtimestamp(core_err["since"]).strftime("%H:%M")
+            out.append(f"    last fetch failed {fage}m ago (since {since_str}) — "
+                       f"{core_err.get('kind')}: {(core_err.get('message') or '')[:100]}")
+        scoped_err = (fetch.get("scoped") or {}).get("error")
+        if scoped_err:
+            fage = int((now - float(scoped_err.get("at") or now)) // 60)
+            out.append(f"    scoped-limits fetch failed {fage}m ago — "
+                       f"{scoped_err.get('kind')}: {(scoped_err.get('message') or '')[:100]}")
     errs = state.get("errors") or []
     if errs:
         out.append("recent quota-shaped errors:")

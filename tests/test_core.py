@@ -213,6 +213,95 @@ def test_queue_evicts_non_alert_lines_before_alert_lines():
     assert len(st["pending"]) == 50
 
 
+def test_fetch_failure_recorded_no_alert_before_stale_then_one_alert_then_recover():
+    st = core.empty_state()
+    core.note_fetch(st, "anthropic", ok=False, kind="fetch_error", message="timeout", now=NOW, cfg=CFG)
+    err = st["providers"]["anthropic"]["fetch"]["core"]["error"]
+    assert err["kind"] == "fetch_error" and err["since"] == NOW
+    assert not st["pending"]
+    core.note_fetch(st, "anthropic", ok=False, kind="fetch_error", message="timeout",
+                    now=NOW + 10 * 60, cfg=CFG)
+    assert not st["pending"]
+    core.note_fetch(st, "anthropic", ok=False, kind="fetch_error", message="timeout",
+                    now=NOW + 31 * 60, cfg=CFG)
+    assert sum("usage unavailable" in l for l in st["pending"]) == 1
+    core.note_fetch(st, "anthropic", ok=False, kind="fetch_error", message="timeout",
+                    now=NOW + 46 * 60, cfg=CFG)
+    assert sum("usage unavailable" in l for l in st["pending"]) == 1
+    core.drain_pending(st)
+    core.note_fetch(st, "anthropic", ok=True, now=NOW + 60 * 60, cfg=CFG)
+    assert st["providers"]["anthropic"]["fetch"]["core"]["error"] is None
+    assert st["providers"]["anthropic"]["fetch"]["core"]["last_ok_at"] == NOW + 60 * 60
+    assert sum("recovered" in l for l in st["pending"]) == 1
+
+
+def test_kind_change_mid_incident_keeps_since_and_does_not_realert():
+    st = core.empty_state()
+    core.note_fetch(st, "anthropic", ok=False, kind="fetch_error", message="a", now=NOW, cfg=CFG)
+    core.note_fetch(st, "anthropic", ok=False, kind="unavailable", message="b",
+                    now=NOW + 31 * 60, cfg=CFG)
+    err = st["providers"]["anthropic"]["fetch"]["core"]["error"]
+    assert err["since"] == NOW and err["kind"] == "unavailable"
+    assert sum("usage unavailable" in l for l in st["pending"]) == 1
+    core.note_fetch(st, "anthropic", ok=False, kind="unavailable", message="c",
+                    now=NOW + 45 * 60, cfg=CFG)
+    assert sum("usage unavailable" in l for l in st["pending"]) == 1
+
+
+def test_note_fetch_persistence_across_reload(tmp_path):
+    path = tmp_path / "state.json"
+    with core.locked_state(path) as st:
+        core.note_fetch(st, "anthropic", ok=False, kind="fetch_error", message="x", now=NOW, cfg=CFG)
+    with core.locked_state(path) as st:
+        core.note_fetch(st, "anthropic", ok=False, kind="fetch_error", message="x",
+                        now=NOW + 31 * 60, cfg=CFG)
+    st = core.read_state(path)
+    assert sum(l.startswith("quota-router: anthropic usage unavailable") for l in st["pending"]) == 1
+    with core.locked_state(path) as st:
+        core.note_fetch(st, "anthropic", ok=False, kind="fetch_error", message="x",
+                        now=NOW + 45 * 60, cfg=CFG)
+    st = core.read_state(path)
+    assert sum(l.startswith("quota-router: anthropic usage unavailable") for l in st["pending"]) == 1
+
+
+def test_scoped_slot_never_alerts_and_is_independent_of_core():
+    st = core.empty_state()
+    core.note_fetch(st, "anthropic", ok=False, kind="scoped_error", message="x",
+                    now=NOW, cfg=CFG, slot="scoped")
+    core.note_fetch(st, "anthropic", ok=False, kind="scoped_error", message="x",
+                    now=NOW + 200 * 60, cfg=CFG, slot="scoped")
+    assert not st["pending"]
+    assert st["providers"]["anthropic"]["fetch"]["scoped"]["error"] is not None
+    assert st["providers"]["anthropic"]["fetch"].get("core") is None
+
+
+def test_render_status_shows_core_and_scoped_fetch_errors():
+    st = core.empty_state()
+    core.note_fetch(st, "openai-codex", ok=False, kind="unavailable", message="no token", now=NOW, cfg=CFG)
+    core.note_fetch(st, "openai-codex", ok=False, kind="scoped_error", message="boom",
+                    now=NOW, cfg=CFG, slot="scoped")
+    out = core.render_status(st, NOW + 60, CFG)
+    assert "last fetch failed" in out and "unavailable: no token" in out
+    assert "scoped-limits fetch failed" in out and "scoped_error: boom" in out
+
+
+def test_render_status_renders_old_state_without_fetch_key():
+    st = core.empty_state()
+    core.apply_refresh(st, {"anthropic": snap(("week", 10, NOW + 5 * H))}, NOW, CFG)
+    st["providers"]["anthropic"].pop("fetch", None)
+    out = core.render_status(st, NOW, CFG)
+    assert "anthropic" in out
+
+
+def test_tier_unaffected_by_fetch_failure_with_stale_snapshot():
+    st = core.empty_state()
+    core.apply_refresh(st, {"anthropic": snap(("week", 30, NOW + 5 * 24 * H), fetched=NOW)}, NOW, CFG)
+    later = NOW + CFG["stale_after_s"] + 5
+    core.note_fetch(st, "anthropic", ok=False, kind="fetch_error", message="x", now=later, cfg=CFG)
+    core.recompute(st, later, CFG)
+    assert st["providers"]["anthropic"]["tier"] == "ok"
+
+
 def test_refresh_drain_interleave_never_loses_or_duplicates(tmp_path, monkeypatch):
     path = tmp_path / "cache" / "quota-router" / "state.json"
     results = {"drained": [], "errors": []}

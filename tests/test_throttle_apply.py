@@ -166,6 +166,15 @@ def test_apply_one_refuses_a_model_block_with_its_own_route(env):
     assert r["result"] == "unsupported"
 
 
+def test_apply_one_refuses_a_fallback_entry_with_extra_keys(env):
+    yaml = PROFILE_YAML.replace("    model: glm-x\n", "    model: glm-x\n    base_url: https://example.invalid\n")
+    env.profile_cfg.write_text(yaml)
+    r = env.thr.apply_one(env.profile_cfg, "constrained", LEVELS, backup_dir=env.home / "b", label="w", now=NOW)
+    assert r["result"] == "unsupported" and r["actual"] == "fast"
+    assert "fallback_providers[0].base_url" in r["message"]
+    assert env.profile_cfg.read_text() == yaml
+
+
 def test_apply_one_refuses_invalid_levels(env):
     leaky = {**LEVELS, "constrained": {**LEVELS["constrained"],
                                        "fallback": [{"provider": "anthropic", "model": "opus-x"}]}}
@@ -273,6 +282,29 @@ def test_runner_failure_is_recorded_alerted_once_and_retried(env):
     assert env.thr.run_apply(env.core.state_path(), dict(env.core.DEFAULTS), t, failing, NOW + 60) == []
     apply(env, now=NOW + 120)
     assert profile(env)["model"]["provider"] == "custom:internal"
+
+
+@pytest.mark.parametrize("exc", [subprocess.TimeoutExpired(["hermes"], 120),
+                                 FileNotFoundError(2, "No such file or directory")])
+def test_runner_exception_is_an_error_for_that_profile_and_the_rest_still_apply(env, exc):
+    feed(env, 90, NOW)
+    tried = []
+
+    def flaky(profile, argv):
+        tried.append(profile)
+        if profile == "worker":
+            raise exc
+        return env.runner(profile, argv)
+
+    t = tcfg(env, levels=KANBAN_LEVELS)
+    lines = env.thr.run_apply(env.core.state_path(), dict(env.core.DEFAULTS), t, flaky, NOW)
+    assert tried == ["worker", "default"]
+    assert env.thr.read_raw(env.root_cfg)["kanban"]["max_in_progress"] == 24
+    rec = state(env)["throttle"]["applied"]["worker"]
+    assert rec["result"] == "error" and type(exc).__name__ in rec["message"]
+    assert [l for l in lines if "failed" in l] == [
+        f"quota-router: throttle apply to worker failed ({rec['message']})"]
+    assert env.thr.run_apply(env.core.state_path(), dict(env.core.DEFAULTS), t, flaky, NOW + 60) == []
 
 
 def test_invalid_levels_block_writes_with_one_alert(env):
@@ -395,6 +427,20 @@ def test_cli_hold_disable_and_status(env, monkeypatch, capsys):
     out = capsys.readouterr().out.strip()
     assert out.startswith("QRTHROTTLE_STATUS ") and json.loads(out.split(" ", 1)[1])["level"] == "fast"
     assert _cli(env, monkeypatch, t, "throttle", "hold", "sideways", "--for", "1h") == 2
+
+
+def test_cli_hold_and_disable_leave_the_pending_queue_for_the_cron(env, monkeypatch, capsys):
+    t = tcfg(env)
+    feed(env, 10, NOW)
+    monkeypatch.setattr(env.plugin.time, "time", lambda: NOW)
+    with env.core.locked_state(env.core.state_path()) as st:
+        env.core.queue(st, "⚠️ unrelated threshold alert")
+    capsys.readouterr()
+    assert _cli(env, monkeypatch, t, "throttle", "hold", "constrained", "--for", "1h") == 0
+    assert _cli(env, monkeypatch, t, "throttle", "disable") == 0
+    assert "unrelated" not in capsys.readouterr().out
+    assert "⚠️ unrelated threshold alert" in state(env)["pending"]
+    assert profile(env)["model"]["provider"] == "custom:internal"   # applied at once; hold beats disable
 
 
 def test_cli_apply_one_prints_one_result_line(env, monkeypatch, capsys):

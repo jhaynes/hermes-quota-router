@@ -352,7 +352,9 @@ def _throttle_handler(args) -> int:
         except ValueError as exc:
             print(f"quota-router: {exc}")
             return 2
-    for ln in thr.run_apply(path, _cfg(), t, thr.subprocess_runner, time.time()):
+    # hold/disable apply at once but leave the queue (their transition line included) for the cron
+    # to deliver; only the cron path drains (README "Alert queue").
+    for ln in thr.run_apply(path, _cfg(), t, thr.subprocess_runner, time.time(), drain=cmd == "apply"):
         print(ln)
     return 0
 

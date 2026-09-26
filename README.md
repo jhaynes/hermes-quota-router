@@ -106,6 +106,15 @@ hermes cron create "every 15m" --name "Quota router: usage refresh + alerts" --s
 ~/.hermes/hermes-agent/venv/bin/python tests/e2e_live.py                          # real hooks + real anthropic call; restores state
 ```
 
+If the managed venv has no pytest, run it ephemerally with uv. The throttle-apply tests import `hermes_cli` (for the real `atomic_config_write`), so put the agent checkout on `PYTHONPATH`:
+
+```
+PYTHONPATH=~/.hermes/hermes-agent uv run --no-project --python ~/.hermes/hermes-agent/venv/bin/python \
+  --with pytest pytest -q -p no:cacheprovider tests/
+```
+
+Every test uses a temp `HERMES_HOME`. The B3 round-trip test edits a **copy** of a real profile config (`QR_REAL_PROFILE_CONFIG`, default `~/.hermes/profiles/builder/config.yaml`; skipped if absent). The live test runs the real `hermes -p <profile>` CLI (`QR_HERMES_BIN`) against the temp home; `QR_SKIP_LIVE=1` skips it.
+
 ## Desktop widget
 
 The desktop half of this package (`desktop/plugin.js`) ships alongside the

@@ -37,6 +37,9 @@ MISS_USED = 97.0              # a window at/above this is a miss if the throttle
 MISS_LOOKBACK_S = 3600.0
 FALSE_ALARM_BELOW = 85.0      # a constrained period whose window's cycle ended below this is a false alarm
 MIN_DAYS = 7.0                # no back-test before this much history
+# History is pruned to 7 days (core.HISTORY_MAX_AGE_S), so a full window always spans slightly less
+# than 7.0 days; up to one hour short still counts as seven days.
+MIN_DAYS_SLACK = 1 / 24.0
 LOOSEN_MIN_DAYS = 21.0        # loosening proposals need three weeks of history
 STEP = 5.0                    # grid step (percentage points)
 BOUNDS = {"enter_projected": (85.0, 100.0), "leave_projected": (70.0, 90.0)}
@@ -182,7 +185,7 @@ def run(history: dict, blocks: list, t: dict, cfg: dict) -> dict:
     hist = _clean(history)
     ts = [p[0] for pts in hist.values() for p in pts]
     days = (max(ts) - min(ts)) / 86400.0 if ts else 0.0
-    if days < MIN_DAYS:
+    if days < MIN_DAYS - MIN_DAYS_SLACK:
         return {"skipped": f"needs 7 days of history, have {days:.1f}", "days": days}
     rows = []
     for params in grid(t):

@@ -892,3 +892,204 @@ def render_status(state: dict, now: float, cfg: dict) -> str:
                        f"{e.get('reason')}: {e.get('message', '')[:100]}")
     out += render_cache(state, now)
     return "\n".join(out)
+
+
+# ── throttle policy (host-local; v2 B1/B4/B5, precedence hold > disable > block > policy) ──────
+
+THROTTLE_LEVELS = ("fast", "constrained")
+THROTTLE_LOG_MAX = 300   # ~25 h of decisions at a 5-minute cadence (shadow report input)
+THROTTLE_DEFAULTS = {
+    "enabled": False,               # shadow mode: compute + log only, never write configs
+    "profiles": [],
+    "levels": {},                   # model specs are config, never code defaults
+    "protected_provider": "anthropic",
+    "enter_projected": 95.0,        # rule a
+    "enter_used": 85.0,             # rule b
+    "early_projected": 85.0,        # rule c (with acceleration)
+    "accel_ratio": 1.5,
+    "leave_projected": 80.0,
+    "leave_used": 75.0,
+    "min_dwell_s": 30 * 60,
+    "ignore_reset_within_s": 30 * 60,
+    "stale_hold_s": 60 * 60,
+}
+
+
+def throttle_config(user: Optional[dict]) -> dict:
+    """``plugins.entries.quota-router.throttle`` merged over ``THROTTLE_DEFAULTS``."""
+    t = dict(THROTTLE_DEFAULTS)
+    if isinstance(user, dict):
+        t.update({k: v for k, v in user.items() if k in THROTTLE_DEFAULTS})
+    return t
+
+
+def level_chain(spec: dict) -> list[tuple[str, str]]:
+    """``[(provider, model), ...]``: the level's primary then its fallback entries, in order."""
+    chain = [(str(spec.get("provider") or ""), str(spec.get("model") or ""))]
+    for f in spec.get("fallback") or []:
+        chain.append((str(f.get("provider") or ""), str(f.get("model") or "")))
+    return chain
+
+
+def validate_levels(levels: Any, protected: str = "anthropic") -> list[str]:
+    """Config errors for the two level specs; empty means valid. B1: the constrained level's whole
+    chain (primary and fallback) must not contain the protected provider."""
+    errs = []
+    if not isinstance(levels, dict):
+        return ["throttle.levels must be a mapping with 'fast' and 'constrained'"]
+    for name in THROTTLE_LEVELS:
+        spec = levels.get(name)
+        if not isinstance(spec, dict) or not spec.get("provider") or not spec.get("model"):
+            errs.append(f"throttle.levels.{name} needs provider and model")
+            continue
+        fb = spec.get("fallback") or []
+        if not isinstance(fb, list) or not all(isinstance(f, dict) and f.get("provider") and f.get("model")
+                                               for f in fb):
+            errs.append(f"throttle.levels.{name}.fallback must be a list of {{provider, model}}")
+    spec = levels.get("constrained")
+    if isinstance(spec, dict) and not errs:
+        if any(p.strip().lower() == protected for p, _m in level_chain(spec)):
+            errs.append(f"throttle.levels.constrained must not contain {protected} (primary or fallback)")
+    return errs
+
+
+def _throttle_windows(state: dict, now: float, cfg: dict, provider: str) -> tuple[list, Optional[float]]:
+    """Last-known tier-affecting windows for ``provider`` joined with their forecasts, plus the
+    snapshot's ``fetched_at``."""
+    snap = ((state.get("providers") or {}).get(provider) or {}).get("snapshot") or {}
+    labels = (cfg.get("forecast_windows") or {}).get(provider) or {}
+    fc = forecast_state(state, now, cfg).get(provider) or {}
+    wins = [dict(w, forecast=fc.get(w["label"])) for w in snap.get("windows") or []
+            if w["label"] in labels and not w.get("scope")]
+    return wins, (float(snap["fetched_at"]) if snap.get("fetched_at") else None)
+
+
+def throttle_policy(level: str, since: float, windows: list, now: float, t: dict
+                    ) -> tuple[str, Optional[str], Optional[str]]:
+    """Pure fresh-data policy: ``(level, rule, window_label)``. Rules a/b/c escalate unless the
+    window resets within ``ignore_reset_within_s``; leaving needs every window's short-rate
+    projection ≤ ``leave_projected`` (an unknown forecast counts as satisfied) and used <
+    ``leave_used``, after ``min_dwell_s``."""
+    if level != "constrained":
+        for w in windows:
+            if w.get("resets_at") and w["resets_at"] - now < t["ignore_reset_within_s"]:
+                continue
+            f = w.get("forecast") or {}
+            ok = f.get("status") == "ok"
+            if ok and f["projected_at_reset"] >= t["enter_projected"]:
+                return "constrained", "a", w["label"]
+            if w["used"] >= t["enter_used"]:
+                return "constrained", "b", w["label"]
+            if (ok and f["rate_pct_h"] > 0 and f["r_short"] >= t["accel_ratio"] * f["rate_pct_h"]
+                    and f["projected_at_reset"] >= t["early_projected"]):
+                return "constrained", "c", w["label"]
+        return "fast", None, None
+    for w in windows:
+        f = w.get("forecast") or {}
+        if w["used"] >= t["leave_used"]:
+            return "constrained", "hold_used", w["label"]
+        if f.get("status") == "ok" and f["projected_short"] > t["leave_projected"]:
+            return "constrained", "hold_projected", w["label"]
+    if now - since < t["min_dwell_s"]:
+        return "constrained", "dwell", None
+    return "fast", "leave", None
+
+
+def throttle_hold(state: dict, level: str, until: float, now: float) -> None:
+    if level not in THROTTLE_LEVELS:
+        raise ValueError(f"level must be one of {THROTTLE_LEVELS}")
+    state.setdefault("throttle", {})["hold"] = {"level": level, "until": float(until), "since": now}
+
+
+def throttle_clear_hold(state: dict) -> None:
+    state.setdefault("throttle", {}).pop("hold", None)
+
+
+def throttle_disable(state: dict, level: Optional[str], now: float) -> None:
+    """Force ``level`` (normally ``fast``) until cleared; ``None`` clears the disable."""
+    th = state.setdefault("throttle", {})
+    if level is None:
+        th.pop("disabled", None)
+        return
+    if level not in THROTTLE_LEVELS:
+        raise ValueError(f"level must be one of {THROTTLE_LEVELS}")
+    th["disabled"] = {"level": level, "since": now}
+
+
+def _why(source: str, rule: Optional[str], label: Optional[str], windows: list) -> str:
+    if source == "policy" and label:
+        w = next((w for w in windows if w["label"] == label), None) or {}
+        f = w.get("forecast") or {}
+        bits = [f"{label} {w.get('used', 0):.0f}%"]
+        if f.get("status") == "ok":
+            reset = datetime.fromtimestamp(f["resets_at"]).strftime("%a %H:%M")
+            bits.append(f"projected {f['projected_at_reset']:.0f}% at reset {reset}, "
+                        f"rate {f['rate_pct_h']:.1f}%/h")
+        return ", ".join(bits) + f"; rule {rule}"
+    if source == "policy":
+        return f"rule {rule}"
+    return {"hold": "manual hold", "disable": "throttle disabled", "block": "observed quota block",
+            "stale": "stale usage data"}.get(source, source)
+
+
+def throttle_step(state: dict, now: float, cfg: dict, t: dict) -> dict:
+    """Decide the throttle level, record it in ``state['throttle']`` and queue alerts (one per
+    transition, one per stale incident). Returns the decision. Pure over ``state``."""
+    th = state.setdefault("throttle", {})
+    level = th.get("level") if th.get("level") in THROTTLE_LEVELS else "fast"
+    since = float(th.get("since") or 0.0)
+    provider = t["protected_provider"]
+    windows, fetched_at = _throttle_windows(state, now, cfg, provider)
+    hold = th.get("hold")
+    if hold and float(hold.get("until") or 0) <= now:
+        th.pop("hold", None)
+        hold = None
+    rule = label = None
+    stale_alerted = False
+    stale_age = None if fetched_at is None else now - fetched_at
+    if hold:
+        new, source = hold["level"], "hold"
+    elif th.get("disabled"):
+        new, source = th["disabled"]["level"], "disable"
+    elif active_block((state.get("blocks") or {}).get(provider), now):
+        new, source = "constrained", "block"
+    elif stale_age is None or stale_age > t["stale_hold_s"]:
+        known = [w for w in windows if not (w.get("resets_at") and w["resets_at"] <= now)]
+        high = [w for w in known if w["used"] >= t["leave_used"]]
+        new, source = ("constrained" if high else "fast"), "stale"
+        if high and th.get("stale_alerted_for") != fetched_at:
+            th["stale_alerted_for"] = fetched_at
+            stale_alerted = True
+            tag = "" if t.get("enabled") else " (shadow)"
+            queue(state, f"quota-router: throttle{tag} stale usage data ({int((stale_age or 0) // 60)}m old); "
+                         f"{level} → constrained ({high[0]['label']} last {high[0]['used']:.0f}%)")
+    elif stale_age > cfg["stale_after_s"]:
+        new, source = level, "stale_hold"
+    else:
+        new, rule, label = throttle_policy(level, since, windows, now, t)
+        source = "policy"
+    if source != "stale":
+        th.pop("stale_alerted_for", None)
+    changed = new != level
+    if changed:
+        tag = "" if t.get("enabled") else " (shadow)"
+        if not stale_alerted:  # the stale alert already names the transition
+            queue(state, f"quota-router: throttle{tag} {level} → {new} ({_why(source, rule, label, windows)})")
+        th["since"] = now
+    elif not th.get("since"):
+        th["since"] = now
+    th.update(level=new, source=source, rule=rule, decided_at=now)
+    wsum = {}
+    for w in windows:
+        f = w.get("forecast") or {}
+        ok = f.get("status") == "ok"
+        wsum[w["label"]] = {"used": w["used"], "projected": f.get("projected_at_reset") if ok else None,
+                            "projected_short": f.get("projected_short") if ok else None,
+                            "r_long": f.get("rate_pct_h") if ok else None,
+                            "r_short": f.get("r_short") if ok else None}
+    decision = {"level": new, "previous": level, "changed": changed, "source": source, "rule": rule,
+                "label": label, "windows": wsum, "at": now}
+    log = th.get("log") if isinstance(th.get("log"), list) else []
+    th["log"] = (log + [{k: decision[k] for k in ("at", "level", "source", "rule", "label", "windows")}]
+                 )[-THROTTLE_LOG_MAX:]
+    return decision

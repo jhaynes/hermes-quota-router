@@ -79,6 +79,16 @@ Scoped (model) windows get `forecast: null`. The forecast doesn't change tiers o
 
 Since 0.3.0 it also carries `cache`: `collected_at`, `stale` (older than `stale_after_s`, or never collected), `alert_below`, `providers.<anthropic|openai-codex|other>.<24h|7d>` (`sessions`, `input`, `cache_read`, `cache_write`, `output`, `hit` — `null` with no input — and `sources.<source>` with the same fields minus `sources`), `top` (up to 5 × `id`, `title`, `source`, `model`, `provider`, `input`, `cache_read`, `cache_write`, `output`, `burn`, `hit`), and `fetch` (`last_ok_at`, `error`). The field is additive, so `v` stays `1`.
 
+## Throttle policy
+
+A separate, host-local decision between two levels, `fast` and `constrained`, over the protected provider's (`anthropic`) forecast windows. It doesn't change tiers or mode. Config lives under `plugins.entries.quota-router.throttle`; thresholds default as below, and the level specs (`levels.fast`, `levels.constrained`: `provider`, `model`, `fallback: [{provider, model}]`) have **no code defaults**. The constrained chain (primary and fallback) must not contain `anthropic`, so a saturated constrained primary fails over away from the capped provider rather than back to it.
+
+- **Enter `constrained`** on any window: (a) `projected_at_reset ≥ enter_projected` (95); (b) `used ≥ enter_used` (85); (c) `r_long > 0`, `r_short ≥ 1.5 × r_long` and `projected_at_reset ≥ early_projected` (85). A window resetting within `ignore_reset_within_s` (30 min) can't escalate.
+- **Leave** when every window has `projected_short ≤ leave_projected` (80; an unknown forecast counts as satisfied) and `used < leave_used` (75), after `min_dwell_s` (30 min).
+- **Stale data** (snapshot older than `stale_after_s`): hold the level. Older than `stale_hold_s` (60 min): `constrained` if any last-known window was at or above `leave_used` (one `stale usage data` alert per incident), otherwise `fast`.
+- **Precedence:** `hold` > `disable` > observed Anthropic block > policy (including stale rules).
+- **Alerts:** one `quota-router: throttle [(shadow)] <from> → <to> (<why>)` line per transition. Every decision is appended to `throttle.log` in state (per-window used, projected, `r_long`, `r_short`, rule) for the shadow report.
+
 ## Deliberately out of scope
 
 - **Error classification override.** Hermes already switches to fallback immediately on rate-limit and billing errors when the credential pool can't rotate (`agent/turn_recovery.py::route_classified_error`).

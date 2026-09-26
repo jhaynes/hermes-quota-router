@@ -57,6 +57,31 @@ def _cfg() -> dict:
     return cfg
 
 
+def _throttle():
+    name = "quota_router_throttle"
+    mod = sys.modules.get(name)
+    if mod is None:
+        _core()
+        spec = importlib.util.spec_from_file_location(name, _here / "throttle.py")
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules[name] = mod
+        spec.loader.exec_module(mod)
+    return mod
+
+
+def _throttle_cfg() -> dict:
+    """``plugins.entries.quota-router.throttle`` from this process's config (the root config on the
+    cron path)."""
+    user = None
+    try:
+        from hermes_cli.config import load_config
+        user = ((load_config() or {}).get("plugins", {}).get("entries", {}).get("quota-router", {}) or {}
+                ).get("throttle")
+    except Exception:
+        pass
+    return _core().throttle_config(user)
+
+
 # ── hooks (hot path: keep cheap, never raise) ──────────────────────────────────
 
 def _on_api_error(provider=None, model=None, status_code=None, reason=None, error=None, **_kw):
@@ -279,6 +304,52 @@ def _cli_setup(sub):
     s.add_argument("--json", action="store_true", help="Print one QRJSON <payload> line for the desktop widget")
     sp.add_parser("refresh", help="Fetch live usage; print only new alerts/transitions (cron-friendly)")
     sp.add_parser("path", help="Print the host-level state file path")
+    th = sp.add_parser("throttle", help="Host-local burn-rate throttle (fast/constrained)")
+    tsp = th.add_subparsers(dest="qr_throttle_cmd")
+    tsp.add_parser("apply", help="Decide the level and reconcile throttled profiles (cron path)")
+    ts = tsp.add_parser("status", help="Show the throttle level, reasons and per-profile results")
+    ts.add_argument("--json", action="store_true")
+    h = tsp.add_parser("hold", help="Force a level for a while (overrides everything)")
+    h.add_argument("level", nargs="?")
+    h.add_argument("--for", dest="duration", default="2h")
+    h.add_argument("--clear", action="store_true")
+    d = tsp.add_parser("disable", help="Restore a level (default fast) and stop following the policy")
+    d.add_argument("--level", default="fast")
+    d.add_argument("--clear", action="store_true", help="Resume following the policy")
+    a1 = tsp.add_parser("apply-one", help="(internal) reconcile THIS profile's config to a level")
+    a1.add_argument("level")
+    a1.add_argument("--levels-json", required=True)
+    a1.add_argument("--kanban", action="store_true")
+
+
+def _throttle_handler(args) -> int:
+    core, thr = _core(), _throttle()
+    cmd = getattr(args, "qr_throttle_cmd", None) or "status"
+    now = time.time()
+    if cmd == "apply-one":
+        print(thr.child_main(args.level, args.levels_json, args.kanban, now))
+        return 0
+    t = _throttle_cfg()
+    path = core.state_path()
+    if cmd == "status":
+        s = thr.throttle_status(core.read_state(path), t, core.root_home(), now)
+        print("QRTHROTTLE_STATUS " + json.dumps(s) if args.json else thr.render_throttle_status(s))
+        return 0
+    if cmd in ("hold", "disable"):
+        try:
+            with core.locked_state(path) as st:
+                if cmd == "hold" and args.clear:
+                    core.throttle_clear_hold(st)
+                elif cmd == "hold":
+                    core.throttle_hold(st, args.level or "", now + thr.parse_duration(args.duration), now)
+                else:
+                    core.throttle_disable(st, None if args.clear else args.level, now)
+        except ValueError as exc:
+            print(f"quota-router: {exc}")
+            return 2
+    for ln in thr.run_apply(path, _cfg(), t, thr.subprocess_runner, time.time()):
+        print(ln)
+    return 0
 
 
 def _cli_handler(args):
@@ -290,6 +361,8 @@ def _cli_handler(args):
     if cmd == "path":
         print(_core().state_path())
         return 0
+    if cmd == "throttle":
+        return _throttle_handler(args)
     if getattr(args, "json", False):
         print(status_json_line(fetch=getattr(args, "refresh", False)))
         return 0

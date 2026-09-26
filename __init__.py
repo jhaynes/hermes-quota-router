@@ -188,7 +188,12 @@ def refresh(now: float | None = None, snapshots: dict | None = None, drain: bool
         from agent.account_usage import fetch_account_usage
         snapshots = {}
         outcomes = {}
+        cfg0 = _cfg()
+        with core.locked_state(core.state_path()) as st0:  # backoff decision + its one alert
+            due = {p: core.fetch_due(st0, p, now, cfg0) for p in core.WATCHED}
         for p in core.WATCHED:
+            if not due[p]:
+                continue
             try:
                 snap = fetch_account_usage(p)
             except Exception as exc:

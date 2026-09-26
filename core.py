@@ -29,6 +29,11 @@ DEFAULTS = {
     "block_ttl_s": 6 * 3600,   # observed hard-block without a known reset expires after this
     "alert_thresholds": [75.0, 90.0],
     "cycle_tolerance_s": 10 * 60,  # resets_at moving more than this starts a new history cycle
+    # Fetch backoff (v2): after backoff_failures non-ok core fetches within backoff_window_s, a
+    # provider is fetched at most every backoff_interval_s until a fetch succeeds.
+    "backoff_failures": 3,
+    "backoff_window_s": 60 * 60,
+    "backoff_interval_s": 15 * 60,
     # Forecast (v2 B5). Window labels are core's; kind picks the rate maths below.
     "forecast_windows": {"anthropic": {"Current session": "session", "Current week": "weekly",
                                        "Opus week": "weekly"}},
@@ -593,6 +598,7 @@ def note_fetch(state: dict, provider: str, *, slot: str = "core", ok: bool, kind
         fslot["last_ok_at"] = now
         fslot["error"] = None
         fslot["alerted"] = False
+        fslot.pop("backoff_alerted", None)
         if had_alerted and slot == "core":
             queue(state, f"quota-router: {provider} usage fetch recovered")
         return
@@ -603,6 +609,27 @@ def note_fetch(state: dict, provider: str, *, slot: str = "core", ok: bool, kind
         mins = int((now - since) // 60)
         queue(state, f"quota-router: {provider} usage unavailable for {mins}m+ ({kind}: {message[:80]})")
         fslot["alerted"] = True
+
+
+def fetch_due(state: dict, provider: str, now: float, cfg: dict) -> bool:
+    """Whether a core usage fetch for ``provider`` should run now. After ``backoff_failures``
+    non-ok fetches within ``backoff_window_s`` (from ``fetch_log``) with no success since, fetches
+    are spaced ``backoff_interval_s`` apart; one alert per incident. A success clears it."""
+    log = state.get("fetch_log")
+    log = log if isinstance(log, list) else []
+    mine = [e for e in log if isinstance(e, list) and len(e) == 3 and e[1] == provider and _num(e[0])]
+    recent = [e for e in mine if e[0] >= now - cfg["backoff_window_s"]]
+    last_ok = max((e[0] for e in mine if e[2] == "ok"), default=None)
+    bad = [e for e in recent if e[2] != "ok" and (last_ok is None or e[0] > last_ok)]
+    if len(bad) < cfg["backoff_failures"]:
+        return True
+    fslot = state["providers"].setdefault(provider, {"tier": "ok", "tier_since": now}) \
+        .setdefault("fetch", {}).setdefault("core", {"last_ok_at": None, "error": None, "alerted": False})
+    if not fslot.get("backoff_alerted"):
+        fslot["backoff_alerted"] = True
+        queue(state, f"quota-router: {provider} usage fetch backing off to {int(cfg['backoff_interval_s'] // 60)}m "
+                     f"({len(bad)} non-ok fetches in {int(cfg['backoff_window_s'] // 60)}m)")
+    return now - max(e[0] for e in mine) >= cfg["backoff_interval_s"]
 
 
 def clear_block_on_success(state: dict, provider: str, now: float) -> bool:

@@ -189,3 +189,85 @@ test("tipModel surfaces block and fetch error, tolerates empty payload", () => {
 	const empty = tipPure.tipModel({ v: 1, providers: {} }, Date.now());
 	assert.equal(empty.providers.length, 0);
 });
+
+// ---- cache efficiency (fixture = REAL `status --json --refresh` output of this branch) ----
+// Regenerate: scripts/make_widget_fixture.py <captured cli output> > fixtures/status_v1_cli_output.txt
+
+const cachePure = (() => {
+	const body = extractPureBlock(pluginSrc);
+	const context = { console };
+	vm.createContext(context);
+	return vm.runInContext(`${body}\n({ parseQrjson, chipSummary, tipModel, cacheModel, hitTone, fmtHit, fmtTokens })`, context, {
+		filename: "plugin-pure-cache.js",
+	});
+})();
+const realOutput = readFileSync(path.join(fixturesDir, "status_v1_cli_output.txt"), "utf8");
+
+test("real CLI output: noise around one QRJSON line parses to a v1 payload with a cache object", () => {
+	assert.ok(realOutput.split("\n").some((l) => l && !l.startsWith("QRJSON ")), "fixture carries noise lines");
+	const payload = cachePure.parseQrjson(realOutput);
+	assert.equal(payload.v, 1);
+	assert.ok(payload.providers.anthropic && payload.providers["openai-codex"]);
+	const c = payload.cache;
+	assert.ok(c && typeof c.collected_at === "number");
+	assert.deepEqual(Object.keys(c.providers).sort(), ["anthropic", "openai-codex", "other"]);
+	for (const pid of Object.keys(c.providers)) {
+		for (const w of ["24h", "7d"]) {
+			const agg = c.providers[pid][w];
+			for (const k of ["sessions", "input", "cache_read", "cache_write", "output", "hit", "sources"]) {
+				assert.ok(k in agg, `${pid}.${w}.${k}`);
+			}
+		}
+	}
+	for (const t of c.top) {
+		for (const k of ["id", "title", "source", "model", "provider", "input", "cache_read", "cache_write", "burn", "hit"]) {
+			assert.ok(k in t, `top.${k}`);
+		}
+	}
+	// existing helpers still work on the real payload
+	assert.match(cachePure.chipSummary(payload), /A \d+% left/);
+	assert.ok(cachePure.tipModel(payload, payload.now * 1000).providers.length >= 2);
+});
+
+test("cacheModel mirrors the real payload's 24h/7d hit and top burners", () => {
+	const payload = cachePure.parseQrjson(realOutput);
+	const m = cachePure.cacheModel(payload);
+	assert.equal(m.available, true);
+	assert.equal(m.error, "");
+	const a = m.providers.find((p) => p.id === "anthropic");
+	assert.equal(a.name, "Anthropic");
+	assert.equal(a.hit24Text, cachePure.fmtHit(payload.cache.providers.anthropic["24h"].hit));
+	assert.equal(a.hit7Text, cachePure.fmtHit(payload.cache.providers.anthropic["7d"].hit));
+	assert.ok(["good", "warn", "bad", "muted"].includes(a.hit24Tone));
+	assert.equal(m.top.length, payload.cache.top.length);
+	assert.equal(m.top[0].burnText, cachePure.fmtTokens(payload.cache.top[0].burn));
+	assert.ok(m.top.every((t) => t.label && t.meta.includes(" · ")));
+});
+
+test("cacheModel skips providers with no sessions, tolerates a missing cache object, surfaces errors", () => {
+	assert.deepEqual(
+		JSON.parse(JSON.stringify(cachePure.cacheModel({ v: 1, providers: {} }))),
+		{ available: false, stale: false, providers: [], top: [], error: "" },
+	);
+	const payload = cachePure.parseQrjson(realOutput);
+	payload.cache.providers.other = { "24h": { sessions: 0, hit: null }, "7d": { sessions: 0, hit: null } };
+	payload.cache.fetch = { last_ok_at: null, error: { kind: "locked", message: "database is locked" } };
+	const m = cachePure.cacheModel(payload);
+	assert.ok(!m.providers.some((p) => p.id === "other"));
+	assert.equal(m.error, "locked: database is locked");
+});
+
+test("hitTone / fmtHit / fmtTokens", () => {
+	assert.equal(cachePure.hitTone(null, 80), "muted");
+	assert.equal(cachePure.hitTone(49.9, 80), "bad");
+	assert.equal(cachePure.hitTone(79.9, 80), "warn");
+	assert.equal(cachePure.hitTone(80, 80), "good");
+	assert.equal(cachePure.hitTone(85, 90), "warn");
+	assert.equal(cachePure.hitTone(85, undefined), "good");
+	assert.equal(cachePure.fmtHit(91.66), "91.7%");
+	assert.equal(cachePure.fmtHit(null), "—");
+	assert.equal(cachePure.fmtTokens(999), "999");
+	assert.equal(cachePure.fmtTokens(12300), "12.3K");
+	assert.equal(cachePure.fmtTokens(19_000_000), "19.0M");
+	assert.equal(cachePure.fmtTokens(1_250_000_000), "1.25B");
+});

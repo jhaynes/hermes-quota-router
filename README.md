@@ -7,7 +7,7 @@ Host-level quota awareness for `anthropic` and `openai-codex`.
 - **Mode:** normal, shift (one provider constrained) or internal (both constrained).
 - **Alerts:** at 75% and 90%, once per window per reset cycle.
 - **Alert queue:** only `hermes quota-router refresh` (the cron path) **drains** and delivers pending alert/transition lines. A manual refresh (`/quota refresh`, `hermes quota-router status --refresh`) folds fresh usage in and enqueues any new lines, but leaves the queue for the next cron run to deliver — it no longer swallows them. Delivery is **at-most-once**: drained lines are removed from state immediately, so if the cron script's delivery step then fails, those lines are lost, not retried.
-- **Surfaces:** `hermes quota-router status [--refresh] | refresh | path`, `/quota [refresh]`.
+- **Surfaces:** `hermes quota-router status [--refresh] | refresh | path | throttle <apply|status|hold|disable>`, `/quota [refresh]`.
 
 State lives at `<root HERMES_HOME>/cache/quota-router/state.json` and is shared by every profile on the host.
 
@@ -53,6 +53,36 @@ A separate, host-local decision between two levels, `fast` and `constrained`, ov
 - **Stale data** (snapshot older than `stale_after_s`): hold the level. Older than `stale_hold_s` (60 min): `constrained` if any last-known window was at or above `leave_used` (one `stale usage data` alert per incident), otherwise `fast`.
 - **Precedence:** `hold` > `disable` > observed Anthropic block > policy (including stale rules).
 - **Alerts:** one `quota-router: throttle [(shadow)] <from> → <to> (<why>)` line per transition. Every decision is appended to `throttle.log` in state (per-window used, projected, `r_long`, `r_short`, rule) for the shadow report.
+
+## Throttle apply
+
+```yaml
+plugins:
+  entries:
+    quota-router:
+      throttle:
+        enabled: false            # shadow mode (default): decide + log, never write
+        profiles: [worker-a, worker-b]
+        levels:
+          fast:        {provider: primary-provider, model: fast-model,
+                        fallback: [{provider: "custom:internal", model: internal-model}, {provider: backup, model: backup-model}],
+                        max_in_progress: 64}          # optional; both levels or neither
+          constrained: {provider: "custom:internal", model: internal-model,
+                        fallback: [{provider: backup, model: backup-model}],
+                        max_in_progress: 24}
+```
+
+- `hermes quota-router throttle apply` decides the level (above) and, when `enabled: true`, reconciles **every run** (not only on a level change) each listed profile by running `hermes -p <profile> quota-router throttle apply-one <level> ...`. The child reads its own raw `config.yaml`, compares the **parsed** `model.provider`, `model.default` and `fallback_providers` with both level specs, and makes at most one `hermes_cli.config.atomic_config_write` call:
+  - matches the desired level → no-op;
+  - matches the other level → backup to `<root>/backups/quota-throttle/<profile>-<ts>.yaml`, one atomic write, re-read to verify. If the throttle had already applied this level there, it alerts once: `re-applied <level> to <profile> after external overwrite`;
+  - matches neither → a hand edit: skipped, never overwritten, one alert per (profile, level);
+  - a `model:` block carrying its own route (`base_url`, `api_mode`, ...) is skipped with an alert.
+- When both levels set `max_in_progress`, the root config's `kanban.max_in_progress` is reconciled the same way (`hermes -p default`). Otherwise the key is never touched.
+- A constrained chain containing `anthropic` is refused with one alert, and nothing is written.
+- Running workers are never touched; the next spawn reads the new config.
+- `throttle status [--json]`: level, source/rule, hold/disable, per-window numbers from the last decision, per-profile results, and the leak count (sessions started on `anthropic` by a throttled profile since entering `constrained`, read-only from its `state.db`).
+- `throttle hold <fast|constrained> --for 2h` / `throttle hold --clear`; `throttle disable [--level fast]` / `throttle disable --clear`. Each applies at once.
+- Rollback: `throttle disable`, check `throttle status` shows every profile at `fast`, then downgrade the plugin. Restoring a backup is the last resort.
 
 ## Deliberately out of scope
 

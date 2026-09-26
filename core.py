@@ -12,7 +12,9 @@ import contextlib
 import fcntl
 import json
 import os
+import sqlite3
 import time
+import urllib.parse
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Optional
@@ -28,6 +30,11 @@ DEFAULTS = {
     "stale_after_s": 30 * 60,  # snapshots older than this are ignored (fail open to normal)
     "block_ttl_s": 6 * 3600,   # observed hard-block without a known reset expires after this
     "alert_thresholds": [75.0, 90.0],
+    # cache efficiency (display + alert only; never feeds tier/mode/blocks)
+    "cache_alert_below": 80.0,             # provider 24h hit % below this ...
+    "cache_alert_min_tokens": 20_000_000,  # ... on at least this much 24h input -> alert
+    "cache_write_alert_tokens": 10_000_000,  # one session writing this much in 24h ...
+    "cache_write_alert_below": 50.0,       # ... at a hit % below this -> alert
 }
 TIER_ORDER = {"ok": 0, "tight": 1, "exhausted": 2}
 
@@ -48,6 +55,11 @@ def root_home(hermes_home: Optional[str | Path] = None) -> Path:
 
 def state_path(hermes_home: Optional[str | Path] = None) -> Path:
     return root_home(hermes_home) / "cache" / "quota-router" / "state.json"
+
+
+def state_db_path(hermes_home: Optional[str | Path] = None) -> Path:
+    """Hermes' session database for this host (read-only input to the cache section)."""
+    return root_home(hermes_home) / "state.db"
 
 
 PENDING_CAP = 50
@@ -387,6 +399,211 @@ def is_stale(snapshot: Optional[dict], now: float, cfg: dict) -> bool:
     return age > cfg["stale_after_s"]
 
 
+# ── cache efficiency (host-local, read-only over state.db; display + alert only) ──
+
+CACHE_PROVIDERS = ("anthropic", "openai-codex", "other")
+CACHE_WINDOWS = (("24h", 24 * 3600), ("7d", 7 * 24 * 3600))
+CACHE_TOP_N = 5
+CACHE_ALERT_REPEAT_S = 24 * 3600
+# Session totals are cumulative, so a session counts in the window it was LAST active in.
+_ACTIVE = "COALESCE(last_activity_at, started_at)"
+_SUMS = ("COUNT(*), COALESCE(SUM(input_tokens),0), COALESCE(SUM(cache_read_tokens),0), "
+         "COALESCE(SUM(cache_write_tokens),0), COALESCE(SUM(output_tokens),0)")
+_SESSION_COLS = ("id, title, source, model, billing_provider, COALESCE(input_tokens,0), "
+                 "COALESCE(cache_read_tokens,0), COALESCE(cache_write_tokens,0), COALESCE(output_tokens,0)")
+
+
+def cache_provider(billing_provider: Any) -> str:
+    """Map a ``sessions.billing_provider`` onto the cache section's provider buckets."""
+    p = str(billing_provider or "").strip().lower()
+    return p if p in WATCHED else "other"
+
+
+def hit_pct(inp: int, read: int, write: int) -> Optional[float]:
+    """``cache_read / (input + cache_read + cache_write)`` as a percent, or ``None`` with no input."""
+    total = inp + read + write
+    return round(100.0 * read / total, 1) if total else None
+
+
+def _agg(sessions: int, inp: int, read: int, write: int, out: int) -> dict:
+    return {"sessions": sessions, "input": inp, "cache_read": read, "cache_write": write,
+            "output": out, "hit": hit_pct(inp, read, write)}
+
+
+def _session_row(row) -> dict:
+    sid, title, source, model, provider, inp, read, write, out = row
+    return {"id": sid, "title": (title or None) and str(title)[:80], "source": source, "model": model,
+            "provider": provider, "input": inp, "cache_read": read, "cache_write": write, "output": out,
+            "burn": inp + write, "hit": hit_pct(inp, read, write)}
+
+
+def collect_cache_outcome(db_path: Path, now: float, cfg: dict, timeout_s: float = 0.5):
+    """Aggregate prompt-cache stats from ``state.db``. Returns ``(ok, kind, message, data|None)``.
+
+    Opens the DB read-only (``mode=ro`` URI, which never creates a file) with a short busy
+    timeout; kinds are ``missing``, ``locked`` and ``db_error``. ``data`` carries per-provider,
+    per-source aggregates for each window, the top burners by uncached input plus cache writes
+    over 24h, and the sessions that trip the cache-write alert.
+    """
+    db_path = Path(db_path)
+    if not db_path.is_file():
+        return False, "missing", f"no state.db at {db_path.name}", None
+    uri = f"file:{urllib.parse.quote(str(db_path))}?mode=ro"
+    try:
+        con = sqlite3.connect(uri, uri=True, timeout=timeout_s)
+        try:
+            providers = {p: {} for p in CACHE_PROVIDERS}
+            for label, span in CACHE_WINDOWS:
+                totals = {p: [0] * 5 for p in CACHE_PROVIDERS}
+                sources: dict = {p: {} for p in CACHE_PROVIDERS}
+                rows = con.execute(f"SELECT billing_provider, source, {_SUMS} FROM sessions "
+                                   f"WHERE {_ACTIVE} >= ? GROUP BY billing_provider, source",
+                                   (now - span,)).fetchall()
+                for provider, source, *nums in rows:
+                    p = cache_provider(provider)
+                    src = sources[p].setdefault(source or "?", [0] * 5)
+                    for i, n in enumerate(nums):
+                        totals[p][i] += n
+                        src[i] += n
+                for p in CACHE_PROVIDERS:
+                    agg = _agg(*totals[p])
+                    agg["sources"] = {s: _agg(*v) for s, v in sorted(sources[p].items())}
+                    providers[p][label] = agg
+            since = now - CACHE_WINDOWS[0][1]
+            top = con.execute(
+                f"SELECT {_SESSION_COLS} FROM sessions WHERE {_ACTIVE} >= ? "
+                "AND COALESCE(input_tokens,0) + COALESCE(cache_write_tokens,0) > 0 "
+                "ORDER BY COALESCE(input_tokens,0) + COALESCE(cache_write_tokens,0) DESC, id "
+                "LIMIT ?", (since, CACHE_TOP_N)).fetchall()
+            writers = con.execute(
+                f"SELECT {_SESSION_COLS} FROM sessions WHERE {_ACTIVE} >= ? "
+                "AND COALESCE(cache_write_tokens,0) >= ? ORDER BY cache_write_tokens DESC, id",
+                (since, cfg["cache_write_alert_tokens"])).fetchall()
+        finally:
+            con.close()
+    except sqlite3.OperationalError as exc:
+        msg = str(exc)
+        kind = "locked" if "locked" in msg or "busy" in msg else "db_error"
+        return False, kind, msg[:200], None
+    except sqlite3.DatabaseError as exc:
+        return False, "db_error", str(exc)[:200], None
+    writers = [w for w in map(_session_row, writers)
+               if w["hit"] is not None and w["hit"] < cfg["cache_write_alert_below"]]
+    return True, None, "", {"providers": providers, "top": [_session_row(r) for r in top],
+                            "writers": writers}
+
+
+def fmt_tokens(n: Any) -> str:
+    n = float(n or 0)
+    for div, suffix, digits in ((1e9, "B", 2), (1e6, "M", 1), (1e3, "K", 1)):
+        if n >= div:
+            return f"{n / div:.{digits}f}{suffix}"
+    return f"{int(n)}"
+
+
+def _fmt_hit(hit: Optional[float]) -> str:
+    return "—" if hit is None else f"{hit:.1f}%"
+
+
+def cache_alert_lines(data: dict, sent: dict, now: float, cfg: dict) -> list[str]:
+    """Low-hit and heavy-cache-write alerts, each at most once per condition per 24h. Mutates ``sent``."""
+    for key in [k for k, at in sent.items() if now - float(at) >= CACHE_ALERT_REPEAT_S]:
+        sent.pop(key, None)
+    out = []
+    for p in CACHE_PROVIDERS:
+        agg = data["providers"][p]["24h"]
+        volume = agg["input"] + agg["cache_read"] + agg["cache_write"]
+        key = f"hit|{p}"
+        if (agg["hit"] is not None and agg["hit"] < cfg["cache_alert_below"]
+                and volume >= cfg["cache_alert_min_tokens"] and key not in sent):
+            sent[key] = now
+            out.append(f"⚠️ cache: {p} 24h hit {_fmt_hit(agg['hit'])} (<{cfg['cache_alert_below']:g}%) "
+                       f"on {fmt_tokens(volume)} input")
+    for w in data.get("writers") or []:
+        key = f"write|{w['id']}"
+        if key in sent:
+            continue
+        sent[key] = now
+        out.append(f"⚠️ cache: session {w['id']} ({w['provider'] or '?'}/{w['source']}, {w['model'] or '?'}) "
+                   f"wrote {fmt_tokens(w['cache_write'])} to cache in 24h at {_fmt_hit(w['hit'])} hit "
+                   f"(<{cfg['cache_write_alert_below']:g}%)")
+    return out
+
+
+def apply_cache(state: dict, outcome: tuple, now: float, cfg: dict) -> list[str]:
+    """Fold a ``collect_cache_outcome`` result into ``state['cache']`` (aggregates only) and queue
+    any new alert lines, which are returned. A failure records ``cache.fetch.error`` (keeping the
+    incident's ``since``) and leaves the last good aggregates in place. Never touches tier or mode."""
+    ok, kind, message, data = outcome
+    cache = state.setdefault("cache", {})
+    fetch = cache.setdefault("fetch", {"last_ok_at": None, "error": None})
+    if not ok:
+        since = (fetch.get("error") or {}).get("since", now)
+        fetch["error"] = {"since": since, "at": now, "kind": kind, "message": scrub(message or "")[:200]}
+        return []
+    fetch["last_ok_at"], fetch["error"] = now, None
+    cache["collected_at"] = now
+    cache["providers"] = data["providers"]
+    cache["top"] = data["top"]
+    lines = cache_alert_lines(data, cache.setdefault("alerts_sent", {}), now, cfg)
+    queue(state, *lines)
+    return lines
+
+
+def cache_payload(state: dict, now: float, cfg: dict) -> dict:
+    cache = state.get("cache") or {}
+    fetch = cache.get("fetch") or {}
+    collected = cache.get("collected_at")
+    return {"collected_at": collected,
+            "stale": collected is None or now - float(collected) > cfg["stale_after_s"],
+            "alert_below": cfg["cache_alert_below"],
+            "providers": cache.get("providers") or {},
+            "top": cache.get("top") or [],
+            "fetch": {"last_ok_at": fetch.get("last_ok_at"), "error": fetch.get("error")}}
+
+
+def render_cache(state: dict, now: float) -> list[str]:
+    cache = state.get("cache") or {}
+    err = (cache.get("fetch") or {}).get("error")
+    collected = cache.get("collected_at")
+    if collected is None:
+        out = ["cache: no data yet (collected by refresh)"]
+    else:
+        out = [f"cache: (prompt-cache hit = read / (input + read + write), collected {int((now - collected) // 60)}m ago)"]
+        shown = False
+        for p in CACHE_PROVIDERS:
+            windows = (cache.get("providers") or {}).get(p) or {}
+            d, w = windows.get("24h") or {}, windows.get("7d") or {}
+            if not w.get("sessions"):
+                continue
+            shown = True
+            out.append(f"    {p:<14} 24h {_fmt_hit(d.get('hit')):>6} of {fmt_tokens(_in(d)):>6}   "
+                       f"7d {_fmt_hit(w.get('hit')):>6} of {fmt_tokens(_in(w)):>6}")
+            srcs = sorted(set(d.get("sources") or {}) | set(w.get("sources") or {}))
+            for s in srcs:
+                sd, sw = (d.get("sources") or {}).get(s) or {}, (w.get("sources") or {}).get(s) or {}
+                out.append(f"        {s:<10} 24h {_fmt_hit(sd.get('hit')):>6} of {fmt_tokens(_in(sd)):>6}   "
+                           f"7d {_fmt_hit(sw.get('hit')):>6} of {fmt_tokens(_in(sw)):>6}")
+        if not shown:
+            out.append("    no sessions in the last 7d")
+        top = cache.get("top") or []
+        if top:
+            out.append("    top burners (24h, uncached input + cache writes):")
+            for t in top:
+                title = f"  \"{t['title'][:40]}\"" if t.get("title") else ""
+                out.append(f"        {t['id']}  {t.get('provider') or '?'}/{t.get('source')}  {t.get('model') or '?'}  "
+                           f"hit {_fmt_hit(t.get('hit'))}  burn {fmt_tokens(t.get('burn'))} "
+                           f"(in {fmt_tokens(t.get('input'))}, write {fmt_tokens(t.get('cache_write'))}){title}")
+    if err:
+        fage = int((now - float(err.get("at") or now)) // 60)
+        out.append(f"    cache stats fetch failed {fage}m ago — {err.get('kind')}: {(err.get('message') or '')[:100]}")
+    return out
+
+
+def _in(agg: dict) -> int:
+    return sum(int(agg.get(k) or 0) for k in ("input", "cache_read", "cache_write"))
+
+
 def status_payload(state: dict, now: float, cfg: dict, host: str) -> dict:
     """Machine-readable status for the desktop widget: see the plan's JSON contract."""
     providers = {}
@@ -421,7 +638,8 @@ def status_payload(state: dict, now: float, cfg: dict, host: str) -> dict:
            for e in (state.get("errors") or [])[-5:]]
     return {"v": 1, "host": host, "now": now, "mode": state.get("mode", "normal"),
            "mode_since": state.get("mode_since"), "providers": providers,
-           "recent_errors": errs, "pending_count": len(state.get("pending") or [])}
+           "recent_errors": errs, "pending_count": len(state.get("pending") or []),
+           "cache": cache_payload(state, now, cfg)}
 
 
 def note_fetch(state: dict, provider: str, *, slot: str = "core", ok: bool, kind: Optional[str] = None,
@@ -509,4 +727,5 @@ def render_status(state: dict, now: float, cfg: dict) -> str:
         for e in errs[-5:]:
             out.append(f"    {datetime.fromtimestamp(e['at']):%a %H:%M} {e['provider']} {e.get('status')} "
                        f"{e.get('reason')}: {e.get('message', '')[:100]}")
+    out += render_cache(state, now)
     return "\n".join(out)

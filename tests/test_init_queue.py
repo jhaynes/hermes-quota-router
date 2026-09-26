@@ -27,6 +27,7 @@ def _load_plugin(tmp_home, monkeypatch):
     # state_path()/root_home() to the tmp home regardless of the real environment.
     monkeypatch.setitem(sys.modules, "quota_router_core", core_mod)
     core_mod.state_path = lambda hermes_home=None: tmp_home / "cache" / "quota-router" / "state.json"
+    core_mod.state_db_path = lambda hermes_home=None: tmp_home / "state.db"
     return plugin_mod, core_mod
 
 

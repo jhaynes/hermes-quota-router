@@ -916,10 +916,12 @@ THROTTLE_DEFAULTS = {
 
 
 def throttle_config(user: Optional[dict]) -> dict:
-    """``plugins.entries.quota-router.throttle`` merged over ``THROTTLE_DEFAULTS``."""
+    """``plugins.entries.quota-router.throttle`` merged over ``THROTTLE_DEFAULTS``. ``configured``
+    is false when there is no throttle block at all (a host that never opted in stays silent)."""
     t = dict(THROTTLE_DEFAULTS)
     if isinstance(user, dict):
         t.update({k: v for k, v in user.items() if k in THROTTLE_DEFAULTS})
+    t["configured"] = isinstance(user, dict) and bool(user)
     return t
 
 

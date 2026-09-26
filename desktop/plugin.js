@@ -200,6 +200,73 @@ function tipModel(payload, nowMs) {
 	};
 }
 
+const CACHE_PROVIDER_NAMES = { ...PROVIDER_NAMES, other: "Other" };
+
+/** Tone for a cache hit % against the backend's alert threshold (null -> muted). */
+function hitTone(hit, alertBelow) {
+	if (hit == null || !Number.isFinite(Number(hit))) return "muted";
+	const below = Number.isFinite(Number(alertBelow)) ? Number(alertBelow) : 80;
+	if (Number(hit) < 50) return "bad";
+	if (Number(hit) < below) return "warn";
+	return "good";
+}
+
+/** "91.7%" / "—" */
+function fmtHit(hit) {
+	if (hit == null || !Number.isFinite(Number(hit))) return "—";
+	return `${Number(hit).toFixed(1)}%`;
+}
+
+/** Compact token counts: 999, 12.3K, 19.0M, 1.25B. */
+function fmtTokens(n) {
+	const v = Number(n) || 0;
+	if (v >= 1e9) return `${(v / 1e9).toFixed(2)}B`;
+	if (v >= 1e6) return `${(v / 1e6).toFixed(1)}M`;
+	if (v >= 1e3) return `${(v / 1e3).toFixed(1)}K`;
+	return String(Math.round(v));
+}
+
+/** View model for the payload's `cache` object: providers with any 7d sessions,
+ *  their 24h/7d hit + tone, and the top-burner rows. Tolerates a missing object. */
+function cacheModel(payload) {
+	const c = payload?.cache;
+	const alertBelow = c?.alert_below;
+	const providers = [];
+	for (const pid of Object.keys(c?.providers || {})) {
+		const w = c.providers[pid] || {};
+		const d = w["24h"] || {};
+		const wk = w["7d"] || {};
+		if (!wk.sessions && !d.sessions) continue;
+		const vol = (a) => (Number(a.input) || 0) + (Number(a.cache_read) || 0) + (Number(a.cache_write) || 0);
+		providers.push({
+			id: pid,
+			name: CACHE_PROVIDER_NAMES[pid] || pid,
+			hit24Text: fmtHit(d.hit),
+			hit24Tone: hitTone(d.hit, alertBelow),
+			hit7Text: fmtHit(wk.hit),
+			hit7Tone: hitTone(wk.hit, alertBelow),
+			volume24Text: fmtTokens(vol(d)),
+			volume7Text: fmtTokens(vol(wk)),
+		});
+	}
+	const top = (c?.top || []).map((t) => ({
+		id: String(t.id || "?"),
+		label: String(t.title || t.id || "?"),
+		meta: [t.source, t.model].filter(Boolean).join(" · "),
+		hitText: fmtHit(t.hit),
+		hitTone: hitTone(t.hit, alertBelow),
+		burnText: fmtTokens(t.burn),
+	}));
+	const err = c?.fetch?.error;
+	return {
+		available: Boolean(c && c.collected_at != null),
+		stale: Boolean(c?.stale),
+		providers,
+		top,
+		error: err ? `${err.kind || "error"}: ${err.message || ""}`.trim() : "",
+	};
+}
+
 // END PURE
 
 /** One CLI call, timeout-guarded. Returns the raw cli.exec result. */
@@ -337,8 +404,33 @@ function TipProvider({ p }) {
 	});
 }
 
+function TipCache({ cm }) {
+	return jsxs("div", {
+		className: "flex flex-col gap-1 pt-1.5",
+		style: RULE,
+		children: [
+			jsx("span", { className: "font-semibold", children: `Cache hit · 24h${cm.stale ? " · stale" : ""}` }),
+			jsx("div", {
+				className: "grid items-baseline gap-x-3 gap-y-0.5",
+				style: { gridTemplateColumns: "minmax(0,1fr) auto auto" },
+				children: cm.providers.map((p) =>
+					jsxs("div", {
+						className: "contents",
+						children: [
+							jsx("span", { className: "truncate", children: p.name }),
+							jsx("span", { className: "text-right font-semibold tabular-nums", style: toneStyle(p.hit24Tone), children: p.hit24Text }),
+							jsx("span", { className: "text-right tabular-nums opacity-60", children: p.volume24Text }),
+						],
+					}, p.id),
+				),
+			}),
+		],
+	});
+}
+
 function ChipTip({ payload }) {
 	const m = tipModel(payload, Date.now());
+	const cm = cacheModel(payload);
 	if (!m.providers.length) return "Quota Router — no snapshot yet";
 	return jsxs("div", {
 		className: "flex flex-col gap-2 py-0.5",
@@ -358,6 +450,7 @@ function ChipTip({ payload }) {
 					children: [jsx(TipProvider, { p })],
 				}, `p${i}`),
 			),
+			cm.providers.length ? jsx(TipCache, { cm }) : null,
 			m.footer ? jsx("div", { className: "pt-1 text-[0.625rem] opacity-60", style: RULE, children: m.footer }) : null,
 		],
 	});
@@ -474,6 +567,73 @@ function ProviderCard({ pid, provider, now }) {
 	});
 }
 
+function CacheCard({ payload }) {
+	const cm = cacheModel(payload);
+	if (!cm.available && !cm.error) return null;
+	const small = "text-[0.6875rem] text-(--ui-text-secondary)";
+	return jsxs("div", {
+		className: "flex flex-col gap-2 rounded-lg border border-(--ui-stroke-secondary) px-3 py-2.5",
+		children: [
+			jsxs("div", {
+				className: "flex items-center justify-between gap-2",
+				children: [
+					jsx("span", { className: "text-sm font-semibold text-(--ui-text-primary)", children: "Cache efficiency" }),
+					cm.stale ? jsx(Badge, { children: "stale" }) : null,
+				],
+			}),
+			...cm.providers.map((p) =>
+				jsxs("div", {
+					className: "flex items-center justify-between gap-2 text-xs",
+					children: [
+						jsx("span", { className: "text-(--ui-text-secondary)", children: p.name }),
+						jsxs("span", {
+							className: "tabular-nums text-(--ui-text-primary)",
+							children: [
+								"24h ",
+								jsx("span", { style: toneStyle(p.hit24Tone), children: p.hit24Text }),
+								` · 7d `,
+								jsx("span", { style: toneStyle(p.hit7Tone), children: p.hit7Text }),
+							],
+						}),
+					],
+				}, p.id),
+			),
+			cm.available && !cm.providers.length ? jsx("div", { className: small, children: "no sessions in the last 7d" }) : null,
+			cm.top.length
+				? jsxs("div", {
+						className: "flex flex-col gap-1",
+						children: [
+							jsx("div", { className: "text-[0.6875rem] font-medium text-(--ui-text-secondary)", children: "Top burners · 24h" }),
+							...cm.top.map((t) =>
+								jsxs("div", {
+									className: "flex items-center justify-between gap-2 text-xs",
+									children: [
+										jsxs("div", {
+											className: "flex flex-col",
+											style: { minWidth: 0 },
+											children: [
+												jsx("span", { className: "truncate text-(--ui-text-primary)", children: t.label }),
+												jsx("span", { className: cn("truncate", small), children: t.meta }),
+											],
+										}),
+										jsxs("span", {
+											className: "text-right tabular-nums",
+											children: [
+												jsx("span", { style: toneStyle(t.hitTone), children: t.hitText }),
+												jsx("span", { className: small, children: ` · ${t.burnText}` }),
+											],
+										}),
+									],
+								}, t.id),
+							),
+						],
+					})
+				: null,
+			cm.error ? jsx("div", { className: small, children: `cache stats error: ${cm.error}` }) : null,
+		],
+	});
+}
+
 function QuotaView() {
 	const { data, isLoading, isError, error, refetch } = useStatus();
 	const refresh = useRefresh();
@@ -514,9 +674,12 @@ function QuotaView() {
 			jsx("div", { className: "text-sm font-medium", children: "Quota" }),
 			jsx("div", {
 				className: "flex flex-1 flex-col gap-2 overflow-y-auto",
-				children: providers.map((pid) =>
-					jsx(ProviderCard, { pid, provider: data.providers[pid], now, key: pid }),
-				),
+				children: [
+					...providers.map((pid) =>
+						jsx(ProviderCard, { pid, provider: data.providers[pid], now, key: pid }),
+					),
+					jsx(CacheCard, { payload: data, key: "cache" }),
+				],
 			}),
 			data.pending_count > 0
 				? jsx("div", {

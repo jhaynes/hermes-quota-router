@@ -8,6 +8,7 @@ Host-level quota awareness for `anthropic` and `openai-codex`.
 - **Alerts:** at 75% and 90%, once per window per reset cycle.
 - **Alert queue:** only `hermes quota-router refresh` (the cron path) **drains** and delivers pending alert/transition lines. A manual refresh (`/quota refresh`, `hermes quota-router status --refresh`) folds fresh usage in and enqueues any new lines, but leaves the queue for the next cron run to deliver — it no longer swallows them. Delivery is **at-most-once**: drained lines are removed from state immediately, so if the cron script's delivery step then fails, those lines are lost, not retried.
 - **Surfaces:** `hermes quota-router status [--refresh] | refresh | path`, `/quota [refresh]`.
+- **Cache efficiency:** 24h/7d prompt-cache hit rates per provider and source, the top-burner sessions, and low-hit alerts, all from this host's `state.db` (see below).
 
 State lives at `<root HERMES_HOME>/cache/quota-router/state.json` and is shared by every profile on the host.
 
@@ -27,6 +28,38 @@ Anthropic's `/api/oauth/usage` response includes a `limits[]` list with per-mode
 - **Fail-open with carry-forward.** If the scoped fetch fails or is throttled, the last good scoped windows are kept in state and shown in `status`/`--json` with a `stale` marker, until they are older than `stale_after_s`, at which point they drop from the snapshot.
 - A scoped failure never blocks or delays the core `anthropic` fetch, and is recorded independently under the `scoped` fetch slot (never alerts).
 
+## Cache efficiency
+
+`refresh()` (the 15-minute cron and any manual refresh, never a request hook) also reads this host's `<root HERMES_HOME>/state.db` and summarises how well prompt caching is working. The query is **read-only**: the DB is opened with a `file:…?mode=ro` URI and a 0.5 s busy timeout, and a missing file is never created.
+
+- **Metric:** `hit = cache_read / (input + cache_read + cache_write)`, over trailing **24h** and **7d** windows. `input` is uncached input.
+- **Breakdowns:** per provider (`anthropic`, `openai-codex`, and `other` for every other `billing_provider`), then per `source` (desktop, kanban, cron, tui, …) within each provider. It also lists the **top 5 burners**: sessions ranked by uncached input plus cache writes over 24h, with id, title, source, model, hit % and tokens.
+- **Attribution caveat:** session token totals in `state.db` are cumulative, and windows filter on `last_activity_at` (falling back to `started_at`). A long session's **whole** total is attributed to the window it was last active in. A week-old session that was active an hour ago counts in full towards 24h.
+- **Host-local:** each host reports only its own root `state.db`. The payload's `host` says which host. Profile-local `state.db` files (`profiles/<name>/state.db`) are not read.
+- **State:** only the latest aggregates and top-5 list are kept (`state.json` → `cache`), with no per-run history.
+- **Failures:** a missing, locked or unreadable DB records a `cache` fetch outcome (`missing` / `locked` / `db_error`) with the incident's first-failure time. The last good aggregates stay on display, and the failure is shown under the `cache:` block. It is display-only and never alerts, and it never changes tier, mode or blocks.
+
+**Alerts** go through the normal queue, so like every other alert they are delivered only on the cron path. Each condition fires at most once per 24h:
+
+| key | default | fires when |
+|---|---|---|
+| `cache_alert_below` | `80` | a provider's 24h hit % is below this … |
+| `cache_alert_min_tokens` | `20000000` | … **and** its 24h input (cached + uncached + writes) is at least this, so low-volume noise stays quiet |
+| `cache_write_alert_tokens` | `10000000` | a single session wrote at least this many tokens to cache in 24h … |
+| `cache_write_alert_below` | `50` | … at a hit % below this |
+
+Set them under `plugins.entries.quota-router` in `config.yaml`, like the other thresholds:
+
+```yaml
+plugins:
+  entries:
+    quota-router:
+      cache_alert_below: 85
+      cache_alert_min_tokens: 50000000
+```
+
+**Surfaces:** `hermes quota-router status` and `/quota` add a `cache:` block showing 24h/7d hit % per provider and source, plus the top burners. `status --json` adds a `cache` object (see below). The desktop widget shows 24h hit % per provider in the chip's hover card, and 24h/7d hit % plus the top-burner list in the Quota pane.
+
 ## `status --json`
 
 `hermes quota-router status --json [--refresh]` prints exactly one `QRJSON <payload>` line to stdout (nothing else on stdout; logging goes to stderr) for the desktop widget or any other machine reader. `--refresh --json` fetches fresh data but does **not** drain the pending-alert queue — only `hermes quota-router refresh` (the cron path) does that.
@@ -43,6 +76,8 @@ For each window in `forecast_windows` (default: Anthropic `Current session` as `
 - `status: "unknown"` (with a `reason`) when there is no reset time, fewer than 4 points, a span under 40 minutes, or `used` under 20%.
 
 Scoped (model) windows get `forecast: null`. The forecast doesn't change tiers or mode.
+
+Since 0.3.0 it also carries `cache`: `collected_at`, `stale` (older than `stale_after_s`, or never collected), `alert_below`, `providers.<anthropic|openai-codex|other>.<24h|7d>` (`sessions`, `input`, `cache_read`, `cache_write`, `output`, `hit` — `null` with no input — and `sources.<source>` with the same fields minus `sources`), `top` (up to 5 × `id`, `title`, `source`, `model`, `provider`, `input`, `cache_read`, `cache_write`, `output`, `burn`, `hit`), and `fetch` (`last_ok_at`, `error`). The field is additive, so `v` stays `1`.
 
 ## Deliberately out of scope
 

@@ -199,6 +199,9 @@ def refresh(now: float | None = None, snapshots: dict | None = None, drain: bool
             if ok and windows is not None:
                 scoped_windows = windows
 
+    # Cache stats: read-only state.db aggregate, collected before taking the state lock.
+    cache_outcome = core.collect_cache_outcome(core.state_db_path(), now, cfg)
+
     with core.locked_state(core.state_path()) as st:
         for p, (ok, kind, message) in outcomes.items():
             core.note_fetch(st, p, ok=ok, kind=kind, message=message, now=now, cfg=cfg)
@@ -251,6 +254,7 @@ def refresh(now: float | None = None, snapshots: dict | None = None, drain: bool
                         "details": [], "windows": extra,
                     }
         core.apply_refresh(st, snapshots, now, cfg)
+        core.apply_cache(st, cache_outcome, now, cfg)
         return core.drain_pending(st) if drain else []
 
 

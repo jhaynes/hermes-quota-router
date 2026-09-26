@@ -129,6 +129,29 @@ def test_run_skips_until_seven_days_of_history():
     assert "biased" in md and "| enter_projected |" in md
 
 
+def _state_history(days, cadence_s):
+    """History as the plugin records it: every fetch folded through core.apply_refresh, which
+    prunes to the 7-day retention window."""
+    st = core.empty_state()
+    t = T0
+    while t < T0 + days * 24 * H:
+        start = T0 + ((t - T0) // CYCLE) * CYCLE
+        core.apply_refresh(st, {"anthropic": {"fetched_at": t, "windows": [
+            {"label": "Current session", "used_percent": 5 * (t - start) / H, "resets_at": start + CYCLE},
+            {"label": "Current week", "used_percent": 40.0, "resets_at": T0 + 30 * 24 * H}]}},
+            t, dict(core.DEFAULTS))
+        t += cadence_s
+    return st["history"]["anthropic"]
+
+
+def test_run_accepts_a_full_retention_window_recorded_by_the_plugin():
+    for cadence in (5 * M + 1, 15 * M + 7):          # real fetch times never align with the cutoff
+        out = bt.run(_state_history(9, cadence), [], base_t(), dict(core.DEFAULTS))
+        assert "skipped" not in out, (cadence, out.get("skipped"))
+    out = bt.run(_state_history(6.5, 15 * M), [], base_t(), dict(core.DEFAULTS))
+    assert out["skipped"].startswith("needs 7 days of history")
+
+
 def test_malformed_history_is_ignored():
     hist = synthetic_week(days=1.0)
     hist["Current session"][5] = ["bad"]

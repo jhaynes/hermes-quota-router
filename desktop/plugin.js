@@ -133,6 +133,73 @@ function toneForMode(mode) {
 	return "good";
 }
 
+const PROVIDER_NAMES = { anthropic: "Anthropic", "openai-codex": "Codex" };
+
+/** Traffic-light tone for a remaining-% value (>30 good, 11-30 warn, <=10 bad). */
+function leftTone(left) {
+	if (left == null) return "muted";
+	if (left <= 10) return "bad";
+	if (left <= 30) return "warn";
+	return "good";
+}
+
+/** Compact "N ago" from a seconds delta. */
+function fmtAgo(seconds) {
+	if (seconds == null || !Number.isFinite(Number(seconds))) return "";
+	const s = Math.max(0, Math.floor(Number(seconds)));
+	if (s < 60) return "just now";
+	if (s < 3600) return `${Math.floor(s / 60)}m ago`;
+	if (s < 86400) return `${Math.floor(s / 3600)}h ago`;
+	return `${Math.floor(s / 86400)}d ago`;
+}
+
+/** Structured model for the chip's hover card: one stacked section per
+ *  provider, core windows first then model limits, every value toned. */
+function tipModel(payload, nowMs) {
+	const tierTones = { ok: "good", tight: "warn", exhausted: "bad" };
+	const providers = [];
+	for (const pid of Object.keys(payload?.providers || {})) {
+		const p = payload.providers[pid] || {};
+		const rows = (p.windows || [])
+			.map((w) => {
+				const left = remainingPct(w);
+				const scoped = Boolean(w.scope) || w.affects_tier === false;
+				return {
+					label: String(w.label || w.scope || "window").replace(/\s*\(model\)\s*$/, ""),
+					left,
+					leftTone: leftTone(left),
+					reset: w.resets_at ? fmtReset(w.resets_at, nowMs) : "",
+					scoped,
+					stale: Boolean(w.stale),
+				};
+			})
+			.sort((a, b) => Number(a.scoped) - Number(b.scoped));
+		const fetchErr = p.fetch?.core?.error || p.fetch?.scoped?.error;
+		providers.push({
+			name: PROVIDER_NAMES[pid] || pid,
+			tier: p.tier || "unknown",
+			tierTone: tierTones[p.tier] || "muted",
+			stale: Boolean(p.stale),
+			rows,
+			block: p.block ? `${p.block.message || "blocked"}${p.block.until ? ` · clears ${fmtReset(p.block.until, nowMs)}` : ""}` : "",
+			fetchError: fetchErr ? String(fetchErr.message || fetchErr.kind || "fetch failed") : "",
+		});
+	}
+	const nowS = nowMs / 1000;
+	const fetched = Object.values(payload?.providers || {})
+		.map((p) => p?.fetched_at)
+		.filter((x) => Number.isFinite(Number(x)));
+	const newest = fetched.length ? Math.max(...fetched.map(Number)) : null;
+	const footerParts = [payload?.host, newest != null ? `fetched ${fmtAgo(nowS - newest)}` : ""];
+	if (payload?.pending_count > 0) footerParts.push(`${payload.pending_count} alerts awaiting cron`);
+	return {
+		mode: payload?.mode || "unknown",
+		modeTone: toneForMode(payload?.mode),
+		providers,
+		footer: footerParts.filter(Boolean).join(" · "),
+	};
+}
+
 // END PURE
 
 /** One CLI call, timeout-guarded. Returns the raw cli.exec result. */
@@ -202,21 +269,98 @@ function useRefresh() {
 
 // ---- statusbar chip ---------------------------------------------------------
 
-function chipTip(payload) {
-	const lines = [];
-	for (const pid of Object.keys(payload.providers || {})) {
-		const p = payload.providers[pid];
-		lines.push(`${pid} (${p.tier}${p.stale ? ", stale" : ""})`);
-		for (const w of p.windows || []) {
-			const r = remainingPct(w);
-			const reset = w.resets_at ? ` · resets ${fmtReset(w.resets_at, Date.now())}` : "";
-			lines.push(`  ${w.label}: ${r == null ? "—" : `${r}% left`}${reset}`);
-		}
-		if (p.block) lines.push(`  BLOCKED: ${p.block.message || "blocked"}`);
-		const fetchErr = p.fetch?.core?.error || p.fetch?.scoped?.error;
-		if (fetchErr) lines.push(`  fetch error: ${fetchErr.message || fetchErr.kind}`);
-	}
-	return lines.join("\n") || "Quota Router";
+// Hover card. Tooltip bubbles use bg-foreground / text-background (inverted
+// theme), so tones use saturated palette colours that read on either polarity.
+// Hairline in the bubble's own text colour; Tailwind border-current/15 isn't in the app bundle.
+const RULE = { borderTop: "1px solid color-mix(in srgb, currentColor 18%, transparent)" };
+
+// Tip bubbles invert the theme (bg-foreground / text-background), so a fixed
+// palette shade is unreadable on one polarity. Mix each hue with the bubble's
+// own text colour: darker on a light bubble, lighter on a dark one.
+const TONE_HUE = { good: "#10b981", warn: "#f59e0b", bad: "#ef4444" };
+function toneStyle(tone, extra) {
+	const hue = TONE_HUE[tone];
+	const base = hue ? { color: `color-mix(in oklab, ${hue} 72%, currentColor)` } : { opacity: 0.6 };
+	return extra ? { ...base, ...extra } : base;
+}
+
+function TipRow({ r }) {
+	return jsxs("div", {
+		className: "contents",
+		children: [
+			jsx("span", { className: cn("truncate", r.scoped && "pl-2", (r.scoped || r.stale) && "opacity-80"), children: r.label + (r.stale ? " (stale)" : "") }),
+			jsx("span", {
+				className: "text-right font-semibold tabular-nums",
+				style: toneStyle(r.leftTone),
+				children: r.left == null ? "—" : `${r.left}%`,
+			}),
+			jsx("span", { className: "text-right tabular-nums opacity-60", children: r.reset || "" }),
+		],
+	});
+}
+
+function TipProvider({ p }) {
+	const core = p.rows.filter((r) => !r.scoped);
+	const scoped = p.rows.filter((r) => r.scoped);
+	return jsxs("div", {
+		className: "flex flex-col gap-1",
+		children: [
+			jsxs("div", {
+				className: "flex items-center justify-between gap-3",
+				children: [
+					jsx("span", { className: "font-semibold", children: p.name }),
+					jsx("span", {
+						className: "text-[0.625rem] font-semibold uppercase tracking-wide",
+						style: toneStyle(p.tierTone),
+						children: p.tier + (p.stale ? " · stale" : ""),
+					}),
+				],
+			}),
+			jsxs("div", {
+				className: "grid items-baseline gap-x-3 gap-y-0.5",
+				style: { gridTemplateColumns: "minmax(0,1fr) auto auto" },
+				children: [
+					...core.map((r, i) => jsx(TipRow, { r }, `c${i}`)),
+					scoped.length
+						? jsx("span", {
+								className: "mt-0.5 text-[0.625rem] uppercase tracking-wide opacity-50",
+								style: { gridColumn: "1 / -1" },
+								children: "Model limits",
+							}, "sh")
+						: null,
+					...scoped.map((r, i) => jsx(TipRow, { r }, `s${i}`)),
+				],
+			}),
+			p.block ? jsx("div", { className: "font-semibold", style: toneStyle("bad"), children: `⛔ ${p.block}` }) : null,
+			p.fetchError ? jsx("div", { style: toneStyle("warn"), children: `⚠ fetch: ${p.fetchError}` }) : null,
+		],
+	});
+}
+
+function ChipTip({ payload }) {
+	const m = tipModel(payload, Date.now());
+	if (!m.providers.length) return "Quota Router — no snapshot yet";
+	return jsxs("div", {
+		className: "flex flex-col gap-2 py-0.5",
+		style: { minWidth: "15rem" },
+		children: [
+			jsxs("div", {
+				className: "flex items-center justify-between gap-3",
+				children: [
+					jsx("span", { className: "font-semibold", children: "Quota" }),
+					jsx("span", { className: "font-semibold", style: toneStyle(m.modeTone), children: `mode: ${m.mode}` }),
+				],
+			}),
+			...m.providers.map((p, i) =>
+				jsxs("div", {
+					className: "flex flex-col gap-1 pt-1.5",
+					style: RULE,
+					children: [jsx(TipProvider, { p })],
+				}, `p${i}`),
+			),
+			m.footer ? jsx("div", { className: "pt-1 text-[0.625rem] opacity-60", style: RULE, children: m.footer }) : null,
+		],
+	});
 }
 
 function QuotaChip() {
@@ -233,7 +377,7 @@ function QuotaChip() {
 	const summary = chipSummary(data) || "no data";
 	const tone = toneForMode(data.mode);
 	return jsx(Tip, {
-		label: chipTip(data),
+		label: jsx(ChipTip, { payload: data }),
 		children: jsxs("button", {
 			type: "button",
 			className: cn(

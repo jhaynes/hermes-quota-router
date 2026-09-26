@@ -105,6 +105,11 @@ hermes cron create "every 15m" --name "Quota router: usage refresh + alerts" --s
 
 The refresh may run every 5 minutes (`hermes cron edit <id> --schedule "every 5m"`). Run shadow mode at 15 minutes first, then 5 minutes. A built-in backoff keeps a failing endpoint from being hammered: after 3 non-ok core fetches for a provider within an hour (from the `fetch_log` ring) with no success since, that provider is fetched at most every 15 minutes, with one `quota-router: <provider> usage fetch backing off to 15m (...)` alert per incident. The next success clears it.
 
+## Evaluation (read-only)
+
+- `python eval/outcomes.py --state-db <profile>/state.db --kanban-db <board>/kanban.db [...] [--days 7] [--json]` groups a profile's top-level kanban worker sessions by `provider/model`: sessions, cards, card outcomes (task status), review rejects (`changes_requested` events) and turns. Both databases are opened read-only. Model is confounded with task, so it's a first signal, not a benchmark.
+- `python eval/backtest.py --state <root>/cache/quota-router/state.json [--throttle-json '{...}'] [--json]` replays recorded history through the throttle policy for the current thresholds and a ±5-point grid (`enter_projected` 85–100, `leave_projected` 70–90, leave < enter). It reports constrained hours, misses (a window reached 97% or a block happened while the throttle was `fast` in the hour before) and false alarms (constrained periods whose window's cycle ended below 85%). The proposal minimises misses, then constrained time. Tightening is proposed automatically; any loosening is labelled Justin's judgement and needs 3 weeks of history. It skips until 7 days of history exist, and it says that it's biased by constrained periods and by other hosts' usage. Nothing is applied.
+
 ## Tests
 
 ```

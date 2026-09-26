@@ -12,6 +12,10 @@ Host-level quota awareness for `anthropic` and `openai-codex`.
 
 State lives at `<root HERMES_HOME>/cache/quota-router/state.json` and is shared by every profile on the host.
 
+- **Usage history:** every refresh appends `[fetched_at, used_pct, resets_at]` per core (non-scoped) window to `history[provider][label]`. Earlier reset cycles are kept (a `resets_at` move of more than 10 minutes, or null ↔ value, starts a new cycle); points are pruned by age (7 days) and count (2,500 per window). Malformed history is dropped, never fatal.
+- **Fetch-outcome ring:** every core fetch appends `[t, provider, outcome]` (`ok`, `fetch_error`, `unavailable`, `no_data`) to `fetch_log`, capped at 24 h / 1,000 entries.
+- Both keys are additive under `version: 1`; older plugin versions ignore them.
+
 ## Fetch failures
 
 Every `refresh()` records each provider's fetch outcome per slot (`core`: the standard `/usage` fetch; `scoped`: the Anthropic model-scoped `limits[]` fetch). A failure preserves the incident's first-failure timestamp even if the error `kind` changes mid-incident. For the `core` slot only, a failing incident that has lasted the 15-minute cron's 30–60 minute window (`stale_after_s`) queues one `quota-router: <provider> usage unavailable for <mins>m+ (<kind>: <message>)` alert, and a following success queues one `quota-router: <provider> usage fetch recovered` line. The `scoped` slot is display-only and never alerts. Kinds: `fetch_error` (an exception reached the plugin), `unavailable` (core returned an `unavailable_reason`), `no_data` (core returned nothing; core swallows its own fetch exceptions and returns `None`, so most real network/auth failures land here). `hermes quota-router status` shows the current error, if any, under each provider. This never changes tier logic: a stale snapshot still fails open to `ok` regardless of fetch health.
@@ -60,7 +64,18 @@ plugins:
 
 `hermes quota-router status --json [--refresh]` prints exactly one `QRJSON <payload>` line to stdout (nothing else on stdout; logging goes to stderr) for the desktop widget or any other machine reader. `--refresh --json` fetches fresh data but does **not** drain the pending-alert queue — only `hermes quota-router refresh` (the cron path) does that.
 
-The payload (`v: 1`) has `host`, `now`, `mode`/`mode_since`, and per-provider `tier`, `fetched_at`, `stale`, `plan`, `windows` (each with `affects_tier: bool` — `false` for scoped windows), `block`, `fetch.core`/`fetch.scoped` outcomes, and `details`; plus top-level `recent_errors` (last 5) and `pending_count`.
+The payload (`v: 1`) has `host`, `now`, `mode`/`mode_since`, and per-provider `tier`, `fetched_at`, `stale`, `plan`, `windows` (each with `affects_tier: bool` — `false` for scoped windows — and `forecast`), `block`, `fetch.core`/`fetch.scoped` outcomes, and `details`; plus top-level `recent_errors` (last 5) and `pending_count`.
+
+## Forecast
+
+For each window in `forecast_windows` (default: Anthropic `Current session` as `session`, `Current week` and `Opus week` as `weekly`), `status` and `status --json` show a forecast computed from the current reset cycle's history:
+
+- `rate_pct_h` (`r_long`): `session` uses the least-squares slope over the whole current cycle; `weekly` uses the cycle average (used ÷ elapsed cycle time), so quiet nights count.
+- `r_short`: least-squares slope over the last 30 minutes (`session`) or 6 hours (`weekly`).
+- `projected_at_reset = used + max(r_long, 0) × hours_to_reset`, clamped to [used, 200]; `projected_short` is the same with `r_short`. `accel = r_short − r_long`. `confidence` is the number of points.
+- `status: "unknown"` (with a `reason`) when there is no reset time, fewer than 4 points, a span under 40 minutes, or `used` under 20%.
+
+Scoped (model) windows get `forecast: null`. The forecast doesn't change tiers or mode.
 
 Since 0.3.0 it also carries `cache`: `collected_at`, `stale` (older than `stale_after_s`, or never collected), `alert_below`, `providers.<anthropic|openai-codex|other>.<24h|7d>` (`sessions`, `input`, `cache_read`, `cache_write`, `output`, `hit` — `null` with no input — and `sources.<source>` with the same fields minus `sources`), `top` (up to 5 × `id`, `title`, `source`, `model`, `provider`, `input`, `cache_read`, `cache_write`, `output`, `burn`, `hit`), and `fetch` (`last_ok_at`, `error`). The field is additive, so `v` stays `1`.
 

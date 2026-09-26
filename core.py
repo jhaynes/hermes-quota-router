@@ -30,6 +30,19 @@ DEFAULTS = {
     "stale_after_s": 30 * 60,  # snapshots older than this are ignored (fail open to normal)
     "block_ttl_s": 6 * 3600,   # observed hard-block without a known reset expires after this
     "alert_thresholds": [75.0, 90.0],
+    "cycle_tolerance_s": 10 * 60,  # resets_at moving more than this starts a new history cycle
+    # Forecast (v2 B5). Window labels are core's; kind picks the rate maths below.
+    "forecast_windows": {"anthropic": {"Current session": "session", "Current week": "weekly",
+                                       "Opus week": "weekly"}},
+    "forecast_kinds": {
+        # long rate: least squares over the whole current cycle
+        "session": {"period_s": 5 * 3600, "short_lookback_s": 30 * 60, "long_rate": "lsq"},
+        # long rate: cycle average (used / elapsed cycle time) so quiet nights count
+        "weekly": {"period_s": 7 * 24 * 3600, "short_lookback_s": 6 * 3600, "long_rate": "cycle_average"},
+    },
+    "forecast_min_points": 4,
+    "forecast_min_span_s": 40 * 60,
+    "forecast_min_used": 20.0,
     # cache efficiency (display + alert only; never feeds tier/mode/blocks)
     "cache_alert_below": 80.0,             # provider 24h hit % below this ...
     "cache_alert_min_tokens": 20_000_000,  # ... on at least this much 24h input -> alert
@@ -63,11 +76,16 @@ def state_db_path(hermes_home: Optional[str | Path] = None) -> Path:
 
 
 PENDING_CAP = 50
+HISTORY_MAX_AGE_S = 7 * 24 * 3600
+HISTORY_MAX_POINTS = 2500     # per (provider, window)
+FETCH_LOG_MAX_AGE_S = 24 * 3600
+FETCH_LOG_MAX = 1000
 
 
 def empty_state() -> dict:
     return {"version": 1, "providers": {}, "mode": "normal", "mode_since": 0.0, "alerts_sent": {},
-            "transitions": [], "blocks": {}, "errors": [], "pending": []}
+            "transitions": [], "blocks": {}, "errors": [], "pending": [],
+            "history": {}, "fetch_log": []}
 
 
 def _is_deliverable(line: str) -> bool:
@@ -253,6 +271,130 @@ def prune_alerts(sent: dict, now: float) -> None:
             sent.pop(key, None)
 
 
+def _num(v: Any) -> bool:
+    return isinstance(v, (int, float)) and not isinstance(v, bool) and v == v
+
+
+def _valid_point(p: Any) -> bool:
+    return (isinstance(p, list) and len(p) == 3 and _num(p[0]) and _num(p[1])
+            and (p[2] is None or _num(p[2])))
+
+
+def append_history(state: dict, provider: str, snap: dict, now: float) -> None:
+    """Append ``[fetched_at, used, resets_at]`` per core (unscoped, non-stale) window of a normalized
+    snapshot to ``state['history'][provider][label]``. A snapshot no newer than the last point is
+    ignored (manual status refreshes re-fold the same data). Points from earlier reset cycles are
+    kept; pruning is by age (``HISTORY_MAX_AGE_S``) and count (``HISTORY_MAX_POINTS``) only.
+    Malformed history is repaired by dropping the bad parts, never raised."""
+    if not isinstance(state.get("history"), dict):
+        state["history"] = {}
+    per = state["history"].get(provider)
+    if not isinstance(per, dict):
+        per = state["history"][provider] = {}
+    t = float(snap.get("fetched_at") or now)
+    for w in snap.get("windows") or []:
+        if w.get("scope") or w.get("stale"):
+            continue
+        pts = per.get(w["label"])
+        pts = [p for p in pts if _valid_point(p)] if isinstance(pts, list) else []
+        if not pts or t > pts[-1][0]:
+            pts.append([t, float(w["used"]), w.get("resets_at")])
+        per[w["label"]] = [p for p in pts if p[0] >= now - HISTORY_MAX_AGE_S][-HISTORY_MAX_POINTS:]
+
+
+def _same_cycle(a: Optional[float], b: Optional[float], cfg: dict) -> bool:
+    if a is None or b is None:
+        return a is None and b is None
+    return abs(a - b) <= cfg["cycle_tolerance_s"]
+
+
+def current_cycle(points: list, cfg: dict) -> list:
+    """Trailing points sharing the last point's reset cycle. A ``resets_at`` move beyond
+    ``cycle_tolerance_s``, or a null↔value change, starts a new cycle."""
+    out: list = []
+    for p in reversed(points):
+        if out and not _same_cycle(p[2], out[-1][2], cfg):
+            break
+        out.append(p)
+    return out[::-1]
+
+
+def _slope_per_h(points: list) -> Optional[float]:
+    """Least-squares slope of used% over time, in %/h (None if fewer than 2 distinct times)."""
+    n = len(points)
+    if n < 2:
+        return None
+    mt = sum(p[0] for p in points) / n
+    mu = sum(p[1] for p in points) / n
+    den = sum((p[0] - mt) ** 2 for p in points)
+    if den <= 0:
+        return None
+    return sum((p[0] - mt) * (p[1] - mu) for p in points) / den * 3600.0
+
+
+def forecast(points: Any, now: float, kind: dict, cfg: dict) -> dict:
+    """Projected usage at reset for one window (v2 B5). Pure.
+
+    ``r_long``: least squares over the current cycle (``lsq``) or the cycle average
+    (``cycle_average``: used ÷ elapsed cycle time). ``r_short``: least squares over the last
+    ``short_lookback_s``. ``projected_at_reset = used + max(r_long, 0) × hours_to_reset`` (and
+    ``projected_short`` with ``r_short``), clamped to [used, 200]. ``accel = r_short − r_long``.
+    ``unknown`` with a ``reason`` when there is no reset time, fewer than ``forecast_min_points``
+    points, a span under ``forecast_min_span_s`` or ``used`` under ``forecast_min_used``.
+    """
+    pts = [p for p in (points if isinstance(points, list) else []) if _valid_point(p) and p[0] <= now]
+    cycle = current_cycle(sorted(pts, key=lambda p: p[0]), cfg)
+    if not cycle:
+        return {"status": "unknown", "reason": "no history", "confidence": 0}
+    last_t, used, resets_at = cycle[-1]
+    base = {"used": used, "resets_at": resets_at, "confidence": len(cycle)}
+    if resets_at is None:
+        return {"status": "unknown", "reason": "no reset time", **base}
+    period = float(kind["period_s"])
+    cycle = [p for p in cycle if p[0] >= resets_at - period]
+    base["confidence"] = len(cycle)
+    if len(cycle) < cfg["forecast_min_points"]:
+        return {"status": "unknown", "reason": f"{len(cycle)} points < {cfg['forecast_min_points']}", **base}
+    span = cycle[-1][0] - cycle[0][0]
+    if span < cfg["forecast_min_span_s"]:
+        return {"status": "unknown", "reason": f"span {int(span // 60)}m < {int(cfg['forecast_min_span_s'] // 60)}m",
+                **base}
+    if used < cfg["forecast_min_used"]:
+        return {"status": "unknown", "reason": f"used {used:.0f}% < {cfg['forecast_min_used']:.0f}%", **base}
+    if kind.get("long_rate") == "cycle_average":
+        elapsed = last_t - (resets_at - period)
+        r_long = used / (elapsed / 3600.0) if elapsed > 0 else 0.0
+    else:
+        r_long = _slope_per_h(cycle) or 0.0
+    recent = [p for p in cycle if p[0] >= last_t - kind["short_lookback_s"]]
+    r_short = _slope_per_h(recent) if len(recent) >= 3 else None
+    r_short = r_long if r_short is None else r_short
+    hours = max(resets_at - now, 0.0) / 3600.0
+
+    def project(rate: float) -> float:
+        return min(max(used + max(rate, 0.0) * hours, used), 200.0)
+
+    return {"status": "ok", **base, "rate_pct_h": r_long, "r_short": r_short, "accel": r_short - r_long,
+            "projected_at_reset": project(r_long), "projected_short": project(r_short)}
+
+
+def forecast_state(state: dict, now: float, cfg: dict) -> dict:
+    """``{provider: {label: forecast + {'kind'}}}`` for every configured ``forecast_windows``
+    label that has history."""
+    out: dict = {}
+    hist = state.get("history")
+    hist = hist if isinstance(hist, dict) else {}
+    for provider, labels in (cfg.get("forecast_windows") or {}).items():
+        per = hist.get(provider)
+        per = per if isinstance(per, dict) else {}
+        for label, kind_name in labels.items():
+            kind = cfg["forecast_kinds"].get(kind_name)
+            if kind is None or label not in per:
+                continue
+            out.setdefault(provider, {})[label] = {**forecast(per[label], now, kind, cfg), "kind": kind_name}
+    return out
+
+
 def apply_refresh(state: dict, snapshots: dict, now: float, cfg: dict) -> list[str]:
     """Fold fresh snapshots into ``state``; return human lines for alerts/transitions (empty = quiet)."""
     lines: list[str] = []
@@ -260,6 +402,7 @@ def apply_refresh(state: dict, snapshots: dict, now: float, cfg: dict) -> list[s
     for provider, snap in snapshots.items():
         pstate = state["providers"].setdefault(provider, {"tier": "ok", "tier_since": now})
         pstate["snapshot"] = normalize_snapshot(snap, now)
+        append_history(state, provider, pstate["snapshot"], now)
         lines += alert_lines(provider, pstate["snapshot"]["windows"], state["alerts_sent"], cfg)
     lines += recompute(state, now, cfg)
     queue(state, *lines)
@@ -607,15 +750,18 @@ def _in(agg: dict) -> int:
 def status_payload(state: dict, now: float, cfg: dict, host: str) -> dict:
     """Machine-readable status for the desktop widget: see the plan's JSON contract."""
     providers = {}
+    forecasts = forecast_state(state, now, cfg)
     for p in WATCHED:
         ps = state["providers"].get(p) or {}
         snap = ps.get("snapshot") or {}
         fetch = ps.get("fetch") or {}
         core_fetch = fetch.get("core") or {}
         scoped_fetch = fetch.get("scoped") or {}
+        pf = forecasts.get(p) or {}
         windows = [{"label": w["label"], "used": w["used"], "resets_at": w.get("resets_at"),
                    "scope": w.get("scope"), "affects_tier": not w.get("scope"),
-                   "stale": bool(w.get("stale"))}
+                   "stale": bool(w.get("stale")),
+                   "forecast": None if w.get("scope") else pf.get(w["label"])}
                   for w in (snap.get("windows") or [])]
         block = state["blocks"].get(p)
         block_out = {"until": block["until"], "message": block.get("message", "")[:200]} \
@@ -654,6 +800,12 @@ def note_fetch(state: dict, provider: str, *, slot: str = "core", ok: bool, kind
     pstate = state["providers"].setdefault(provider, {"tier": "ok", "tier_since": now})
     fetch = pstate.setdefault("fetch", {})
     fslot = fetch.setdefault(slot, {"last_ok_at": None, "error": None, "alerted": False})
+    if slot == "core":
+        log = state.get("fetch_log")
+        log = [e for e in log if isinstance(e, list) and len(e) == 3 and _num(e[0])] \
+            if isinstance(log, list) else []
+        log.append([now, provider, "ok" if ok else (kind or "error")])
+        state["fetch_log"] = [e for e in log if e[0] >= now - FETCH_LOG_MAX_AGE_S][-FETCH_LOG_MAX:]
     if ok:
         had_alerted = bool(fslot.get("error") and fslot.get("alerted"))
         fslot["last_ok_at"] = now
@@ -683,7 +835,17 @@ def clear_block_on_success(state: dict, provider: str, now: float) -> bool:
     return False
 
 
+def _forecast_text(f: Optional[dict]) -> str:
+    if not f:
+        return ""
+    if f.get("status") != "ok":
+        return f"  forecast unknown ({f.get('reason', '?')})"
+    return (f"  → {f['projected_at_reset']:.0f}% at reset ({f['rate_pct_h']:.1f}%/h, "
+            f"short {f['r_short']:.1f}%/h, n={f['confidence']})")
+
+
 def render_status(state: dict, now: float, cfg: dict) -> str:
+    forecasts = forecast_state(state, now, cfg)
     out = [f"mode: {state.get('mode', 'normal')}"
            + (f" (since {datetime.fromtimestamp(state['mode_since']):%a %H:%M})" if state.get("mode_since") else "")]
     for p in WATCHED:
@@ -697,7 +859,8 @@ def render_status(state: dict, now: float, cfg: dict) -> str:
         scoped_windows = [w for w in (snap.get("windows") or []) if w.get("scope")]
         for w in core_windows:
             reset = datetime.fromtimestamp(w["resets_at"]).strftime("%a %H:%M") if w.get("resets_at") else "?"
-            out.append(f"    {w['label']:<16} {w['used']:5.1f}%  resets {reset}")
+            out.append(f"    {w['label']:<16} {w['used']:5.1f}%  resets {reset}"
+                       + _forecast_text((forecasts.get(p) or {}).get(w["label"])))
         if scoped_windows:
             out.append("    model limits:")
             for w in scoped_windows:

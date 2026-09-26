@@ -107,8 +107,8 @@ esac
     return exe, log
 
 
-def _run_script(exe):
-    env = dict(os.environ, QR_HERMES_BIN=str(exe))
+def _run_script(exe, **extra_env):
+    env = dict(os.environ, QR_HERMES_BIN=str(exe), **extra_env)
     return subprocess.run([sys.executable, str(_root / "scripts" / "quota-router-refresh.py")],
                           capture_output=True, text=True, timeout=60, env=env)
 
@@ -135,3 +135,21 @@ def test_cron_script_reports_a_failed_apply(tmp_path):
     r = _run_script(exe)
     assert r.returncode == 1
     assert "quota-router throttle apply failed (exit 4)" in r.stdout
+
+
+def test_cron_script_applies_even_when_refresh_hangs(tmp_path):
+    exe, log = _fake_hermes(tmp_path)
+    exe.write_text(exe.read_text().replace('refresh) echo', 'refresh) sleep 5; echo'))
+    r = _run_script(exe, QR_STEP_TIMEOUT="1")
+    assert r.returncode == 1
+    assert log.read_text().splitlines() == ["quota-router refresh", "quota-router throttle apply"]
+    assert "quota-router refresh failed (timed out after 1s)" in r.stdout
+    assert "quota-router: throttle line" in r.stdout
+
+
+def test_cron_script_reports_a_missing_binary_for_every_step(tmp_path):
+    r = _run_script(tmp_path / "no-such-hermes")
+    assert r.returncode == 1
+    assert [l.split(" (")[0] for l in r.stdout.splitlines()] == [
+        "quota-router refresh failed", "quota-router throttle apply failed"]
+    assert "Traceback" not in r.stderr

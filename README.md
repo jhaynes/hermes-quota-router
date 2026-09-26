@@ -11,6 +11,10 @@ Host-level quota awareness for `anthropic` and `openai-codex`.
 
 State lives at `<root HERMES_HOME>/cache/quota-router/state.json` and is shared by every profile on the host.
 
+- **Usage history:** every refresh appends `[fetched_at, used_pct, resets_at]` per core (non-scoped) window to `history[provider][label]`. Earlier reset cycles are kept (a `resets_at` move of more than 10 minutes, or null ↔ value, starts a new cycle); points are pruned by age (7 days) and count (2,500 per window). Malformed history is dropped, never fatal.
+- **Fetch-outcome ring:** every core fetch appends `[t, provider, outcome]` (`ok`, `fetch_error`, `unavailable`, `no_data`) to `fetch_log`, capped at 24 h / 1,000 entries.
+- Both keys are additive under `version: 1`; older plugin versions ignore them.
+
 ## Fetch failures
 
 Every `refresh()` records each provider's fetch outcome per slot (`core`: the standard `/usage` fetch; `scoped`: the Anthropic model-scoped `limits[]` fetch). A failure preserves the incident's first-failure timestamp even if the error `kind` changes mid-incident. For the `core` slot only, a failing incident that has lasted the 15-minute cron's 30–60 minute window (`stale_after_s`) queues one `quota-router: <provider> usage unavailable for <mins>m+ (<kind>: <message>)` alert, and a following success queues one `quota-router: <provider> usage fetch recovered` line. The `scoped` slot is display-only and never alerts. Kinds: `fetch_error` (an exception reached the plugin), `unavailable` (core returned an `unavailable_reason`), `no_data` (core returned nothing; core swallows its own fetch exceptions and returns `None`, so most real network/auth failures land here). `hermes quota-router status` shows the current error, if any, under each provider. This never changes tier logic: a stale snapshot still fails open to `ok` regardless of fetch health.

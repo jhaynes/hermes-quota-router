@@ -28,6 +28,7 @@ DEFAULTS = {
     "stale_after_s": 30 * 60,  # snapshots older than this are ignored (fail open to normal)
     "block_ttl_s": 6 * 3600,   # observed hard-block without a known reset expires after this
     "alert_thresholds": [75.0, 90.0],
+    "cycle_tolerance_s": 10 * 60,  # resets_at moving more than this starts a new history cycle
 }
 TIER_ORDER = {"ok": 0, "tight": 1, "exhausted": 2}
 
@@ -51,11 +52,16 @@ def state_path(hermes_home: Optional[str | Path] = None) -> Path:
 
 
 PENDING_CAP = 50
+HISTORY_MAX_AGE_S = 7 * 24 * 3600
+HISTORY_MAX_POINTS = 2500     # per (provider, window)
+FETCH_LOG_MAX_AGE_S = 24 * 3600
+FETCH_LOG_MAX = 1000
 
 
 def empty_state() -> dict:
     return {"version": 1, "providers": {}, "mode": "normal", "mode_since": 0.0, "alerts_sent": {},
-            "transitions": [], "blocks": {}, "errors": [], "pending": []}
+            "transitions": [], "blocks": {}, "errors": [], "pending": [],
+            "history": {}, "fetch_log": []}
 
 
 def _is_deliverable(line: str) -> bool:
@@ -241,6 +247,54 @@ def prune_alerts(sent: dict, now: float) -> None:
             sent.pop(key, None)
 
 
+def _num(v: Any) -> bool:
+    return isinstance(v, (int, float)) and not isinstance(v, bool) and v == v
+
+
+def _valid_point(p: Any) -> bool:
+    return (isinstance(p, list) and len(p) == 3 and _num(p[0]) and _num(p[1])
+            and (p[2] is None or _num(p[2])))
+
+
+def append_history(state: dict, provider: str, snap: dict, now: float) -> None:
+    """Append ``[fetched_at, used, resets_at]`` per core (unscoped, non-stale) window of a normalized
+    snapshot to ``state['history'][provider][label]``. A snapshot no newer than the last point is
+    ignored (manual status refreshes re-fold the same data). Points from earlier reset cycles are
+    kept; pruning is by age (``HISTORY_MAX_AGE_S``) and count (``HISTORY_MAX_POINTS``) only.
+    Malformed history is repaired by dropping the bad parts, never raised."""
+    if not isinstance(state.get("history"), dict):
+        state["history"] = {}
+    per = state["history"].get(provider)
+    if not isinstance(per, dict):
+        per = state["history"][provider] = {}
+    t = float(snap.get("fetched_at") or now)
+    for w in snap.get("windows") or []:
+        if w.get("scope") or w.get("stale"):
+            continue
+        pts = per.get(w["label"])
+        pts = [p for p in pts if _valid_point(p)] if isinstance(pts, list) else []
+        if not pts or t > pts[-1][0]:
+            pts.append([t, float(w["used"]), w.get("resets_at")])
+        per[w["label"]] = [p for p in pts if p[0] >= now - HISTORY_MAX_AGE_S][-HISTORY_MAX_POINTS:]
+
+
+def _same_cycle(a: Optional[float], b: Optional[float], cfg: dict) -> bool:
+    if a is None or b is None:
+        return a is None and b is None
+    return abs(a - b) <= cfg["cycle_tolerance_s"]
+
+
+def current_cycle(points: list, cfg: dict) -> list:
+    """Trailing points sharing the last point's reset cycle. A ``resets_at`` move beyond
+    ``cycle_tolerance_s``, or a null↔value change, starts a new cycle."""
+    out: list = []
+    for p in reversed(points):
+        if out and not _same_cycle(p[2], out[-1][2], cfg):
+            break
+        out.append(p)
+    return out[::-1]
+
+
 def apply_refresh(state: dict, snapshots: dict, now: float, cfg: dict) -> list[str]:
     """Fold fresh snapshots into ``state``; return human lines for alerts/transitions (empty = quiet)."""
     lines: list[str] = []
@@ -248,6 +302,7 @@ def apply_refresh(state: dict, snapshots: dict, now: float, cfg: dict) -> list[s
     for provider, snap in snapshots.items():
         pstate = state["providers"].setdefault(provider, {"tier": "ok", "tier_since": now})
         pstate["snapshot"] = normalize_snapshot(snap, now)
+        append_history(state, provider, pstate["snapshot"], now)
         lines += alert_lines(provider, pstate["snapshot"]["windows"], state["alerts_sent"], cfg)
     lines += recompute(state, now, cfg)
     queue(state, *lines)
@@ -436,6 +491,12 @@ def note_fetch(state: dict, provider: str, *, slot: str = "core", ok: bool, kind
     pstate = state["providers"].setdefault(provider, {"tier": "ok", "tier_since": now})
     fetch = pstate.setdefault("fetch", {})
     fslot = fetch.setdefault(slot, {"last_ok_at": None, "error": None, "alerted": False})
+    if slot == "core":
+        log = state.get("fetch_log")
+        log = [e for e in log if isinstance(e, list) and len(e) == 3 and _num(e[0])] \
+            if isinstance(log, list) else []
+        log.append([now, provider, "ok" if ok else (kind or "error")])
+        state["fetch_log"] = [e for e in log if e[0] >= now - FETCH_LOG_MAX_AGE_S][-FETCH_LOG_MAX:]
     if ok:
         had_alerted = bool(fslot.get("error") and fslot.get("alerted"))
         fslot["last_ok_at"] = now

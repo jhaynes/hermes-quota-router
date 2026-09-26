@@ -31,7 +31,18 @@ Anthropic's `/api/oauth/usage` response includes a `limits[]` list with per-mode
 
 `hermes quota-router status --json [--refresh]` prints exactly one `QRJSON <payload>` line to stdout (nothing else on stdout; logging goes to stderr) for the desktop widget or any other machine reader. `--refresh --json` fetches fresh data but does **not** drain the pending-alert queue — only `hermes quota-router refresh` (the cron path) does that.
 
-The payload (`v: 1`) has `host`, `now`, `mode`/`mode_since`, and per-provider `tier`, `fetched_at`, `stale`, `plan`, `windows` (each with `affects_tier: bool` — `false` for scoped windows), `block`, `fetch.core`/`fetch.scoped` outcomes, and `details`; plus top-level `recent_errors` (last 5) and `pending_count`.
+The payload (`v: 1`) has `host`, `now`, `mode`/`mode_since`, and per-provider `tier`, `fetched_at`, `stale`, `plan`, `windows` (each with `affects_tier: bool` — `false` for scoped windows — and `forecast`), `block`, `fetch.core`/`fetch.scoped` outcomes, and `details`; plus top-level `recent_errors` (last 5) and `pending_count`.
+
+## Forecast
+
+For each window in `forecast_windows` (default: Anthropic `Current session` as `session`, `Current week` and `Opus week` as `weekly`), `status` and `status --json` show a forecast computed from the current reset cycle's history:
+
+- `rate_pct_h` (`r_long`): `session` uses the least-squares slope over the whole current cycle; `weekly` uses the cycle average (used ÷ elapsed cycle time), so quiet nights count.
+- `r_short`: least-squares slope over the last 30 minutes (`session`) or 6 hours (`weekly`).
+- `projected_at_reset = used + max(r_long, 0) × hours_to_reset`, clamped to [used, 200]; `projected_short` is the same with `r_short`. `accel = r_short − r_long`. `confidence` is the number of points.
+- `status: "unknown"` (with a `reason`) when there is no reset time, fewer than 4 points, a span under 40 minutes, or `used` under 20%.
+
+Scoped (model) windows get `forecast: null`. The forecast doesn't change tiers or mode.
 
 ## Deliberately out of scope
 

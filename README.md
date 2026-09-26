@@ -54,9 +54,13 @@ hermes cron create "every 15m" --name "Quota router: usage refresh + alerts" --s
 ## Desktop widget
 
 The desktop half of this package (`desktop/plugin.js`) ships alongside the
-Python plugin but stays **off by default** — enable it in **Settings →
-Plugins** after installing, then run **⌘K → Reload desktop plugins** if it
-doesn't appear within a few seconds.
+Python plugin but stays **off by default** — enable it in **Capabilities → Plugins** by turning on the **Desktop** switch on the
+`quota-router` row (the **Agent** switch is the separate Python half). It loads
+immediately; run **⌘K → Reload desktop plugins** only if it doesn't appear.
+
+Hovering the chip shows a stacked card per provider: each window's remaining %
+(green > 30%, amber 11–30%, red ≤ 10%) and time to reset, model limits under
+their own heading, blocks and fetch errors, and when the snapshot was fetched.
 
 Once enabled it adds:
 

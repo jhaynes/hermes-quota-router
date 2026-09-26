@@ -116,3 +116,76 @@ test("v2 fixture payload is distinguishable by v field (version mismatch path)",
 	assert.equal(statusV2.v, 2);
 	assert.notEqual(statusV2.v, 1);
 });
+
+// ---- tip model tests (stacked, coloured hover) -------------------------------
+
+const tipPure = (() => {
+	const body = extractPureBlock(pluginSrc);
+	const context = { console };
+	vm.createContext(context);
+	return vm.runInContext(`${body}\n({ tipModel, leftTone, fmtAgo })`, context, { filename: "plugin-pure-tip.js" });
+})();
+
+test("leftTone buckets remaining % into good / warn / bad / muted", () => {
+	assert.equal(tipPure.leftTone(null), "muted");
+	assert.equal(tipPure.leftTone(0), "bad");
+	assert.equal(tipPure.leftTone(10), "bad");
+	assert.equal(tipPure.leftTone(11), "warn");
+	assert.equal(tipPure.leftTone(30), "warn");
+	assert.equal(tipPure.leftTone(31), "good");
+	assert.equal(tipPure.leftTone(100), "good");
+});
+
+test("fmtAgo renders compact relative ages", () => {
+	assert.equal(tipPure.fmtAgo(5), "just now");
+	assert.equal(tipPure.fmtAgo(90), "1m ago");
+	assert.equal(tipPure.fmtAgo(3 * 3600 + 120), "3h ago");
+	assert.equal(tipPure.fmtAgo(null), "");
+});
+
+test("tipModel stacks providers with core rows before model-limit rows, each toned", () => {
+	const nowMs = statusV1.now * 1000;
+	const m = tipPure.tipModel(statusV1, nowMs);
+	assert.equal(m.mode, statusV1.mode);
+	assert.ok(["good", "warn", "bad"].includes(m.modeTone));
+	assert.equal(m.providers.length, Object.keys(statusV1.providers).length);
+	for (const p of m.providers) {
+		assert.ok(p.name && p.name.length > 1, "friendly provider name");
+		assert.ok(["good", "warn", "bad", "muted"].includes(p.tierTone));
+		const firstScoped = p.rows.findIndex((r) => r.scoped);
+		if (firstScoped !== -1) {
+			assert.ok(p.rows.slice(firstScoped).every((r) => r.scoped), "model-limit rows come last");
+		}
+		for (const r of p.rows) {
+			assert.ok(typeof r.label === "string" && r.label.length > 0);
+			assert.ok(!/\(model\)/.test(r.label), "scoped label drops the '(model)' suffix");
+			assert.ok(["good", "warn", "bad", "muted"].includes(r.leftTone));
+		}
+	}
+	const anthropic = m.providers.find((p) => p.name === "Anthropic");
+	assert.ok(anthropic, "anthropic rendered as 'Anthropic'");
+	const fable = anthropic.rows.find((r) => r.scoped);
+	assert.equal(fable.label, "Fable week");
+	assert.equal(fable.left, 100);
+	assert.equal(fable.leftTone, "good");
+	const codex = m.providers.find((p) => p.name === "Codex");
+	assert.ok(codex, "openai-codex rendered as 'Codex'");
+	assert.equal(codex.tierTone, "bad");
+	assert.ok(codex.rows.some((r) => r.left === 0 && r.leftTone === "bad"));
+	assert.ok(m.footer.includes(statusV1.host));
+});
+
+test("tipModel surfaces block and fetch error, tolerates empty payload", () => {
+	const payload = JSON.parse(JSON.stringify(statusV1));
+	const pid = Object.keys(payload.providers)[0];
+	payload.providers[pid].block = { until: payload.now + 600, message: "rate limited" };
+	payload.providers[pid].fetch = { core: { last_ok_at: null, error: { kind: "http", message: "HTTP 500" } }, scoped: { last_ok_at: null, error: null } };
+	payload.pending_count = 2;
+	const m = tipPure.tipModel(payload, payload.now * 1000);
+	const p = m.providers[0];
+	assert.match(p.block, /rate limited/);
+	assert.match(p.fetchError, /HTTP 500/);
+	assert.match(m.footer, /2 alerts awaiting cron/);
+	const empty = tipPure.tipModel({ v: 1, providers: {} }, Date.now());
+	assert.equal(empty.providers.length, 0);
+});

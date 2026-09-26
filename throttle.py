@@ -127,9 +127,12 @@ def apply_one(path: Path, level: str, levels: dict, *, kanban: bool = False, bac
         if actual is None:
             return {"result": "drift", "actual": None}
         model = raw.get("model") if isinstance(raw.get("model"), dict) else {}
-        own = [k for k in ROUTE_KEYS if model.get(k) not in (None, "")]
+        own = [f"model.{k}" for k in ROUTE_KEYS if model.get(k) not in (None, "")]
+        # A fallback entry is rewritten as {provider, model}; any other key on it would be dropped.
+        own += [f"fallback_providers[{i}].{k}" for i, f in enumerate(raw.get("fallback_providers") or [])
+                if isinstance(f, dict) for k in f if k not in ("provider", "model")]
         if own and not kanban:
-            return {"result": "unsupported", "actual": actual, "message": f"model.{own[0]} is set"}
+            return {"result": "unsupported", "actual": actual, "message": f"{own[0]} is set"}
         spec = levels[level]
         if kanban:
             raw["kanban"]["max_in_progress"] = spec["max_in_progress"]
@@ -263,8 +266,12 @@ def run_apply(state_path: Path, cfg: dict, t: dict, runner: Runner, now: float, 
         if t.get("enabled") and not errs:
             level = decision["level"]
             for profile, kanban in _targets(t):
-                rc, out, err = runner(profile, apply_one_argv(level, t["levels"], kanban=kanban))
-                res = parse_result(out) if rc == 0 else None
+                try:
+                    rc, out, err = runner(profile, apply_one_argv(level, t["levels"], kanban=kanban))
+                    res = parse_result(out) if rc == 0 else None
+                except Exception as exc:   # timeout, missing binary: this profile failed, go on
+                    rc, out, err = None, "", ""
+                    res = {"result": "error", "actual": None, "message": f"{type(exc).__name__}: {str(exc)[:160]}"}
                 if res is None:
                     tail = (err or out or "").strip().splitlines()[-1:] or ["no result"]
                     res = {"result": "error", "actual": None, "message": f"exit {rc}: {tail[0][:160]}"}

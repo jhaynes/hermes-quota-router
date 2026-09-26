@@ -101,7 +101,7 @@ hermes cron create "every 15m" --name "Quota router: usage refresh + alerts" --s
 
 ### Cron script and cadence
 
-`scripts/quota-router-refresh.py` runs `hermes quota-router refresh`, then `hermes quota-router throttle apply` (set `QR_HERMES_BIN` to use another binary). `throttle apply` runs even if `refresh` failed, so holds expire and the stale-data rules run. On a host without a `throttle` block it's a silent no-op; with `enabled: false` (shadow) it decides and logs only. Only `⚠️`/`quota-router:` lines reach stdout.
+`scripts/quota-router-refresh.py` runs `hermes quota-router refresh`, then `hermes quota-router throttle apply` (set `QR_HERMES_BIN` to use another binary). `throttle apply` runs even if `refresh` failed, timed out (`QR_STEP_TIMEOUT`, default 300 s per step) or could not start, so holds expire and the stale-data rules run. On a host without a `throttle` block it's a silent no-op; with `enabled: false` (shadow) it decides and logs only. Only `⚠️`/`quota-router:` lines reach stdout.
 
 The refresh may run every 5 minutes (`hermes cron edit <id> --schedule "every 5m"`). Run shadow mode at 15 minutes first, then 5 minutes. A built-in backoff keeps a failing endpoint from being hammered: after 3 non-ok core fetches for a provider within an hour (from the `fetch_log` ring) with no success since, that provider is fetched at most every 15 minutes, with one `quota-router: <provider> usage fetch backing off to 15m (...)` alert per incident. The next success clears it.
 

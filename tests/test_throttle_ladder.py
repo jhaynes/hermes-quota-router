@@ -724,15 +724,62 @@ def test_a_downgrade_to_0_3_0_does_not_resend_the_stale_alert():
     assert core.drain_pending(st) == []
 
 
+def test_reverting_a_ladder_to_levels_keeps_a_constrained_protected_provider():
+    """A ladder level name says nothing about the protected provider, so its own state is kept."""
+    st = core.empty_state()
+    feed(st, NOW, codex=(10, 90), claude=(88, 30))
+    assert step(st, NOW)["level"] == "internal"
+    feed(st, NOW + 40 * M, codex=(10, 90), claude=(80, 30))
+    assert step(st, NOW + 40 * M)["level"] == "internal"
+    assert (pstate(st, CLAUDE).get("state"), pstate(st, CLAUDE).get("rule")) == ("constrained", "hold_used")
+    throttle_lines(st)
+    t = core.throttle_config({"levels": LEVELS, "profiles": []})              # config reverted to levels:
+    feed(st, NOW + 45 * M, claude=(80, 30))
+    d = core.throttle_step(st, NOW + 45 * M, CFG, t)
+    assert (d["previous"], d["level"], d["changed"]) == ("internal", "constrained", True), d
+    assert pstate(st, CLAUDE).get("since") == NOW                               # its own dwell, too
+    assert throttle_lines(st) == [
+        "quota-router: throttle (shadow) internal → constrained (internal is not a level of this config)"]
+
+
+def test_an_unknown_recorded_level_is_a_level_change_with_one_alert():
+    st = core.empty_state()
+    feed(st, NOW, codex=(10, 90), claude=(10, 30))
+    assert step(st, NOW)["level"] == "claude"
+    throttle_lines(st)
+    t = core.throttle_config({"levels": LEVELS, "profiles": []})
+    feed(st, NOW + 5 * M, claude=(10, 30))
+    d = core.throttle_step(st, NOW + 5 * M, CFG, t)
+    assert (d["previous"], d["level"], d["changed"]) == ("claude", "fast", True), d
+    assert throttle_lines(st) == ["quota-router: throttle (shadow) claude → fast (claude is not a level of this config)"]
+    assert core.throttle_step(st, NOW + 6 * M, CFG, t)["changed"] is False
+    assert throttle_lines(st) == []
+
+
+def test_a_state_with_a_stale_dedupe_but_no_level_keeps_the_dedupe():
+    """0.3.0 reads a missing level as fast and still honours the recorded stale-alert dedupe."""
+    t = core.throttle_config({"levels": LEVELS, "profiles": []})
+    st = core.empty_state()
+    feed(st, NOW, claude=(86, 30))
+    st["throttle"] = {"stale_alerted_for": NOW, "since": NOW}                   # hand-edited: no level
+    ref = copy.deepcopy(st)
+    d_new, d_old = core.throttle_step(st, NOW + 2 * H, CFG, t), legacy_step(ref, NOW + 2 * H, CFG, t)
+    assert {k: d_new[k] for k in DECISION_KEYS} == {k: d_old[k] for k in DECISION_KEYS}
+    assert st["pending"] == ref["pending"], st["pending"][-1:]
+
+
 def test_switching_a_constrained_legacy_state_to_a_ladder_keeps_anthropic_constrained():
     st = core.empty_state()
     t = core.throttle_config({"levels": LEVELS, "profiles": []})
     feed(st, NOW, codex=(10, 10), claude=(86, 30))
     legacy_step(st, NOW, CFG, t)
     feed(st, NOW + 5 * M, codex=(90, 10), claude=(10, 10))
+    throttle_lines(st)
     d = step(st, NOW + 5 * M)
-    assert d["previous"] == "codex" and d["level"] == "internal", d   # anthropic still in its dwell
+    assert (d["previous"], d["level"], d["changed"]) == ("constrained", "internal", True), d  # anthropic in its dwell
     assert pstate(st, CLAUDE).get("since") == NOW
+    assert throttle_lines(st)[-1] == \
+        "quota-router: throttle (shadow) constrained → internal (constrained is not a level of this config)"
 
 
 # ── apply-one / reconcile across N levels (temp HERMES_HOME) ───────────────────

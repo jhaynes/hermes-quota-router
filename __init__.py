@@ -10,13 +10,19 @@ What it does
   and a mode (normal / shift / internal), and prints ONLY new alerts/transitions, so it can run as a
   silent no-agent cron job.
 - ``hermes quota-router status`` / ``/quota`` show the current picture.
+- ``hermes quota-router throttle apply`` (the cron path) picks a throttle level from per-provider
+  burn-rate forecasts. It is opt-in and in shadow mode by default. With ``throttle.enabled: true`` it
+  rewrites each listed profile's ``model.provider``, ``model.default`` and ``fallback_providers`` to
+  that level, plus the root ``kanban.max_in_progress`` when every level sets it. It never overwrites
+  a hand edit.
 
 What it deliberately does NOT do
 - Override error classification: Hermes already fails over immediately on rate-limit/billing
   errors when the credential pool cannot rotate (``route_classified_error``). A duplicate override
   could only make it worse.
-- Rewrite config or pin kanban cards: pinning removes the fallback chain. Routing before a session
-  starts needs an upstream ``resolve_session_route`` hook (proposal tracked in the plan).
+- Pin kanban cards: pinning removes the fallback chain. No config is written outside the opt-in
+  throttle. Routing before a session starts needs an upstream ``resolve_session_route`` hook
+  (proposal tracked in the plan).
 """
 from __future__ import annotations
 

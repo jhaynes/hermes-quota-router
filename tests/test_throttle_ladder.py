@@ -396,21 +396,29 @@ def _feed_one(st, provider, t, a, b, a_reset, b_reset):
 
 def _run_pair(rows, t, provider="anthropic"):
     """Apply the same rows to two states; step one with the oracle and one with the new code; compare
-    every decision, the recorded throttle fields, the log and the queued throttle lines."""
+    every decision, the recorded throttle fields, the log and the queued throttle lines.
+
+    ``feed``/``block``/``clear`` act on the protected provider; ``feedp``/``blockp``/``clearp`` name
+    one; ``protect`` switches ``protected_provider`` on the live config, as editing config.yaml does."""
     old, new = core.empty_state(), core.empty_state()
     steps = 0
     for minute, op, *args in rows:
         now = NOW + minute * M
+        if op == "protect":
+            t, provider = dict(t, protected_provider=args[0]), args[0]
+            continue
+        target = args[0] if op in ("feedp", "blockp", "clearp") else provider
+        args = args[1:] if op in ("feedp", "blockp", "clearp") else args
         for st in (old, new):
-            if op == "feed":      # ("feed", session used, session reset minute=+180, week used=40)
+            if op in ("feed", "feedp"):   # (session used, session reset minute=+180, week used=40)
                 a, a_reset, b = (list(args) + [None, None])[:3]
-                _feed_one(st, provider, now, a, 40.0 if b is None else b,
+                _feed_one(st, target, now, a, 40.0 if b is None else b,
                           NOW + (minute + 180 if a_reset is None else a_reset) * M, NOW + 5 * 24 * H)
-            elif op == "block":
-                core.record_error(st, provider=provider, status_code=429, reason="rate_limit",
+            elif op in ("block", "blockp"):
+                core.record_error(st, provider=target, status_code=429, reason="rate_limit",
                                   message="usage limit reached", model="m", now=now, cfg=CFG)
-            elif op == "clear":
-                core.clear_block_on_success(st, provider, now)
+            elif op in ("clear", "clearp"):
+                core.clear_block_on_success(st, target, now)
             elif op == "hold":
                 core.throttle_hold(st, args[0], now + args[1] * M, now)
             elif op == "unhold":
@@ -514,6 +522,67 @@ def test_legacy_config_matches_the_old_code_over_random_replays(seed):
     old, _new = _run_pair(_random_rows(seed), t)
     sources = {rec["source"] for rec in old["throttle"]["log"]}
     assert len(sources) >= 3, sources          # the replay exercised more than one branch
+
+
+def test_switching_protected_provider_on_a_live_legacy_config_carries_the_level_and_dwell_over():
+    """0.3.0 keeps one level and one ``since`` whatever the protected provider is, so switching
+    ``protected_provider`` hands both to the new provider, and switching back ignores that provider's
+    own earlier state."""
+    rows = [(0, "feedp", CLAUDE, 86), (0, "feedp", CODEX, 10), (0, "step"),          # anthropic: rule b
+            (5, "protect", CODEX), (5, "feedp", CODEX, 10), (5, "step"),             # constrained since 0: dwell
+            (20, "feedp", CODEX, 10), (20, "step"),
+            (31, "feedp", CODEX, 10), (31, "step"),                                  # dwell over: leave
+            (40, "feedp", CODEX, 90), (40, "step"),                                  # codex: rule b, since 40
+            (45, "protect", CLAUDE), (45, "feedp", CLAUDE, 10), (45, "step"),        # since 40, not 0: dwell
+            (71, "feedp", CLAUDE, 10), (71, "step")]                                 # 31 min after 40: leave
+    old, new = _run_pair(rows, core.throttle_config({"levels": LEVELS, "profiles": []}))
+    assert [r["rule"] for r in old["throttle"]["log"]] == ["b", "dwell", "dwell", "leave", "b", "dwell", "leave"]
+    assert [r["level"] for r in new["throttle"]["log"]][-2:] == ["constrained", "fast"]
+
+
+def _random_switch_rows(seed, n=300):
+    """Both providers fed, blocked and cleared at random, with ``protected_provider`` switched live
+    (including an odd spelling core has no windows for)."""
+    rnd = random.Random(1000 + seed)
+    rows, minute = [], 0.0
+    used, reset = {CLAUDE: 30.0, CODEX: 30.0}, {CLAUDE: 180.0, CODEX: 120.0}
+    for _ in range(n):
+        minute += rnd.choice([1, 5, 5, 5, 15, 40, 70])
+        for p in used:
+            if minute >= reset[p]:
+                used[p], reset[p] = rnd.uniform(0, 20), minute + rnd.choice([35, 120, 300])
+            used[p] = min(100.0, max(0.0, used[p] + rnd.uniform(-3, 9)))
+        p = rnd.choice([CLAUDE, CODEX])
+        r = rnd.random()
+        if r < 0.65:
+            rows.append((minute, "feedp", p, round(used[p], 2), reset[p], rnd.choice([40, 80, 90])))
+        elif r < 0.73:
+            rows.append((minute, "protect", rnd.choice([CLAUDE, CODEX, CLAUDE, CODEX, "Anthropic"])))
+        elif r < 0.77:
+            rows.append((minute, "blockp", p))
+        elif r < 0.80:
+            rows.append((minute, "clearp", p))
+        elif r < 0.84:
+            rows.append((minute, "hold", rnd.choice(["fast", "constrained"]), rnd.choice([5, 30, 90])))
+        elif r < 0.86:
+            rows.append((minute, "unhold"))
+        elif r < 0.89:
+            rows.append((minute, "disable", rnd.choice(["fast", "constrained"])))
+        elif r < 0.92:
+            rows.append((minute, "undisable"))
+        rows.append((minute, "step"))
+    return rows
+
+
+@pytest.mark.parametrize("seed", range(12))
+def test_legacy_config_matches_the_old_code_across_protected_provider_switches(seed):
+    rows = _random_switch_rows(seed)
+    t = core.throttle_config({"levels": LEVELS, "profiles": [], "enabled": seed % 2 == 0})
+    old, _new = _run_pair(rows, t)
+    assert sum(1 for r in rows if r[1] == "protect") >= 10
+    log = old["throttle"]["log"]
+    assert {rec["rule"] for rec in log} & {"a", "b", "c"}                          # a policy entry happened
+    assert len({rec["source"] for rec in log}) >= 3                              # and more than one branch ran
 
 
 def test_legacy_config_protecting_codex_matches_the_old_code():

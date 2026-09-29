@@ -1214,20 +1214,33 @@ def _provider_policy(state: dict, provider: str, level: str, since: float, windo
 
 
 def throttle_provider_states(th: dict, t: dict, gates: Iterable[str]) -> dict:
-    """``th['providers']``, created on first use. A 0.3.0 record (one ``level`` for the protected
-    provider) migrates to that provider's state, keeping its dwell (``since``) and its stale-alert
-    dedupe; hold and disable stay where they are. It migrates again when 0.3.0 decided after this
-    code last did (a downgrade and back: 0.3.0 moves ``decided_at`` and ignores ``providers``)."""
+    """``th['providers']``, created on first use; hold and disable stay where they are.
+
+    The legacy config (no ``ladder``) keeps 0.3.0's model: one ``level`` and ``since`` for whatever
+    the protected provider is now. So its record is re-derived from ``th`` (state, ``since``,
+    stale-alert dedupe) whenever it disagrees with ``th['level']`` or was decided at a different
+    time than ``th`` was. That covers a 0.3.0 state file, a ``protected_provider`` switched on a live
+    config (the level and its dwell carry over), and a downgrade and back (0.3.0 moves ``th`` but
+    not ``providers``). For a ladder, a 0.3.0 record seeds the protected provider once, and again
+    if 0.3.0 decided after this code last did."""
     per = th.get("providers")
     per = per if isinstance(per, dict) else {}
-    stamps = [float(ps.get("decided_at") or 0) for ps in per.values() if isinstance(ps, dict)]
-    decided = th.get("decided_at")
-    if th.get("level") is not None and (not per or (decided is not None and max(stamps, default=0.0) < float(decided))):
-        rec = {"state": "constrained" if th["level"] == "constrained" else "ok"}
-        for key in ("since", "source", "rule", "stale_alerted_for", "decided_at"):
-            if th.get(key) is not None:
-                rec[key] = th[key]
-        per[t.get("protected_provider")] = rec
+    protected = t.get("protected_provider")
+    level, decided = th.get("level"), th.get("decided_at")
+    if level is not None:
+        if t.get("ladder") is None:
+            rec = per.get(protected) if isinstance(per.get(protected), dict) else {}
+            stale = rec.get("state") != ("constrained" if level == "constrained" else "ok") or \
+                rec.get("decided_at") != decided
+        else:
+            stamps = [float(ps.get("decided_at") or 0) for ps in per.values() if isinstance(ps, dict)]
+            stale = not per or (decided is not None and max(stamps, default=0.0) < float(decided))
+        if stale:
+            rec = {"state": "constrained" if level == "constrained" else "ok"}
+            for key in ("since", "source", "rule", "stale_alerted_for", "decided_at"):
+                if th.get(key) is not None:
+                    rec[key] = th[key]
+            per[protected] = rec
     th.pop("stale_alerted_for", None)
     th["providers"] = per
     for p in gates:

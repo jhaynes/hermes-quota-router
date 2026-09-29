@@ -68,7 +68,7 @@ The payload (`v: 1`) has `host`, `now`, `mode`/`mode_since`, and per-provider `t
 
 ## Forecast
 
-For each window in `forecast_windows` (default: Anthropic `Current session` as `session`, `Current week` and `Opus week` as `weekly`), `status` and `status --json` show a forecast computed from the current reset cycle's history:
+For each window in `forecast_windows` (default: Anthropic `Current session` as `session`, `Current week` and `Opus week` as `weekly`; since 0.4.0 also OpenAI Codex `Session`, its 5 h primary window, as `session` and `Weekly` as `weekly`), `status` and `status --json` show a forecast computed from the current reset cycle's history:
 
 - `rate_pct_h` (`r_long`): `session` uses the least-squares slope over the whole current cycle; `weekly` uses the cycle average (used ÷ elapsed cycle time), so quiet nights count.
 - `r_short`: least-squares slope over the last 30 minutes (`session`) or 6 hours (`weekly`).

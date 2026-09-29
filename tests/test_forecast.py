@@ -144,7 +144,9 @@ def test_forecast_state_covers_configured_core_windows_only():
         "Current session": series(NOW - H, 5 * M, [30 + i for i in range(13)], reset),
         "Fable week (model)": series(NOW - H, 5 * M, [30] * 13, reset)},
         "openai-codex": {"Weekly": series(NOW - H, 5 * M, [30] * 13, reset)}}
-    out = core.forecast_state(st, NOW, CFG)
+    # openai-codex has default forecast windows since 0.4.0; configure none for it here
+    anthropic_only = dict(CFG, forecast_windows={"anthropic": CFG["forecast_windows"]["anthropic"]})
+    out = core.forecast_state(st, NOW, anthropic_only)
     assert set(out) == {"anthropic"}
     assert set(out["anthropic"]) == {"Current session"}
     assert out["anthropic"]["Current session"]["kind"] == "session"
@@ -167,3 +169,20 @@ def test_forecast_appears_in_status_json_and_text():
     assert wins["Fable week (model)"]["forecast"] is None
     text = core.render_status(st, NOW, CFG)
     assert "→" in text and "12.0%/h" in text
+
+
+def test_codex_session_and_weekly_are_forecast_by_default():
+    assert core.DEFAULTS["forecast_windows"].get("openai-codex") == {"Session": "session", "Weekly": "weekly"}
+    st = core.empty_state()
+    reset = NOW + 3 * H
+    for i in range(13):
+        t = NOW - H + i * 5 * M
+        core.apply_refresh(st, {"openai-codex": {"fetched_at": t, "windows": [
+            {"label": "Session", "used_percent": 30 + i, "resets_at": reset},
+            {"label": "Weekly", "used_percent": 40, "resets_at": NOW + 4 * 24 * H}]}}, t, CFG)
+    out = core.forecast_state(st, NOW, CFG)["openai-codex"]
+    assert out["Session"]["kind"] == "session" and out["Session"]["status"] == "ok"
+    assert out["Session"]["rate_pct_h"] == pytest.approx(12.0, abs=0.01)
+    assert out["Weekly"]["kind"] == "weekly"
+    wins = {w["label"]: w for w in core.status_payload(st, NOW, CFG, "host")["providers"]["openai-codex"]["windows"]}
+    assert wins["Session"]["forecast"]["status"] == "ok"

@@ -1241,7 +1241,6 @@ def throttle_provider_states(th: dict, t: dict, gates: Iterable[str]) -> dict:
                 if th.get(key) is not None:
                     rec[key] = th[key]
             per[protected] = rec
-    th.pop("stale_alerted_for", None)
     th["providers"] = per
     for p in gates:
         if not isinstance(per.get(p), dict):
@@ -1393,6 +1392,13 @@ def throttle_step(state: dict, now: float, cfg: dict, t: dict) -> dict:
     elif not th.get("since"):
         th["since"] = now
     th.update(level=new, source=source, rule=rule, decided_at=now)
+    # With one gate provider, keep its stale-alert dedupe where 0.3.0 reads it too, so a 0.3.0 run on
+    # this state (a downgrade) does not send the stale alert again.
+    alerted_for = pstates[gates[0]].get("stale_alerted_for") if single else None
+    if alerted_for is not None:
+        th["stale_alerted_for"] = alerted_for
+    else:
+        th.pop("stale_alerted_for", None)
     for d in per.values():
         d.pop("_raw")
         d.pop("_stale")

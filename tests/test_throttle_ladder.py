@@ -384,7 +384,7 @@ def legacy_step(state: dict, now: float, cfg: dict, t: dict) -> dict:
 
 
 DECISION_KEYS = ("level", "previous", "changed", "source", "rule", "label", "windows", "at")
-TH_KEYS = ("level", "since", "source", "rule", "decided_at", "hold", "disabled")
+TH_KEYS = ("level", "since", "source", "rule", "decided_at", "hold", "disabled", "stale_alerted_for")
 
 
 def _feed_one(st, provider, t, a, b, a_reset, b_reset):
@@ -634,7 +634,7 @@ def test_old_state_file_migrates_to_per_provider_state_and_keeps_the_stale_dedup
     migrated = (new["throttle"].get("providers") or {}).get("anthropic") or {}
     assert (migrated.get("state"), migrated.get("since"), migrated.get("stale_alerted_for")) == \
         ("constrained", NOW, NOW), migrated
-    assert "stale_alerted_for" not in new["throttle"]
+    assert new["throttle"].get("stale_alerted_for") == NOW                   # still where 0.3.0 reads it
     old, new = _continue_pair(path, t, [(125, "step"), (130, "feed", 10, 10), (130, "step")])
     assert new["throttle"]["level"] == "fast"
 
@@ -676,6 +676,21 @@ def test_a_downgrade_to_0_3_0_and_back_keeps_the_level_0_3_0_decided():
         d_new, d_old = core.throttle_step(st, now, CFG, t), legacy_step(ref, now, CFG, t)
         assert {k: d_new[k] for k in DECISION_KEYS} == {k: d_old[k] for k in DECISION_KEYS}, now
     assert [r["rule"] for r in st["throttle"]["log"][-2:]] == ["dwell", "leave"]
+
+
+def test_a_downgrade_to_0_3_0_does_not_resend_the_stale_alert():
+    """With one gate provider the stale-alert dedupe is also kept where 0.3.0 reads it."""
+    t = core.throttle_config({"levels": LEVELS, "profiles": []})
+    st = core.empty_state()
+    feed(st, NOW, claude=(86, 30))
+    core.throttle_step(st, NOW, CFG, t)
+    core.throttle_step(st, NOW + 2 * H, CFG, t)                     # stale, last known high: alert once
+    assert [ln for ln in core.drain_pending(st) if "stale usage data" in ln]
+    assert st["throttle"].get("stale_alerted_for") == NOW
+    legacy_step(st, NOW + 2 * H + 5 * M, CFG, t)                    # downgraded: 0.3.0, same snapshot
+    assert core.drain_pending(st) == []
+    core.throttle_step(st, NOW + 2 * H + 10 * M, CFG, t)            # upgraded again
+    assert core.drain_pending(st) == []
 
 
 def test_switching_a_constrained_legacy_state_to_a_ladder_keeps_anthropic_constrained():

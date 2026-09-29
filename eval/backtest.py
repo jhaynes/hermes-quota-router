@@ -6,6 +6,10 @@ Reads the state file read-only:
 
     python eval/backtest.py --state ~/.hermes/cache/quota-router/state.json [--json]
 
+A ladder config is back-tested once per gate provider: each gate provider's ok/constrained state
+follows exactly the policy of a legacy throttle protecting it, so that provider's report reads
+``fast`` as ``ok``. Hold and disable are not replayed.
+
 Biases (said in every report): history is the usage that actually happened, so it already reflects
 periods when the throttle (or a person) moved work off the provider, and it includes other hosts'
 usage of the shared account. A variant that would have throttled earlier can't show the usage it
@@ -197,8 +201,8 @@ def run(history: dict, blocks: list, t: dict, cfg: dict) -> dict:
     return {"days": days, "grid": rows, "proposal": propose(rows, current, days)}
 
 
-def render_markdown(out: dict) -> str:
-    lines = ["## Throttle back-test", ""]
+def render_markdown(out: dict, provider: str | None = None) -> str:
+    lines = ["## Throttle back-test" + (f" ({provider})" if provider else ""), ""]
     if out.get("skipped"):
         return "\n".join(lines + [f"Skipped: {out['skipped']}."]) + "\n"
     lines += [f"History: {out['days']:.1f} days. The back-test is biased: recorded usage already reflects "
@@ -226,7 +230,10 @@ def load_state(path: Path, provider: str) -> tuple[dict, list]:
     hist = (st.get("history") or {}).get(provider) or {}
     blocks, cur = [], None
     for rec in ((st.get("throttle") or {}).get("log") or []):
-        if rec.get("source") == "block":
+        # a ladder record carries each gate provider's own source; a legacy one only the protected's
+        source = ((rec.get("providers") or {}).get(provider) or {}).get("source") \
+            if rec.get("providers") else rec.get("source")
+        if source == "block":
             cur = cur or {"since": rec["at"], "until": rec["at"]}
             cur["until"] = rec["at"]
         elif cur:
@@ -245,14 +252,24 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--json", action="store_true")
     a = ap.parse_args(argv)
     t = core.throttle_config(json.loads(a.throttle_json) if a.throttle_json else {"profiles": []})
-    hist, blocks = load_state(a.state.expanduser(), t["protected_provider"])
-    out = run(hist, blocks, t, dict(core.DEFAULTS))
-    if a.json:
-        for r in out.get("grid") or []:
-            r.pop("detail", None)
-        print(json.dumps(out, indent=1))
+    if t.get("ladder") is None:
+        runs = {t["protected_provider"]: t}
     else:
-        print(render_markdown(out))
+        runs = {p: dict(t, ladder=None, levels={}, protected_provider=p)
+                for p in core.gate_providers(core.throttle_ladder(t))}
+    outs = {}
+    for provider, tp in runs.items():
+        hist, blocks = load_state(a.state.expanduser(), provider)
+        outs[provider] = run(hist, blocks, tp, dict(core.DEFAULTS))
+        for r in (outs[provider].get("grid") or []) if a.json else []:
+            r.pop("detail", None)
+    if t.get("ladder") is None:
+        out = outs[t["protected_provider"]]
+        print(json.dumps(out, indent=1) if a.json else render_markdown(out))
+    elif a.json:
+        print(json.dumps(outs, indent=1))
+    else:
+        print("\n".join(render_markdown(out, provider) for provider, out in outs.items()))
     return 0
 
 

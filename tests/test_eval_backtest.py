@@ -170,3 +170,37 @@ def test_history_from_state_file_is_read_only(tmp_path):
     hist, blocks = bt.load_state(p, "anthropic")
     assert set(hist) == {"Current session", "Current week"} and blocks == []
     assert p.stat().st_mtime == before
+
+
+LADDER = [
+    {"name": "codex", "gate": ["openai-codex"], "provider": "openai-codex", "model": "codex-x"},
+    {"name": "claude", "gate": ["anthropic"], "provider": "anthropic", "model": "opus-x"},
+    {"name": "internal", "provider": "custom:internal", "model": "glm-x"},
+]
+
+
+def test_a_ladder_is_back_tested_once_per_gate_provider(tmp_path, capsys):
+    import json
+    st = core.empty_state()
+    t = T0
+    while t < T0 + 7.2 * 24 * H:
+        start = T0 + ((t - T0) // CYCLE) * CYCLE
+        core.apply_refresh(st, {
+            "anthropic": {"fetched_at": t, "windows": [
+                {"label": "Current session", "used_percent": 5 * (t - start) / H, "resets_at": start + CYCLE}]},
+            "openai-codex": {"fetched_at": t, "windows": [
+                {"label": "Session", "used_percent": 22 * (t - start) / H, "resets_at": start + CYCLE}]}},
+            t, dict(core.DEFAULTS))
+        t += 15 * M
+    path = tmp_path / "state.json"
+    path.write_text(json.dumps(st))
+    assert bt.main(["--state", str(path), "--throttle-json", json.dumps({"ladder": LADDER}), "--json"]) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert set(out) == {"openai-codex", "anthropic"}
+    codex, claude = out["openai-codex"]["grid"][0], out["anthropic"]["grid"][0]
+    assert codex["constrained_hours"] > 0 and claude["constrained_hours"] == 0   # only codex burns fast
+    assert bt.main(["--state", str(path), "--throttle-json", json.dumps({"ladder": LADDER})]) == 0
+    md = capsys.readouterr().out
+    assert "## Throttle back-test (openai-codex)" in md and "## Throttle back-test (anthropic)" in md
+    assert bt.main(["--state", str(path), "--json"]) == 0             # no ladder: one report, as before
+    assert "grid" in json.loads(capsys.readouterr().out)

@@ -1217,30 +1217,35 @@ def throttle_provider_states(th: dict, t: dict, gates: Iterable[str]) -> dict:
     """``th['providers']``, created on first use; hold and disable stay where they are.
 
     The legacy config (no ``ladder``) keeps 0.3.0's model: one ``level`` and ``since`` for whatever
-    the protected provider is now. So its record is re-derived from ``th`` (state, ``since``,
-    stale-alert dedupe) whenever it disagrees with ``th['level']`` or was decided at a different
-    time than ``th`` was. That covers a 0.3.0 state file, a ``protected_provider`` switched on a live
-    config (the level and its dwell carry over), and a downgrade and back (0.3.0 moves ``th`` but
-    not ``providers``). For a ladder, a 0.3.0 record seeds the protected provider once, and again
-    if 0.3.0 decided after this code last did."""
+    the protected provider is now (a missing level is 0.3.0's default, ``fast``). So its record is
+    re-derived from ``th`` (state, ``since``, stale-alert dedupe) whenever it disagrees with that
+    level or was decided at a different time than ``th`` was. That covers a 0.3.0 state file, a
+    ``protected_provider`` switched on a live config (the level and its dwell carry over), and a
+    downgrade and back (0.3.0 moves ``th`` but not ``providers``). For a ladder, a 0.3.0 record
+    seeds the protected provider once, and again if 0.3.0 decided after this code last did.
+
+    Only ``fast``/``constrained`` describe the protected provider: a recorded ladder level (a
+    ``ladder:`` config reverted to ``levels:``) says nothing about it, so its own state is kept."""
     per = th.get("providers")
     per = per if isinstance(per, dict) else {}
     protected = t.get("protected_provider")
-    level, decided = th.get("level"), th.get("decided_at")
-    if level is not None:
-        if t.get("ladder") is None:
-            rec = per.get(protected) if isinstance(per.get(protected), dict) else {}
-            stale = rec.get("state") != ("constrained" if level == "constrained" else "ok") or \
-                rec.get("decided_at") != decided
-        else:
-            stamps = [float(ps.get("decided_at") or 0) for ps in per.values() if isinstance(ps, dict)]
-            stale = not per or (decided is not None and max(stamps, default=0.0) < float(decided))
-        if stale:
-            rec = {"state": "constrained" if level == "constrained" else "ok"}
-            for key in ("since", "source", "rule", "stale_alerted_for", "decided_at"):
-                if th.get(key) is not None:
-                    rec[key] = th[key]
-            per[protected] = rec
+    recorded, decided = th.get("level"), th.get("decided_at")
+    if t.get("ladder") is None:
+        level = "fast" if recorded is None else recorded
+        rec = per.get(protected) if isinstance(per.get(protected), dict) else {}
+        stale = level in THROTTLE_LEVELS and (
+            rec.get("state") != ("constrained" if level == "constrained" else "ok") or rec.get("decided_at") != decided)
+    else:
+        level = recorded
+        stamps = [float(ps.get("decided_at") or 0) for ps in per.values() if isinstance(ps, dict)]
+        stale = level in THROTTLE_LEVELS and (
+            not per or (decided is not None and max(stamps, default=0.0) < float(decided)))
+    if stale:
+        rec = {"state": "constrained" if level == "constrained" else "ok"}
+        for key in ("since", "source", "rule", "stale_alerted_for", "decided_at"):
+            if th.get(key) is not None:
+                rec[key] = th[key]
+        per[protected] = rec
     th["providers"] = per
     for p in gates:
         if not isinstance(per.get(p), dict):
@@ -1304,7 +1309,11 @@ def throttle_step(state: dict, now: float, cfg: dict, t: dict) -> dict:
     gates = gate_providers(rungs)
     single = len(gates) == 1
     tag = "" if t.get("enabled") else " (shadow)"
-    level = th.get("level") if th.get("level") in names else names[0]
+    recorded = th.get("level")
+    # A recorded level this config doesn't have (a ladder name after a revert to levels:, or the
+    # reverse) is a level change like any other: it moves profiles, so it is alerted.
+    unknown = recorded is not None and recorded not in names
+    level = recorded if recorded in names or unknown else names[0]
     pstates = throttle_provider_states(th, t, gates)
     hold = th.get("hold")
     if hold and float(hold.get("until") or 0) <= now:
@@ -1364,6 +1373,7 @@ def throttle_step(state: dict, now: float, cfg: dict, t: dict) -> dict:
     else:
         source, rule, label = "policy", None, None
     changed = new != level
+    note = f"{level} is not a level of this config" if unknown else None
     if single:
         only = per[gates[0]]
         if only["_stale"]:  # names the transition itself, so no second line
@@ -1372,7 +1382,7 @@ def throttle_step(state: dict, now: float, cfg: dict, t: dict) -> dict:
                          f"{level} → {new} ({w['label']} last {w['used']:.0f}%)")
         elif changed:
             queue(state, f"quota-router: throttle{tag} {level} → {new} "
-                         f"({_why(source, rule, label, only['_raw'])})")
+                         f"({note or _why(source, rule, label, only['_raw'])})")
     else:
         for p in gates:
             d = per[p]
@@ -1384,7 +1394,7 @@ def throttle_step(state: dict, now: float, cfg: dict, t: dict) -> dict:
                 queue(state, f"quota-router: throttle{tag} {p} {d['previous']} → {d['state']} "
                              f"({_why(d['source'], d['rule'], d['label'], d['_raw'])})")
         if changed:
-            why = ", ".join(f"{p} {per[p]['state']}" for p in gates if per[p]["changed"]) or \
+            why = note or ", ".join(f"{p} {per[p]['state']}" for p in gates if per[p]["changed"]) or \
                 _why(source, rule, label, [])
             queue(state, f"quota-router: throttle{tag} {level} → {new} ({why})")
     if changed:

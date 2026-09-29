@@ -394,12 +394,35 @@ def _feed_one(st, provider, t, a, b, a_reset, b_reset):
         {"label": labels[1], "used_percent": b, "resets_at": b_reset}]}}, t, CFG)
 
 
+def _apply_op(st, minute, op, args, provider):
+    """One non-step row on one state. ``feed``/``block``/``clear`` act on ``provider`` (the protected
+    one); ``feedp``/``blockp``/``clearp`` name the provider as their first argument."""
+    now = NOW + minute * M
+    target = args[0] if op in ("feedp", "blockp", "clearp") else provider
+    args = args[1:] if op in ("feedp", "blockp", "clearp") else args
+    if op in ("feed", "feedp"):   # (session used, session reset minute=+180, week used=40)
+        a, a_reset, b = (list(args) + [None, None])[:3]
+        _feed_one(st, target, now, a, 40.0 if b is None else b,
+                  NOW + (minute + 180 if a_reset is None else a_reset) * M, NOW + 5 * 24 * H)
+    elif op in ("block", "blockp"):
+        core.record_error(st, provider=target, status_code=429, reason="rate_limit",
+                          message="usage limit reached", model="m", now=now, cfg=CFG)
+    elif op in ("clear", "clearp"):
+        core.clear_block_on_success(st, target, now)
+    elif op == "hold":
+        core.throttle_hold(st, args[0], now + args[1] * M, now)
+    elif op == "unhold":
+        core.throttle_clear_hold(st)
+    elif op == "disable":
+        core.throttle_disable(st, args[0], now)
+    elif op == "undisable":
+        core.throttle_disable(st, None, now)
+
+
 def _run_pair(rows, t, provider="anthropic"):
     """Apply the same rows to two states; step one with the oracle and one with the new code; compare
     every decision, the recorded throttle fields, the log and the queued throttle lines.
-
-    ``feed``/``block``/``clear`` act on the protected provider; ``feedp``/``blockp``/``clearp`` name
-    one; ``protect`` switches ``protected_provider`` on the live config, as editing config.yaml does."""
+    ``protect`` switches ``protected_provider`` on the live config, as editing config.yaml does."""
     old, new = core.empty_state(), core.empty_state()
     steps = 0
     for minute, op, *args in rows:
@@ -407,27 +430,9 @@ def _run_pair(rows, t, provider="anthropic"):
         if op == "protect":
             t, provider = dict(t, protected_provider=args[0]), args[0]
             continue
-        target = args[0] if op in ("feedp", "blockp", "clearp") else provider
-        args = args[1:] if op in ("feedp", "blockp", "clearp") else args
-        for st in (old, new):
-            if op in ("feed", "feedp"):   # (session used, session reset minute=+180, week used=40)
-                a, a_reset, b = (list(args) + [None, None])[:3]
-                _feed_one(st, target, now, a, 40.0 if b is None else b,
-                          NOW + (minute + 180 if a_reset is None else a_reset) * M, NOW + 5 * 24 * H)
-            elif op in ("block", "blockp"):
-                core.record_error(st, provider=target, status_code=429, reason="rate_limit",
-                                  message="usage limit reached", model="m", now=now, cfg=CFG)
-            elif op in ("clear", "clearp"):
-                core.clear_block_on_success(st, target, now)
-            elif op == "hold":
-                core.throttle_hold(st, args[0], now + args[1] * M, now)
-            elif op == "unhold":
-                core.throttle_clear_hold(st)
-            elif op == "disable":
-                core.throttle_disable(st, args[0], now)
-            elif op == "undisable":
-                core.throttle_disable(st, None, now)
         if op != "step":
+            for st in (old, new):
+                _apply_op(st, minute, op, args, provider)
             continue
         steps += 1
         d_old, d_new = legacy_step(old, now, CFG, t), core.throttle_step(new, now, CFG, t)
@@ -488,6 +493,32 @@ def test_legacy_config_decides_exactly_as_the_old_code(name, enabled):
     _run_pair(SCENARIOS[name], t)
 
 
+def _forced_then_low(kind):
+    """ok for two hours, then a five-minute forced constrained, then low usage at +6, +20 and +31 min."""
+    low = [row for m in (0, 60, 120) for row in ((m, "feed", 10), (m, "step"))]
+    force = [(120, "hold", "constrained", 5)] if kind == "hold" else [(120, "disable", "constrained")]
+    after = [] if kind == "hold" else [(125, "undisable")]
+    return low + force + [(120, "step")] + after + [
+        row for m in (126, 140, 151) for row in ((m, "feed", 10), (m, "step"))]
+
+
+@pytest.mark.parametrize("kind", ["hold", "disable"])
+def test_a_forced_change_restarts_the_dwell(kind):
+    """0.3.0 sets ``since`` whenever the level changes, a hold or disable included, so leaving after
+    a forced constrained waits ``min_dwell_s`` from the force, not from when the level was last fast."""
+    t = core.throttle_config({"levels": LEVELS, "profiles": []})
+    st, got = core.empty_state(), []
+    for minute, op, *args in _forced_then_low(kind):
+        if op == "step":
+            d = core.throttle_step(st, NOW + minute * M, CFG, t)
+            got.append((minute, d["level"], d["source"], d["rule"]))
+        else:
+            _apply_op(st, minute, op, args, "anthropic")
+    assert got[3:] == [(120, "constrained", kind, None), (126, "constrained", "policy", "dwell"),
+                       (140, "constrained", "policy", "dwell"), (151, "fast", "policy", "leave")], got
+    _run_pair(_forced_then_low(kind), t)                      # and exactly as the 0.3.0 code
+
+
 def _random_rows(seed, n=240):
     rnd = random.Random(seed)
     rows, used, minute, reset = [], 30.0, 0.0, 180.0
@@ -498,7 +529,7 @@ def _random_rows(seed, n=240):
         used = min(100.0, max(0.0, used + rnd.uniform(-3, 9)))
         r = rnd.random()
         if r < 0.75:
-            rows.append((minute, "feed", round(used, 2), reset, rnd.choice([40, 80, 90])))
+            rows.append((minute, "feed", round(used, 2), reset, rnd.choice([20, 40, 50, 60, 70, 90])))
         elif r < 0.80:
             rows.append((minute, "block"))
         elif r < 0.84:
@@ -555,7 +586,7 @@ def _random_switch_rows(seed, n=300):
         p = rnd.choice([CLAUDE, CODEX])
         r = rnd.random()
         if r < 0.65:
-            rows.append((minute, "feedp", p, round(used[p], 2), reset[p], rnd.choice([40, 80, 90])))
+            rows.append((minute, "feedp", p, round(used[p], 2), reset[p], rnd.choice([20, 40, 50, 60, 70, 90])))
         elif r < 0.73:
             rows.append((minute, "protect", rnd.choice([CLAUDE, CODEX, CLAUDE, CODEX, "Anthropic"])))
         elif r < 0.77:

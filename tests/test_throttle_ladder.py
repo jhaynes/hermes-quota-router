@@ -266,6 +266,67 @@ def test_a_single_gate_ladder_alerts_like_the_legacy_levels():
     assert "providers" not in st["throttle"]["log"][-1]
 
 
+BOTH_FIRST = [
+    {"name": "both", "gate": [CODEX, CLAUDE], "provider": CODEX, "model": "codex-x",
+     "fallback": [{"provider": CLAUDE, "model": "opus-x"}]},
+    {"name": "claude", "gate": [CLAUDE], "provider": CLAUDE, "model": "opus-x"},
+    {"name": "internal", "provider": "custom:internal", "model": "glm-x"},
+]
+
+
+def test_forcing_a_level_never_leaves_its_own_gate_provider_constrained():
+    # an earlier level shares a gate provider with the forced one: only its other gates are marked
+    st = core.empty_state()
+    feed(st, NOW, codex=(10, 30), claude=(10, 30))
+    st["throttle"] = {"hold": {"level": "claude", "until": NOW + H, "since": NOW}}
+    d = step(st, NOW + 1, lcfg(ladder=BOTH_FIRST))
+    assert d["level"] == "claude", d
+    assert (pstate(st, CLAUDE).get("state"), pstate(st, CODEX).get("state")) == ("ok", "constrained")
+    # the forced level's own gate provider was constrained: forcing the level makes it ok
+    st = core.empty_state()
+    feed(st, NOW, codex=(10, 90), claude=(10, 30))
+    assert step(st, NOW)["level"] == "claude"
+    st["throttle"]["hold"] = {"level": "codex", "until": NOW + H, "since": NOW}
+    d = step(st, NOW + 1)
+    assert d["level"] == "codex" and (pstate(st, CODEX).get("state"), pstate(st, CODEX).get("source")) == ("ok", "hold")
+
+
+def test_forcing_a_level_with_two_gate_providers_sets_and_freezes_both():
+    ladder = [BOTH_FIRST[0], BOTH_FIRST[2]]
+    st = core.empty_state()
+    feed(st, NOW, codex=(10, 90), claude=(88, 30))
+    assert step(st, NOW, lcfg(ladder=ladder))["level"] == "internal"
+    st["throttle"]["hold"] = {"level": "both", "until": NOW + H, "since": NOW}
+    feed(st, NOW + 5 * M, codex=(10, 90), claude=(88, 30))
+    d = step(st, NOW + 5 * M, lcfg(ladder=ladder))
+    assert d["level"] == "both", d
+    assert [(pstate(st, p).get("state"), pstate(st, p).get("source")) for p in (CODEX, CLAUDE)] == \
+        [("ok", "hold"), ("ok", "hold")]
+
+
+def _blocked_then_low():
+    """ok for two hours, then an observed hard block, cleared five minutes later, then low usage."""
+    low = [row for m in (0, 60, 120) for row in ((m, "feed", 10), (m, "step"))]
+    return low + [(120, "block"), (120, "step"), (125, "clear")] + [
+        row for m in (126, 140, 151) for row in ((m, "feed", 10), (m, "step"))]
+
+
+def test_an_observed_block_restarts_the_dwell():
+    """0.3.0 sets ``since`` when a block makes the level constrained, so leaving after the block is
+    cleared waits ``min_dwell_s`` from the block."""
+    t = core.throttle_config({"levels": LEVELS, "profiles": []})
+    st, got = core.empty_state(), []
+    for minute, op, *args in _blocked_then_low():
+        if op == "step":
+            d = core.throttle_step(st, NOW + minute * M, CFG, t)
+            got.append((minute, d["level"], d["source"], d["rule"]))
+        else:
+            _apply_op(st, minute, op, args, "anthropic")
+    assert got[3:] == [(120, "constrained", "block", None), (126, "constrained", "policy", "dwell"),
+                       (140, "constrained", "policy", "dwell"), (151, "fast", "policy", "leave")], got
+    _run_pair(_blocked_then_low(), t)                         # and exactly as the 0.3.0 code
+
+
 # ── validation (generalised B1), through the child's own refusal ───────────────
 
 def _refusal(levels, level="codex"):
@@ -977,6 +1038,24 @@ def test_apply_one_moves_between_any_two_of_three_levels(env):
     assert model_of(env) == ("openai-codex", "codex-x", [("custom:internal", "glm-x")])
     assert len(list(bdir.iterdir())) == 3
     assert env.thr.read_raw(env.profile_cfg)["display"] == {"skin": "example"}
+
+
+SAME_CHAIN = [
+    {"name": "wide", "gate": [CODEX], "provider": "custom:internal", "model": "glm-x", "max_in_progress": 64},
+    {"name": "narrow", "gate": [CLAUDE], "provider": "custom:internal", "model": "glm-x", "max_in_progress": 24},
+    {"name": "floor", "provider": "custom:internal", "model": "glm-x", "max_in_progress": 8},
+]
+
+
+def test_apply_one_checks_the_desired_level_first_when_levels_share_a_model_chain(env):
+    env.profile_cfg.write_text("model:\n  default: glm-x\n  provider: custom:internal\n")
+    before, bdir = env.profile_cfg.read_text(), env.home / "b"
+    r = env.thr.apply_one(env.profile_cfg, "narrow", SAME_CHAIN, backup_dir=bdir, label="worker", now=NOW)
+    assert r == {"result": "noop", "actual": "narrow"}, r
+    assert env.profile_cfg.read_text() == before and not bdir.exists()
+    r = env.thr.apply_one(env.root_cfg, "narrow", SAME_CHAIN, kanban=True, backup_dir=bdir, label="default", now=NOW)
+    assert (r["result"], r["actual"]) == ("applied", "wide"), r               # the kanban key differs: 64 → 24
+    assert env.thr.read_raw(env.root_cfg)["kanban"]["max_in_progress"] == 24
 
 
 def test_apply_one_skips_a_config_matching_no_ladder_level(env):

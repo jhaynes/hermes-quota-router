@@ -924,14 +924,21 @@ def render_status(state: dict, now: float, cfg: dict) -> str:
 
 
 # ── throttle policy (host-local; v2 B1/B4/B5, precedence hold > disable > block > policy) ──────
+#
+# Each gate provider runs the fast/constrained policy below on its own windows, and keeps its own
+# ``ok``/``constrained`` state, dwell and reasons (``state['throttle']['providers']``). The selected
+# level is the first ladder level whose gate providers are all ``ok``; the last level has no gate.
+# The legacy ``levels: {fast, constrained}`` config is the two-level ladder
+# ``[fast gated by protected_provider, constrained]``.
 
-THROTTLE_LEVELS = ("fast", "constrained")
+THROTTLE_LEVELS = ("fast", "constrained")   # the legacy level names
 THROTTLE_LOG_MAX = 300   # ~25 h of decisions at a 5-minute cadence (shadow report input)
 THROTTLE_DEFAULTS = {
     "enabled": False,               # shadow mode: compute + log only, never write configs
     "profiles": [],
     "levels": {},                   # model specs are config, never code defaults
     "protected_provider": "anthropic",
+    "ladder": None,                 # ordered levels; None means the legacy levels + protected_provider
     "enter_projected": 95.0,        # rule a
     "enter_used": 85.0,             # rule b
     "early_projected": 85.0,        # rule c (with acceleration)
@@ -984,6 +991,123 @@ def validate_levels(levels: Any, protected: str = "anthropic") -> list[str]:
     return errs
 
 
+LADDER_KEYS = ("name", "gate", "provider", "model", "fallback", "max_in_progress")
+
+
+def _norm_provider(p: Any) -> str:
+    return str(p or "").strip().lower()
+
+
+def throttle_ladder(t: dict) -> list[dict]:
+    """The levels in preference order: ``[{'name', 'gate': [provider, ...], 'spec': {...}}]``.
+
+    ``throttle.ladder`` as configured, or the legacy ``levels`` as ``[fast gated by
+    protected_provider, constrained]``. Tolerant of a malformed ladder, which ``validate_throttle``
+    reports (and ``run_apply`` refuses); never empty, so a decision can always be made and logged."""
+    raw = t.get("ladder")
+    rungs = []
+    for i, entry in enumerate(raw if isinstance(raw, list) else []):
+        if not isinstance(entry, dict):
+            continue
+        gate = entry.get("gate")
+        gate = [_norm_provider(g) for g in gate if isinstance(g, str) and g.strip()] if isinstance(gate, list) else []
+        rungs.append({"name": str(entry.get("name") or f"level{i}"), "gate": list(dict.fromkeys(gate)),
+                      "spec": {k: v for k, v in entry.items() if k not in ("name", "gate")}})
+    if rungs:
+        return rungs
+    levels = t.get("levels") if isinstance(t.get("levels"), dict) else {}
+    return [{"name": "fast", "gate": [t.get("protected_provider")], "spec": levels.get("fast") or {}},
+            {"name": "constrained", "gate": [], "spec": levels.get("constrained") or {}}]
+
+
+def throttle_level_names(t: dict) -> list[str]:
+    return [r["name"] for r in throttle_ladder(t)]
+
+
+def gate_providers(rungs: list[dict]) -> list[str]:
+    """Every provider that gates a level, in ladder order."""
+    return list(dict.fromkeys(p for r in rungs for p in r["gate"]))
+
+
+def throttle_apply_levels(t: dict) -> Any:
+    """What ``apply-one`` receives: the legacy ``levels`` mapping unchanged, or the ladder list."""
+    return t.get("levels") if t.get("ladder") is None else t.get("ladder")
+
+
+def validate_ladder(ladder: Any, cfg: Optional[dict] = None) -> list[str]:
+    """Config errors for ``throttle.ladder``; empty means valid.
+
+    B1 generalised: a provider that gates ANY level may appear in a level's chain (primary or
+    fallback) only if it also gates that level, so a level never fails over onto a provider that
+    is known to be capped. The last level is the floor and has no gate; no other level may be
+    ungated (it would make every later level unreachable). Gate providers must be tracked, and
+    (with ``cfg``) have forecast windows."""
+    if not isinstance(ladder, list):
+        return ["throttle.ladder must be a list of levels, highest preference first"]
+    if len(ladder) < 2:
+        return ["throttle.ladder needs at least two levels (the last one is the floor)"]
+    errs, names = [], []
+    for i, entry in enumerate(ladder):
+        if not isinstance(entry, dict):
+            errs.append(f"throttle.ladder[{i}] must be a mapping")
+            continue
+        name = entry.get("name")
+        if not isinstance(name, str) or not name.strip():
+            errs.append(f"throttle.ladder[{i}] needs a name")
+            continue
+        if name in names:
+            errs.append(f"throttle.ladder has two levels named {name!r}")
+        names.append(name)
+        where = f"throttle.ladder.{name}"
+        unknown = sorted(k for k in entry if k not in LADDER_KEYS)
+        if unknown:
+            errs.append(f"{where} has unknown keys: {', '.join(map(str, unknown))}")
+        if not entry.get("provider") or not entry.get("model"):
+            errs.append(f"{where} needs provider and model")
+        fb = entry.get("fallback") or []
+        if not isinstance(fb, list) or not all(isinstance(f, dict) and f.get("provider") and f.get("model")
+                                               for f in fb):
+            errs.append(f"{where}.fallback must be a list of {{provider, model}}")
+        gate = entry.get("gate") or []
+        if not isinstance(gate, list) or not all(isinstance(g, str) and g.strip() for g in gate):
+            errs.append(f"{where}.gate must be a list of providers")
+            continue
+        for g in gate:
+            if _norm_provider(g) not in WATCHED:
+                errs.append(f"{where}.gate: {g} is not a tracked provider ({', '.join(WATCHED)})")
+    if errs:
+        return errs
+    rungs = throttle_ladder({"ladder": ladder})
+    if rungs[-1]["gate"]:
+        errs.append(f"throttle.ladder.{rungs[-1]['name']} is the floor and must have no gate")
+    for r in rungs[:-1]:
+        if not r["gate"]:
+            errs.append(f"throttle.ladder.{r['name']} has no gate, so no level after it can be selected; "
+                        "only the last level may be ungated")
+    gated_by = {p: [r["name"] for r in rungs if p in r["gate"]] for p in gate_providers(rungs)}
+    for r in rungs:
+        for p in dict.fromkeys(_norm_provider(p) for p, _m in level_chain(r["spec"])):
+            if p in gated_by and p not in r["gate"]:
+                errs.append(f"throttle.ladder.{r['name']} must not contain {p} (primary or fallback): "
+                            f"{p} gates {', '.join(gated_by[p])} but not {r['name']}")
+    if cfg is not None:
+        windows = cfg.get("forecast_windows") or {}
+        for p, levels in gated_by.items():
+            if not windows.get(p):
+                errs.append(f"throttle.ladder.{levels[0]} gates on {p}, which has no forecast_windows, "
+                            "so its usage can never constrain it")
+    return errs
+
+
+def validate_throttle(t: dict, cfg: Optional[dict] = None) -> list[str]:
+    """Config errors for the throttle block: the ladder rules, or exactly the legacy B1 check."""
+    if t.get("ladder") is not None:
+        if t.get("levels"):
+            return ["set throttle.ladder or throttle.levels, not both"]
+        return validate_ladder(t["ladder"], cfg)
+    return validate_levels(t.get("levels"), t["protected_provider"])
+
+
 def _throttle_windows(state: dict, now: float, cfg: dict, provider: str) -> tuple[list, Optional[float]]:
     """Last-known tier-affecting windows for ``provider`` joined with their forecasts, plus the
     snapshot's ``fetched_at``."""
@@ -1026,9 +1150,11 @@ def throttle_policy(level: str, since: float, windows: list, now: float, t: dict
     return "fast", "leave", None
 
 
-def throttle_hold(state: dict, level: str, until: float, now: float) -> None:
-    if level not in THROTTLE_LEVELS:
-        raise ValueError(f"level must be one of {THROTTLE_LEVELS}")
+def throttle_hold(state: dict, level: str, until: float, now: float,
+                  names: Iterable[str] = THROTTLE_LEVELS) -> None:
+    """Force ``level`` (one of ``names``, the ladder's level names) until ``until``."""
+    if level not in tuple(names):
+        raise ValueError(f"level must be one of {tuple(names)}")
     state.setdefault("throttle", {})["hold"] = {"level": level, "until": float(until), "since": now}
 
 
@@ -1036,14 +1162,15 @@ def throttle_clear_hold(state: dict) -> None:
     state.setdefault("throttle", {}).pop("hold", None)
 
 
-def throttle_disable(state: dict, level: Optional[str], now: float) -> None:
-    """Force ``level`` (normally ``fast``) until cleared; ``None`` clears the disable."""
+def throttle_disable(state: dict, level: Optional[str], now: float,
+                     names: Iterable[str] = THROTTLE_LEVELS) -> None:
+    """Force ``level`` (normally the first level, ``fast``) until cleared; ``None`` clears the disable."""
     th = state.setdefault("throttle", {})
     if level is None:
         th.pop("disabled", None)
         return
-    if level not in THROTTLE_LEVELS:
-        raise ValueError(f"level must be one of {THROTTLE_LEVELS}")
+    if level not in tuple(names):
+        raise ValueError(f"level must be one of {tuple(names)}")
     th["disabled"] = {"level": level, "since": now}
 
 
@@ -1063,53 +1190,78 @@ def _why(source: str, rule: Optional[str], label: Optional[str], windows: list) 
             "stale": "stale usage data"}.get(source, source)
 
 
-def throttle_step(state: dict, now: float, cfg: dict, t: dict) -> dict:
-    """Decide the throttle level, record it in ``state['throttle']`` and queue alerts (one per
-    transition, one per stale incident). Returns the decision. Pure over ``state``."""
-    th = state.setdefault("throttle", {})
-    level = th.get("level") if th.get("level") in THROTTLE_LEVELS else "fast"
-    since = float(th.get("since") or 0.0)
-    provider = t["protected_provider"]
-    windows, fetched_at = _throttle_windows(state, now, cfg, provider)
-    hold = th.get("hold")
-    if hold and float(hold.get("until") or 0) <= now:
-        th.pop("hold", None)
-        hold = None
-    rule = label = None
-    stale_alerted = False
+def _provider_policy(state: dict, provider: str, level: str, since: float, windows: list,
+                     fetched_at: Optional[float], alerted_for: Any, now: float, cfg: dict, t: dict) -> tuple:
+    """One provider's fast/constrained decision below hold/disable: observed block > stale rules >
+    policy. Returns ``(level, source, rule, label, stale)``; ``stale`` is ``(age_s, window)`` when a
+    stale-data escalation alert is due for this snapshot (``alerted_for`` dedupes it)."""
+    rule = label = stale = None
     stale_age = None if fetched_at is None else now - fetched_at
-    if hold:
-        new, source = hold["level"], "hold"
-    elif th.get("disabled"):
-        new, source = th["disabled"]["level"], "disable"
-    elif active_block((state.get("blocks") or {}).get(provider), now):
+    if active_block((state.get("blocks") or {}).get(provider), now):
         new, source = "constrained", "block"
     elif stale_age is None or stale_age > t["stale_hold_s"]:
         known = [w for w in windows if not (w.get("resets_at") and w["resets_at"] <= now)]
         high = [w for w in known if w["used"] >= t["leave_used"]]
         new, source = ("constrained" if high else "fast"), "stale"
-        if high and th.get("stale_alerted_for") != fetched_at:
-            th["stale_alerted_for"] = fetched_at
-            stale_alerted = True
-            tag = "" if t.get("enabled") else " (shadow)"
-            queue(state, f"quota-router: throttle{tag} stale usage data ({int((stale_age or 0) // 60)}m old); "
-                         f"{level} → constrained ({high[0]['label']} last {high[0]['used']:.0f}%)")
+        if high and alerted_for != fetched_at:
+            stale = (stale_age or 0, high[0])
     elif stale_age > cfg["stale_after_s"]:
         new, source = level, "stale_hold"
     else:
         new, rule, label = throttle_policy(level, since, windows, now, t)
         source = "policy"
-    if source != "stale":
-        th.pop("stale_alerted_for", None)
-    changed = new != level
-    if changed:
-        tag = "" if t.get("enabled") else " (shadow)"
-        if not stale_alerted:  # the stale alert already names the transition
-            queue(state, f"quota-router: throttle{tag} {level} → {new} ({_why(source, rule, label, windows)})")
-        th["since"] = now
-    elif not th.get("since"):
-        th["since"] = now
-    th.update(level=new, source=source, rule=rule, decided_at=now)
+    return new, source, rule, label, stale
+
+
+def throttle_provider_states(th: dict, t: dict, gates: Iterable[str]) -> dict:
+    """``th['providers']``, created on first use. A 0.3.0 record (one ``level`` for the protected
+    provider) migrates to that provider's state, keeping its dwell (``since``) and its stale-alert
+    dedupe; hold and disable stay where they are. It migrates again when 0.3.0 decided after this
+    code last did (a downgrade and back: 0.3.0 moves ``decided_at`` and ignores ``providers``)."""
+    per = th.get("providers")
+    per = per if isinstance(per, dict) else {}
+    stamps = [float(ps.get("decided_at") or 0) for ps in per.values() if isinstance(ps, dict)]
+    decided = th.get("decided_at")
+    if th.get("level") is not None and (not per or (decided is not None and max(stamps, default=0.0) < float(decided))):
+        rec = {"state": "constrained" if th["level"] == "constrained" else "ok"}
+        for key in ("since", "source", "rule", "stale_alerted_for", "decided_at"):
+            if th.get(key) is not None:
+                rec[key] = th[key]
+        per[t.get("protected_provider")] = rec
+    th.pop("stale_alerted_for", None)
+    th["providers"] = per
+    for p in gates:
+        if not isinstance(per.get(p), dict):
+            per[p] = {"state": "ok"}
+    return per
+
+
+def forced_provider_states(rungs: list[dict], index: int, states: dict) -> dict:
+    """The provider states a forced level implies: its gate providers ``ok``, and every earlier
+    level made unselectable by marking its other gate providers ``constrained``. For the legacy
+    ladder: forcing ``fast`` means the protected provider is ok, forcing ``constrained`` that it
+    is constrained, exactly as the single 0.3.0 level did."""
+    out = dict(states)
+    own = set(rungs[index]["gate"])
+    for p in own:
+        out[p] = "ok"
+    for r in rungs[:index]:
+        if all(out.get(p) == "ok" for p in r["gate"]):
+            for p in r["gate"]:
+                if p not in own:
+                    out[p] = "constrained"
+    return out
+
+
+def select_level(rungs: list[dict], states: dict) -> str:
+    """The first level whose gate providers are all ``ok`` (the floor, if none is)."""
+    for r in rungs:
+        if all(states.get(p) == "ok" for p in r["gate"]):
+            return r["name"]
+    return rungs[-1]["name"]
+
+
+def _window_summary(windows: list) -> dict:
     wsum = {}
     for w in windows:
         f = w.get("forecast") or {}
@@ -1118,9 +1270,126 @@ def throttle_step(state: dict, now: float, cfg: dict, t: dict) -> dict:
                             "projected_short": f.get("projected_short") if ok else None,
                             "r_long": f.get("rate_pct_h") if ok else None,
                             "r_short": f.get("r_short") if ok else None}
+    return wsum
+
+
+def throttle_step(state: dict, now: float, cfg: dict, t: dict) -> dict:
+    """Decide the throttle level, record it in ``state['throttle']`` and queue alerts. Returns the
+    decision. Pure over ``state``.
+
+    Precedence: hold > disable > (per provider) observed block > stale rules > policy. A forced
+    level (hold/disable) sets the provider states it implies (``forced_provider_states``) and
+    freezes the gate providers of that level and every level before it; the others keep following
+    their policy. Otherwise each gate provider follows its own policy and the first level whose
+    gate providers are all ``ok`` is selected.
+
+    Alerts: with one gate provider (the legacy config) one line per level change, exactly as
+    0.3.0 wrote it. With several, one line per provider state change and one per level change.
+    A stale-data escalation alert replaces that provider's own line."""
+    th = state.setdefault("throttle", {})
+    rungs = throttle_ladder(t)
+    names = [r["name"] for r in rungs]
+    gates = gate_providers(rungs)
+    single = len(gates) == 1
+    tag = "" if t.get("enabled") else " (shadow)"
+    level = th.get("level") if th.get("level") in names else names[0]
+    pstates = throttle_provider_states(th, t, gates)
+    hold = th.get("hold")
+    if hold and float(hold.get("until") or 0) <= now:
+        th.pop("hold", None)
+        hold = None
+    ignored = [f"{kind} {rec.get('level')!r}" for kind, rec in (("hold", hold), ("disable", th.get("disabled")))
+               if rec and rec.get("level") not in names]
+    if ignored and th.get("ignored_alerted") != ignored:
+        queue(state, f"quota-router: throttle{tag} ignoring {' and '.join(ignored)}: "
+                     f"not a ladder level ({', '.join(names)})")
+    if ignored:
+        th["ignored_alerted"] = ignored
+    else:
+        th.pop("ignored_alerted", None)
+    forced = None
+    if hold and hold.get("level") in names:
+        forced = (hold["level"], "hold")
+    elif th.get("disabled") and th["disabled"].get("level") in names:
+        forced = (th["disabled"]["level"], "disable")
+    current = {p: "constrained" if pstates[p].get("state") == "constrained" else "ok" for p in gates}
+    frozen, implied = set(), current
+    if forced:
+        index = names.index(forced[0])
+        frozen = {p for r in rungs[:index + 1] for p in r["gate"]}
+        implied = forced_provider_states(rungs, index, current)
+    per = {}
+    for p in gates:
+        ps = pstates[p]
+        windows, fetched_at = _throttle_windows(state, now, cfg, p)
+        rule = label = stale = None
+        if p in frozen:
+            new_state, source = implied[p], forced[1]
+        else:
+            lv, source, rule, label, stale = _provider_policy(
+                state, p, "constrained" if current[p] == "constrained" else "fast", float(ps.get("since") or 0.0),
+                windows, fetched_at, ps.get("stale_alerted_for"), now, cfg, t)
+            new_state = "constrained" if lv == "constrained" else "ok"
+        if stale:
+            ps["stale_alerted_for"] = fetched_at
+        if source != "stale":
+            ps.pop("stale_alerted_for", None)
+        changed = new_state != current[p]
+        if changed:
+            ps["since"] = now
+        elif not ps.get("since"):
+            ps["since"] = now
+        ps.update(state=new_state, source=source, rule=rule, label=label, decided_at=now)
+        per[p] = {"state": new_state, "previous": current[p], "changed": changed, "source": source,
+                  "rule": rule, "label": label, "windows": _window_summary(windows),
+                  "_raw": windows, "_stale": stale}
+    new = forced[0] if forced else select_level(rungs, {p: per[p]["state"] for p in gates})
+    if forced:
+        source, rule, label = forced[1], None, None
+    elif single:
+        only = per[gates[0]]
+        source, rule, label = only["source"], only["rule"], only["label"]
+    else:
+        source, rule, label = "policy", None, None
+    changed = new != level
+    if single:
+        only = per[gates[0]]
+        if only["_stale"]:  # names the transition itself, so no second line
+            age, w = only["_stale"]
+            queue(state, f"quota-router: throttle{tag} stale usage data ({int(age // 60)}m old); "
+                         f"{level} → {new} ({w['label']} last {w['used']:.0f}%)")
+        elif changed:
+            queue(state, f"quota-router: throttle{tag} {level} → {new} "
+                         f"({_why(source, rule, label, only['_raw'])})")
+    else:
+        for p in gates:
+            d = per[p]
+            if d["_stale"]:
+                age, w = d["_stale"]
+                queue(state, f"quota-router: throttle{tag} stale usage data for {p} ({int(age // 60)}m old); "
+                             f"{d['previous']} → constrained ({w['label']} last {w['used']:.0f}%)")
+            elif d["changed"]:
+                queue(state, f"quota-router: throttle{tag} {p} {d['previous']} → {d['state']} "
+                             f"({_why(d['source'], d['rule'], d['label'], d['_raw'])})")
+        if changed:
+            why = ", ".join(f"{p} {per[p]['state']}" for p in gates if per[p]["changed"]) or \
+                _why(source, rule, label, [])
+            queue(state, f"quota-router: throttle{tag} {level} → {new} ({why})")
+    if changed:
+        th["since"] = now
+    elif not th.get("since"):
+        th["since"] = now
+    th.update(level=new, source=source, rule=rule, decided_at=now)
+    for d in per.values():
+        d.pop("_raw")
+        d.pop("_stale")
     decision = {"level": new, "previous": level, "changed": changed, "source": source, "rule": rule,
-                "label": label, "windows": wsum, "at": now}
+                "label": label, "windows": per[gates[0]]["windows"] if single else {}, "at": now,
+                "providers": per}
+    rec = {k: decision[k] for k in ("at", "level", "source", "rule", "label", "windows")}
+    if not single:
+        rec["providers"] = {p: {k: d[k] for k in ("state", "source", "rule", "label", "windows")}
+                            for p, d in per.items()}
     log = th.get("log") if isinstance(th.get("log"), list) else []
-    th["log"] = (log + [{k: decision[k] for k in ("at", "level", "source", "rule", "label", "windows")}]
-                 )[-THROTTLE_LOG_MAX:]
+    th["log"] = (log + [rec])[-THROTTLE_LOG_MAX:]
     return decision

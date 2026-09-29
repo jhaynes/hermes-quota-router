@@ -377,6 +377,19 @@ def test_the_built_in_aliases_cover_everything_hermes_routes_to_a_tracked_provid
     assert all(canon(n) not in core.WATCHED for n in names - set(tracked) if n != "main")
 
 
+def test_validation_rejects_a_level_policy_can_never_select():
+    # same gate as the codex level: whenever claude's gate is ok, codex's is too
+    msg = _refusal([LADDER[0], dict(LADDER[1], gate=[CODEX], fallback=[]), LADDER[2]])
+    assert msg == ("throttle.ladder.claude can never be selected: its gate includes every gate provider of codex, "
+                   "which comes first"), msg
+    wider = [LADDER[0], dict(LADDER[1], gate=[CODEX, CLAUDE]), LADDER[2]]
+    msg = _refusal(wider)
+    assert msg and msg.startswith("throttle.ladder.claude can never be selected"), msg
+    narrower = [dict(LADDER[0], gate=[CODEX, CLAUDE], fallback=[{"provider": CLAUDE, "model": "opus-x"}]),
+                LADDER[1], LADDER[2]]
+    assert core.validate_ladder(narrower) == []                           # a narrower later gate is fine
+
+
 def test_a_valid_ladder_passes_validation_including_a_level_containing_its_own_gate_provider():
     both = [dict(LADDER[0], gate=[CODEX, CLAUDE], fallback=[{"provider": CLAUDE, "model": "opus-x"}]),
             *LADDER[1:]]

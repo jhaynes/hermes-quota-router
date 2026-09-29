@@ -1075,7 +1075,8 @@ def validate_ladder(ladder: Any, cfg: Optional[dict] = None) -> list[str]:
     is known to be capped. Providers are compared as Hermes routes them (``canonical_provider``:
     ``claude`` is ``anthropic``, ``codex`` is ``openai-codex``, a ``custom:`` prefix is dropped), and
     a ``main`` fallback is the level's own primary. The last level is the floor and has no gate; no
-    other level may be ungated (it would make every later level unreachable). Gate providers must be tracked, and (with
+    other level may be ungated, and no level's gate may include every gate provider of an earlier
+    level (either way policy could never select it). Gate providers must be tracked, and (with
     ``cfg``) have forecast windows."""
     if not isinstance(ladder, list):
         return ["throttle.ladder must be a list of levels, highest preference first"]
@@ -1119,6 +1120,11 @@ def validate_ladder(ladder: Any, cfg: Optional[dict] = None) -> list[str]:
         if not r["gate"]:
             errs.append(f"throttle.ladder.{r['name']} has no gate, so no level after it can be selected; "
                         "only the last level may be ungated")
+    for i, r in enumerate(rungs):
+        earlier = next((e for e in rungs[:i] if e["gate"] and set(e["gate"]) <= set(r["gate"])), None)
+        if r["gate"] and earlier:
+            errs.append(f"throttle.ladder.{r['name']} can never be selected: its gate includes every gate "
+                        f"provider of {earlier['name']}, which comes first")
     gated_by = {p: [r["name"] for r in rungs if p in r["gate"]] for p in gate_providers(rungs)}
     for r in rungs:
         chain = level_chain(r["spec"])

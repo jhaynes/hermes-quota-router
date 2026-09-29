@@ -13,6 +13,7 @@ import fcntl
 import json
 import os
 import sqlite3
+import sys
 import time
 import urllib.parse
 from datetime import datetime, timezone
@@ -998,6 +999,38 @@ def _norm_provider(p: Any) -> str:
     return str(p or "").strip().lower()
 
 
+# Hermes' fallback routing (resolve_provider_client → agent.auxiliary_client._normalize_aux_provider)
+# drops a "custom:" prefix and maps these aliases onto the tracked providers.
+TRACKED_ALIASES = {"claude": "anthropic", "claude-code": "anthropic", "codex": "openai-codex"}
+
+
+def _hermes_normalizer():
+    """Hermes' own fallback-routing normaliser, only when this already runs inside Hermes: importing
+    Hermes' config module fresh seeds files in HERMES_HOME, so it is never imported from here."""
+    if "hermes_cli.config" not in sys.modules:
+        return None
+    try:
+        from agent.auxiliary_client import _normalize_aux_provider
+    except Exception:
+        return None
+    return _normalize_aux_provider
+
+
+def canonical_provider(name: Any) -> str:
+    """The provider Hermes routes ``name`` to, as far as the tracked providers go: Hermes' own
+    normaliser when available, then the built-in map either way (so an alias is never missed)."""
+    n = _norm_provider(name)
+    normalize = _hermes_normalizer()
+    if normalize is not None and n != "main":    # "main" reads Hermes' config; the ladder resolves it
+        try:
+            n = _norm_provider(normalize(n)) or n
+        except Exception:
+            pass
+    if n.startswith("custom:"):
+        n = n.split(":", 1)[1].strip() or "custom"
+    return TRACKED_ALIASES.get(n, n)
+
+
 def throttle_ladder(t: dict) -> list[dict]:
     """The levels in preference order: ``[{'name', 'gate': [provider, ...], 'spec': {...}}]``.
 
@@ -1010,7 +1043,7 @@ def throttle_ladder(t: dict) -> list[dict]:
         if not isinstance(entry, dict):
             continue
         gate = entry.get("gate")
-        gate = [_norm_provider(g) for g in gate if isinstance(g, str) and g.strip()] if isinstance(gate, list) else []
+        gate = [canonical_provider(g) for g in gate if isinstance(g, str) and g.strip()] if isinstance(gate, list) else []
         rungs.append({"name": str(entry.get("name") or f"level{i}"), "gate": list(dict.fromkeys(gate)),
                       "spec": {k: v for k, v in entry.items() if k not in ("name", "gate")}})
     if rungs:
@@ -1039,9 +1072,11 @@ def validate_ladder(ladder: Any, cfg: Optional[dict] = None) -> list[str]:
 
     B1 generalised: a provider that gates ANY level may appear in a level's chain (primary or
     fallback) only if it also gates that level, so a level never fails over onto a provider that
-    is known to be capped. The last level is the floor and has no gate; no other level may be
-    ungated (it would make every later level unreachable). Gate providers must be tracked, and
-    (with ``cfg``) have forecast windows."""
+    is known to be capped. Providers are compared as Hermes routes them (``canonical_provider``:
+    ``claude`` is ``anthropic``, ``codex`` is ``openai-codex``, a ``custom:`` prefix is dropped), and
+    a ``main`` fallback is the level's own primary. The last level is the floor and has no gate; no
+    other level may be ungated (it would make every later level unreachable). Gate providers must be tracked, and (with
+    ``cfg``) have forecast windows."""
     if not isinstance(ladder, list):
         return ["throttle.ladder must be a list of levels, highest preference first"]
     if len(ladder) < 2:
@@ -1073,7 +1108,7 @@ def validate_ladder(ladder: Any, cfg: Optional[dict] = None) -> list[str]:
             errs.append(f"{where}.gate must be a list of providers")
             continue
         for g in gate:
-            if _norm_provider(g) not in WATCHED:
+            if canonical_provider(g) not in WATCHED:
                 errs.append(f"{where}.gate: {g} is not a tracked provider ({', '.join(WATCHED)})")
     if errs:
         return errs
@@ -1086,9 +1121,14 @@ def validate_ladder(ladder: Any, cfg: Optional[dict] = None) -> list[str]:
                         "only the last level may be ungated")
     gated_by = {p: [r["name"] for r in rungs if p in r["gate"]] for p in gate_providers(rungs)}
     for r in rungs:
-        for p in dict.fromkeys(_norm_provider(p) for p, _m in level_chain(r["spec"])):
+        chain = level_chain(r["spec"])
+        primary = canonical_provider(chain[0][0])
+        for raw in dict.fromkeys(p for p, _m in chain):
+            p = canonical_provider(raw)
+            p = primary if p == "main" else p
             if p in gated_by and p not in r["gate"]:
-                errs.append(f"throttle.ladder.{r['name']} must not contain {p} (primary or fallback): "
+                spelled = "" if _norm_provider(raw) == p else f", written {raw.strip()!r}"
+                errs.append(f"throttle.ladder.{r['name']} must not contain {p} (primary or fallback{spelled}): "
                             f"{p} gates {', '.join(gated_by[p])} but not {r['name']}")
     if cfg is not None:
         windows = cfg.get("forecast_windows") or {}

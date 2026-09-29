@@ -309,6 +309,74 @@ def test_validation_rejects_other_malformed_ladders(bad, expect):
     assert msg and msg.startswith(expect), msg
 
 
+def _hermes_aux_normalizer():
+    """Hermes' own fallback-routing normaliser, or None when Hermes isn't importable here."""
+    try:
+        from agent.auxiliary_client import _normalize_aux_provider
+    except Exception:
+        return None
+    return _normalize_aux_provider
+
+
+@pytest.fixture(params=["built-in aliases", "hermes normaliser"])
+def alias_mode(request, monkeypatch, tmp_path):
+    """Run alias tests once on the built-in map and once through Hermes' own normaliser."""
+    if request.param == "built-in aliases":
+        monkeypatch.setattr(core, "_hermes_normalizer", lambda: None, raising=False)
+        return request.param
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))    # importing Hermes seeds files there
+    aux = _hermes_aux_normalizer()
+    if aux is None:
+        pytest.skip("Hermes is not importable: the built-in map is what runs")
+    monkeypatch.setattr(core, "_hermes_normalizer", lambda: aux, raising=False)
+    return request.param
+
+
+@pytest.mark.parametrize("where", ["fallback", "primary"])
+@pytest.mark.parametrize("spelling", ["claude", "Claude-Code ", "Anthropic ", "custom:claude"])
+def test_validation_resolves_anthropic_aliases_in_a_chain(alias_mode, spelling, where):
+    floor = (dict(LADDER[2], fallback=[{"provider": spelling, "model": "opus-x"}]) if where == "fallback"
+             else dict(LADDER[2], provider=spelling))
+    errs = core.validate_ladder([*LADDER[:2], floor])
+    assert errs and errs[0].startswith("throttle.ladder.internal must not contain anthropic"), errs
+
+
+@pytest.mark.parametrize("where", ["fallback", "primary"])
+@pytest.mark.parametrize("spelling", ["codex", " Codex", "OpenAI-Codex"])
+def test_validation_resolves_codex_aliases_in_a_chain(alias_mode, spelling, where):
+    claude = (dict(LADDER[1], fallback=[{"provider": spelling, "model": "codex-x"}]) if where == "fallback"
+              else dict(LADDER[1], provider=spelling))
+    errs = core.validate_ladder([LADDER[0], claude, LADDER[2]])
+    assert errs and errs[0].startswith("throttle.ladder.claude must not contain openai-codex"), errs
+
+
+def test_a_gate_spelled_with_an_alias_gates_the_tracked_provider(alias_mode):
+    ladder = [dict(LADDER[0], gate=["codex"], provider="Codex"), dict(LADDER[1], gate=["Claude-Code"]), LADDER[2]]
+    assert core.validate_ladder(ladder) == []
+    t = core.throttle_config({"ladder": ladder, "profiles": []})
+    assert [r["gate"] for r in core.throttle_ladder(t)] == [[CODEX], [CLAUDE], []]
+    st = core.empty_state()
+    feed(st, NOW, codex=(20, 90), claude=(88, 30))
+    assert core.throttle_step(st, NOW, CFG, t)["level"] == "internal"      # both gates read their own windows
+
+
+def test_the_built_in_aliases_cover_everything_hermes_routes_to_a_tracked_provider(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    aux = _hermes_aux_normalizer()
+    if aux is None:
+        pytest.skip("Hermes is not importable here; this parity check needs its alias tables")
+    import agent.auxiliary_client as ac
+    import hermes_cli.providers as hp
+    names = set(ac._PROVIDER_ALIASES) | set(hp.ALIASES) | set(core.WATCHED) | {"codex", "claude", "claude-code"}
+    names |= {f"custom:{n}" for n in names} | {n.upper() for n in names}
+    monkeypatch.setattr(core, "_hermes_normalizer", lambda: None, raising=False)
+    tracked = {n: aux(n) for n in names if n != "main" and aux(n) in core.WATCHED}
+    assert len(tracked) >= 12, tracked                                   # the probe found the aliases
+    canon = getattr(core, "canonical_provider", core._norm_provider)
+    assert {n: canon(n) for n in tracked} == tracked
+    assert all(canon(n) not in core.WATCHED for n in names - set(tracked) if n != "main")
+
+
 def test_a_valid_ladder_passes_validation_including_a_level_containing_its_own_gate_provider():
     both = [dict(LADDER[0], gate=[CODEX, CLAUDE], fallback=[{"provider": CLAUDE, "model": "opus-x"}]),
             *LADDER[1:]]

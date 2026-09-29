@@ -1,4 +1,4 @@
 name: quota-router
-version: "0.3.0"
+version: "0.4.0"
 description: Host-level quota awareness for anthropic / openai-codex — observed blocks, usage tiers, alerts, /quota.
 author: Justin Haynes + Hermes

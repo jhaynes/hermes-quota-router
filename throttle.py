@@ -5,13 +5,17 @@ Two halves (v2 B2/B3):
   ``hermes -p <profile> quota-router throttle apply-one ...`` (a subprocess, so profile scoping is the
   CLI's own), then record results and alerts under the state lock. Shadow mode (``enabled: false``)
   decides and logs only; it never starts a child.
-- ``apply_one`` (child): read the profile's raw config, classify its parsed values against both level
-  specs, and make at most ONE ``hermes_cli.config.atomic_config_write`` call. A value set that matches
-  neither level is a hand edit and is never overwritten.
+- ``apply_one`` (child): read the profile's raw config, classify its parsed values against every level
+  spec, and make at most ONE ``hermes_cli.config.atomic_config_write`` call. A value set that matches
+  no level is a hand edit and is never overwritten.
+
+Level specs arrive as the legacy ``levels`` mapping (``{fast, constrained}``) or as the ladder list
+(``[{name, gate, provider, model, fallback, max_in_progress}]``, highest preference first).
 """
 from __future__ import annotations
 
 import contextlib
+import copy
 import fcntl
 import importlib.util
 import json
@@ -75,22 +79,38 @@ def _kanban_value(raw: dict) -> Any:
     return kb.get("max_in_progress") if isinstance(kb, dict) else None
 
 
-def classify(raw: dict, levels: dict, desired: str, kanban: bool) -> Optional[str]:
-    """The level whose spec the config's parsed values equal (desired checked first), else None."""
+def level_specs(levels: Any) -> dict:
+    """``{name: spec}`` in level order: the legacy ``levels`` mapping's two levels, or a ladder's
+    levels (non-mapping entries skipped; ``validate_ladder`` reports them)."""
+    if isinstance(levels, list):
+        return {str(e.get("name")): e for e in levels if isinstance(e, dict)}
+    levels = levels if isinstance(levels, dict) else {}
+    return {lv: levels.get(lv) or {} for lv in _core().THROTTLE_LEVELS}
+
+
+def validate(levels: Any) -> list[str]:
     core = _core()
-    order = [desired] + [lv for lv in core.THROTTLE_LEVELS if lv != desired]
+    return core.validate_ladder(levels) if isinstance(levels, list) else core.validate_levels(levels)
+
+
+def classify(raw: dict, levels: Any, desired: str, kanban: bool) -> Optional[str]:
+    """The level whose spec the config's parsed values equal (desired checked first), else None."""
+    specs = level_specs(levels)
+    order = [desired] + [lv for lv in specs if lv != desired]
     for lv in order:
         if kanban:
-            if _kanban_value(raw) == levels[lv].get("max_in_progress"):
+            if _kanban_value(raw) == specs[lv].get("max_in_progress"):
                 return lv
-        elif actual_spec(raw) == spec_values(levels[lv]):
+        elif actual_spec(raw) == spec_values(specs[lv]):
             return lv
     return None
 
 
-def kanban_managed(levels: dict) -> bool:
-    return all(isinstance((levels.get(lv) or {}).get("max_in_progress"), int)
-               and not isinstance(levels[lv]["max_in_progress"], bool) for lv in ("fast", "constrained"))
+def kanban_managed(levels: Any) -> bool:
+    """Every level sets an integer ``max_in_progress`` (all levels or none)."""
+    specs = level_specs(levels)
+    return bool(specs) and all(isinstance(spec.get("max_in_progress"), int)
+                               and not isinstance(spec["max_in_progress"], bool) for spec in specs.values())
 
 
 def _backup(path: Path, backup_dir: Path, label: str, now: float) -> Path:
@@ -105,15 +125,16 @@ def _backup(path: Path, backup_dir: Path, label: str, now: float) -> Path:
     return dest
 
 
-def apply_one(path: Path, level: str, levels: dict, *, kanban: bool = False, backup_dir: Path,
+def apply_one(path: Path, level: str, levels: Any, *, kanban: bool = False, backup_dir: Path,
               label: str, now: float) -> dict:
     """Reconcile one config file to ``level``. Result: ``noop`` | ``applied`` | ``drift`` |
-    ``unsupported`` | ``error``, plus ``actual`` (the level the file matched before any write)."""
-    core = _core()
-    errs = core.validate_levels(levels)
+    ``unsupported`` | ``error``, plus ``actual`` (the level the file matched before any write).
+    A file matching any level other than ``level`` is rewritten; one matching none is a hand edit."""
+    errs = validate(levels)
     if kanban and not kanban_managed(levels):
-        errs.append("both levels need an integer max_in_progress for the kanban key")
-    if level not in core.THROTTLE_LEVELS:
+        errs.append("every level needs an integer max_in_progress for the kanban key" if isinstance(levels, list)
+                    else "both levels need an integer max_in_progress for the kanban key")
+    if level not in level_specs(levels):
         errs.append(f"unknown level {level!r}")
     if errs:
         return {"result": "error", "actual": None, "message": errs[0]}
@@ -133,7 +154,7 @@ def apply_one(path: Path, level: str, levels: dict, *, kanban: bool = False, bac
                 if isinstance(f, dict) for k in f if k not in ("provider", "model")]
         if own and not kanban:
             return {"result": "unsupported", "actual": actual, "message": f"{own[0]} is set"}
-        spec = levels[level]
+        spec = level_specs(levels)[level]
         if kanban:
             raw["kanban"]["max_in_progress"] = spec["max_in_progress"]
         else:
@@ -151,9 +172,10 @@ def apply_one(path: Path, level: str, levels: dict, *, kanban: bool = False, bac
         return {"result": "error", "actual": None, "message": f"{type(exc).__name__}: {str(exc)[:200]}"}
 
 
-def apply_one_argv(level: str, levels: dict, *, kanban: bool) -> list[str]:
+def apply_one_argv(level: str, levels: Any, *, kanban: bool) -> list[str]:
     """``quota-router`` sub-argv for the child. Level specs travel in argv because the child's
-    config is the profile's, which doesn't carry the root throttle block."""
+    config is the profile's, which doesn't carry the root throttle block. ``--levels-json`` is the
+    legacy mapping or the ladder list (a 0.3.0 child refuses a list: "must be a mapping")."""
     argv = ["throttle", "apply-one", level, "--levels-json", json.dumps(levels, sort_keys=True)]
     return argv + (["--kanban"] if kanban else [])
 
@@ -223,7 +245,7 @@ def _apply_lock(state_path: Path):
 
 def _targets(t: dict) -> list[tuple[str, bool]]:
     out = [(str(p), False) for p in t.get("profiles") or []]
-    if kanban_managed(t.get("levels") or {}):
+    if kanban_managed(_core().throttle_apply_levels(t) or {}):
         out.append((ROOT_PROFILE, True))
     return out
 
@@ -254,7 +276,7 @@ def run_apply(state_path: Path, cfg: dict, t: dict, runner: Runner, now: float, 
         with core.locked_state(state_path) as st:
             decision = core.throttle_step(st, now, cfg, t)
             th = st["throttle"]
-            errs = core.validate_levels(t.get("levels"), t["protected_provider"]) if t.get("enabled") else []
+            errs = core.validate_throttle(t, cfg) if t.get("enabled") else []
             if errs:
                 if th.get("config_error") != errs[0]:
                     core.queue(st, f"quota-router: throttle config invalid, not applying: {errs[0]}")
@@ -267,7 +289,8 @@ def run_apply(state_path: Path, cfg: dict, t: dict, runner: Runner, now: float, 
             level = decision["level"]
             for profile, kanban in _targets(t):
                 try:
-                    rc, out, err = runner(profile, apply_one_argv(level, t["levels"], kanban=kanban))
+                    rc, out, err = runner(profile, apply_one_argv(level, core.throttle_apply_levels(t),
+                                                                  kanban=kanban))
                     res = parse_result(out) if rc == 0 else None
                 except Exception as exc:   # timeout, missing binary: this profile failed, go on
                     rc, out, err = None, "", ""
@@ -314,23 +337,44 @@ def _leaked_sessions(home: Path, profile: str, provider: str, since: float) -> O
 
 
 def throttle_status(state: dict, t: dict, home: Path, now: float) -> dict:
-    th = state.get("throttle") or {}
-    level = th.get("level") or "fast"
+    """Selected level, reasons, per-provider state and per-profile results. The leak count, per gate
+    provider, is the sessions a throttled profile started on that provider since it became
+    ``constrained`` (no selectable level routes to a constrained gate provider, so each one leaked)."""
+    core = _core()
+    th = dict(state.get("throttle") or {})
+    rungs = core.throttle_ladder(t)
+    gates = core.gate_providers(rungs)
+    level = th.get("level") or rungs[0]["name"]
     since = th.get("since")
     applied = th.get("applied") or {}
+    # on a copy: status never migrates or otherwise writes the state it reports
+    pstates = core.throttle_provider_states(copy.deepcopy({k: v for k, v in th.items() if k != "log"}), t, gates)
+    last = (th.get("log") or [None])[-1]
+    providers = {}
+    for p in gates:
+        ps = pstates.get(p) or {}
+        windows = ((last or {}).get("providers") or {}).get(p, {}).get("windows")
+        if windows is None and len(gates) == 1:
+            windows = (last or {}).get("windows")
+        providers[p] = {"state": ps.get("state", "ok"), "since": ps.get("since"), "source": ps.get("source"),
+                        "rule": ps.get("rule"), "label": ps.get("label"), "windows": windows or {}}
     profiles = {}
     for profile, kanban in _targets(t):
         rec = dict(applied.get(profile) or {})
         rec.pop("alerted", None)
         if not kanban:
-            rec["leaked_sessions"] = (_leaked_sessions(Path(home), profile, t["protected_provider"], float(since))
-                                      if level == "constrained" and since else 0)
+            leaks = {p: (_leaked_sessions(Path(home), profile, p, float(ps["since"]))
+                         if ps["state"] == "constrained" and ps["since"] else 0) for p, ps in providers.items()}
+            counts = [n for n in leaks.values() if n is not None]
+            rec["leaked_sessions"] = sum(counts) if counts or not leaks else None
+            rec["leaked_by_provider"] = leaks
         profiles[profile] = rec
     hold = th.get("hold") if th.get("hold") and float(th["hold"].get("until") or 0) > now else None
     return {"configured": bool(t.get("configured")), "enabled": bool(t.get("enabled")), "level": level,
             "since": since, "source": th.get("source"), "rule": th.get("rule"), "decided_at": th.get("decided_at"),
             "hold": hold, "disabled": th.get("disabled"), "config_error": th.get("config_error"),
-            "profiles": profiles, "last": (th.get("log") or [None])[-1]}
+            "profiles": profiles, "last": last,
+            "ladder": [{"name": r["name"], "gate": list(r["gate"])} for r in rungs], "providers": providers}
 
 
 def render_throttle_status(s: dict) -> str:
@@ -347,20 +391,40 @@ def render_throttle_status(s: dict) -> str:
         out.append(f"  disabled → {s['disabled']['level']} (since {ts(s['disabled']['since'])})")
     if s.get("config_error"):
         out.append(f"  CONFIG INVALID: {s['config_error']}")
-    for label, w in ((s.get("last") or {}).get("windows") or {}).items():
-        proj = "unknown" if w.get("projected") is None else (
-            f"{w['projected']:.0f}% (short {w['projected_short']:.0f}%), "
-            f"r_long {w['r_long']:.1f}%/h r_short {w['r_short']:.1f}%/h")
-        out.append(f"    {label:<16} {w['used']:5.1f}%  → {proj}")
+
+    def windows(ws: dict, indent: str) -> None:
+        for label, w in (ws or {}).items():
+            proj = "unknown" if w.get("projected") is None else (
+                f"{w['projected']:.0f}% (short {w['projected_short']:.0f}%), "
+                f"r_long {w['r_long']:.1f}%/h r_short {w['r_short']:.1f}%/h")
+            out.append(f"{indent}{label:<16} {w['used']:5.1f}%  → {proj}")
+
+    gates = [p for r in s.get("ladder") or [] for p in r["gate"]]
+    gates = list(dict.fromkeys(gates))
+    if len(gates) > 1:
+        out.append("  ladder: " + " → ".join(f"{r['name']} [{', '.join(r['gate']) or 'floor'}]"
+                                               for r in s["ladder"]))
+        for p in gates:
+            ps = (s.get("providers") or {}).get(p) or {}
+            out.append(f"  {p}: {ps.get('state', 'ok')}  since {ts(ps.get('since'))}  source={ps.get('source')}"
+                       + (f" rule={ps['rule']}" if ps.get("rule") else ""))
+            windows(ps.get("windows"), "      ")
+    else:
+        windows((s.get("last") or {}).get("windows"), "    ")
     for profile, rec in s["profiles"].items():
         bits = [f"{rec.get('result', 'never applied')}"]
         if rec.get("level"):
             bits.append(f"at {rec['level']}")
         if rec.get("message"):
             bits.append(str(rec["message"])[:120])
-        if "leaked_sessions" in rec:
+        by = rec.get("leaked_by_provider") or {}
+        if len(by) > 1:
+            bits.append("leak " + ", ".join(f"{'?' if n is None else n} {p}" for p, n in by.items())
+                        + " sessions while constrained")
+        elif "leaked_sessions" in rec:
             leak = rec["leaked_sessions"]
-            bits.append(f"leak {'?' if leak is None else leak} anthropic sessions while constrained")
+            provider = next(iter(by), "anthropic")
+            bits.append(f"leak {'?' if leak is None else leak} {provider} sessions while constrained")
         out.append(f"  {profile}: " + "; ".join(bits))
     return "\n".join(out)
 

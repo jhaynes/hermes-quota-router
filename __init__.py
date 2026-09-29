@@ -313,17 +313,18 @@ def _cli_setup(sub):
     s.add_argument("--json", action="store_true", help="Print one QRJSON <payload> line for the desktop widget")
     sp.add_parser("refresh", help="Fetch live usage; print only new alerts/transitions (cron-friendly)")
     sp.add_parser("path", help="Print the host-level state file path")
-    th = sp.add_parser("throttle", help="Host-local burn-rate throttle (fast/constrained)")
+    th = sp.add_parser("throttle", help="Host-local burn-rate throttle (ladder levels; fast/constrained by default)")
     tsp = th.add_subparsers(dest="qr_throttle_cmd")
     tsp.add_parser("apply", help="Decide the level and reconcile throttled profiles (cron path)")
     ts = tsp.add_parser("status", help="Show the throttle level, reasons and per-profile results")
     ts.add_argument("--json", action="store_true")
-    h = tsp.add_parser("hold", help="Force a level for a while (overrides everything)")
+    h = tsp.add_parser("hold", help="Force a level (a ladder level name) for a while (overrides everything)")
     h.add_argument("level", nargs="?")
     h.add_argument("--for", dest="duration", default="2h")
     h.add_argument("--clear", action="store_true")
-    d = tsp.add_parser("disable", help="Restore a level (default fast) and stop following the policy")
-    d.add_argument("--level", default="fast")
+    d = tsp.add_parser("disable", help="Restore a level (default: the first, fast for levels:) and stop "
+                                       "following the policy")
+    d.add_argument("--level", default=None)
     d.add_argument("--clear", action="store_true", help="Resume following the policy")
     a1 = tsp.add_parser("apply-one", help="(internal) reconcile THIS profile's config to a level")
     a1.add_argument("level")
@@ -345,14 +346,15 @@ def _throttle_handler(args) -> int:
         print("QRTHROTTLE_STATUS " + json.dumps(s) if args.json else thr.render_throttle_status(s))
         return 0
     if cmd in ("hold", "disable"):
+        names = core.throttle_level_names(t)
         try:
             with core.locked_state(path) as st:
                 if cmd == "hold" and args.clear:
                     core.throttle_clear_hold(st)
                 elif cmd == "hold":
-                    core.throttle_hold(st, args.level or "", now + thr.parse_duration(args.duration), now)
+                    core.throttle_hold(st, args.level or "", now + thr.parse_duration(args.duration), now, names)
                 else:
-                    core.throttle_disable(st, None if args.clear else args.level, now)
+                    core.throttle_disable(st, None if args.clear else (args.level or names[0]), now, names)
         except ValueError as exc:
             print(f"quota-router: {exc}")
             return 2

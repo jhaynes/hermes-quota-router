@@ -81,15 +81,26 @@ Since 0.3.0 it also carries `cache`: `collected_at`, `stale` (older than `stale_
 
 ## Throttle policy
 
-A separate, host-local decision between two levels, `fast` and `constrained`, over the protected provider's (`anthropic`) forecast windows. It doesn't change tiers or mode. Config lives under `plugins.entries.quota-router.throttle`; thresholds default as below, and the level specs (`levels.fast`, `levels.constrained`: `provider`, `model`, `fallback: [{provider, model}]`) have **no code defaults**. The constrained chain (primary and fallback) must not contain `anthropic`, so a saturated constrained primary fails over away from the capped provider rather than back to it.
+A separate, host-local decision over an ordered **ladder** of levels. Every provider that gates a level (a **gate provider**, `anthropic` or `openai-codex`) has its own `ok`/`constrained` state, decided from its own `forecast_windows` by the rules below, with its own dwell timer and reasons. The **selected level is the first whose gate providers are all `ok`**. The last level has no gate, so there is always a floor. The throttle doesn't change tiers or mode. Config lives under `plugins.entries.quota-router.throttle`. The thresholds default as below and apply to every gate provider. The level specs (`provider`, `model`, `fallback: [{provider, model}]`, optional `max_in_progress`) have **no code defaults**.
+
+Per gate provider, over that provider's forecast windows:
 
 - **Enter `constrained`** on any window: (a) `projected_at_reset ≥ enter_projected` (95); (b) `used ≥ enter_used` (85); (c) `r_long > 0`, `r_short ≥ 1.5 × r_long` and `projected_at_reset ≥ early_projected` (85). A window resetting within `ignore_reset_within_s` (30 min) can't escalate.
-- **Leave** when every window has `projected_short ≤ leave_projected` (80; an unknown forecast counts as satisfied) and `used < leave_used` (75), after `min_dwell_s` (30 min).
-- **Stale data** (snapshot older than `stale_after_s`): hold the level. Older than `stale_hold_s` (60 min): `constrained` if any last-known window was at or above `leave_used` (one `stale usage data` alert per incident), otherwise `fast`.
-- **Precedence:** `hold` > `disable` > observed Anthropic block > policy (including stale rules).
-- **Alerts:** one `quota-router: throttle [(shadow)] <from> → <to> (<why>)` line per transition. Every decision is appended to `throttle.log` in state (per-window used, projected, `r_long`, `r_short`, rule) for the shadow report.
+- **Leave** (back to `ok`) when every window has `projected_short ≤ leave_projected` (80; an unknown forecast counts as satisfied) and `used < leave_used` (75), after `min_dwell_s` (30 min) in `constrained`.
+- **Stale data** (snapshot older than `stale_after_s`): hold the state. Older than `stale_hold_s` (60 min): `constrained` if any last-known window was at or above `leave_used` (one `stale usage data` alert per incident), otherwise `ok`.
+- An observed hard block on that provider makes it `constrained` until the block ends.
+
+**Precedence:** `hold` > `disable` > observed block > policy (including the stale rules). A hold or disable forces a level. Its gate providers become `ok`, and each earlier level is made unselectable by marking its other gate providers `constrained`. The gate providers of the forced level and of every level before it are frozen until the hold or disable ends; the other gate providers keep following the policy. When it ends, each frozen provider resumes from the forced state, with the dwell counted from when it was forced. A hold or disable naming a level the ladder doesn't have is ignored, with one alert.
+
+**Validation** (B1, generalised): a provider that gates **any** level may appear in a level's chain (primary or fallback) **only if it also gates that level**. Otherwise a saturated level could fail over onto a provider that is known to be capped. Also: at least two levels, unique `name`s, the last level has no `gate` and no other level is ungated (it would make every later level unreachable), gate providers are tracked (`anthropic`, `openai-codex`) and have `forecast_windows`, and a level has only the keys `name`, `gate`, `provider`, `model`, `fallback` and `max_in_progress`. An invalid config is refused with one alert, and nothing is written.
+
+**Legacy `levels`:** `levels: {fast, constrained}` with `protected_provider` (default `anthropic`) still works. It is the two-level ladder `[fast gated by protected_provider, constrained]`, and it decides, logs and alerts exactly as 0.3.0 did. Its validation is the 0.3.0 check (the constrained chain must not contain the protected provider), which is the rule above for that ladder. A 0.3.0 state file migrates on the first decision: the recorded level becomes the protected provider's state, keeping its dwell, the hold, the disable and the stale-alert dedupe. Set `ladder` or `levels`, not both.
+
+- **Alerts:** with one gate provider (the legacy config), one `quota-router: throttle [(shadow)] <from> → <to> (<why>)` line per level change, as before. With several gate providers, one `quota-router: throttle [(shadow)] <provider> ok → constrained (<why>)` line per provider state change, and one `quota-router: throttle [(shadow)] <from> → <to> (<provider> <state>, ...)` line per level change. A stale-data escalation alert (`stale usage data [for <provider>] ...`) replaces that provider's own line. Every decision is appended to `throttle.log` in state (per-window used, projected, `r_long`, `r_short`, rule; per provider when there are several) for the shadow report.
 
 ## Throttle apply
+
+A codex → claude → internal ladder: codex while Codex has room, Claude while Codex is nearly out and Claude isn't, internal when both are:
 
 ```yaml
 plugins:
@@ -97,6 +108,31 @@ plugins:
     quota-router:
       throttle:
         enabled: false            # shadow mode (default): decide + log, never write
+        profiles: [worker-a, worker-b]
+        ladder:                   # highest preference first
+          - name: codex
+            gate: [openai-codex]  # selectable while openai-codex is ok
+            provider: openai-codex
+            model: codex-model
+            fallback: [{provider: "custom:internal", model: internal-model}]
+          - name: claude
+            gate: [anthropic]     # selectable while anthropic is ok
+            provider: anthropic
+            model: claude-model
+            fallback: [{provider: "custom:internal", model: internal-model}]
+          - name: internal        # no gate: the floor
+            provider: "custom:internal"
+            model: internal-model
+            fallback: [{provider: backup, model: backup-model}]
+```
+
+The validation rule means the `codex` level can't fall back to `anthropic`: `anthropic` gates `claude`, and it may be capped while `codex` is selected. To let the codex level fall back to Claude, gate it on both (`gate: [openai-codex, anthropic]`). It is then selected only while both have room.
+
+The legacy two-level form, unchanged:
+
+```yaml
+      throttle:
+        enabled: false
         profiles: [worker-a, worker-b]
         levels:
           fast:        {provider: primary-provider, model: fast-model,
@@ -107,17 +143,17 @@ plugins:
                         max_in_progress: 24}
 ```
 
-- `hermes quota-router throttle apply` decides the level (above) and, when `enabled: true`, reconciles **every run** (not only on a level change) each listed profile by running `hermes -p <profile> quota-router throttle apply-one <level> ...`. The child reads its own raw `config.yaml`, compares the **parsed** `model.provider`, `model.default` and `fallback_providers` with both level specs, and makes at most one `hermes_cli.config.atomic_config_write` call:
+- `hermes quota-router throttle apply` decides the level (above) and, when `enabled: true`, reconciles **every run** (not only on a level change) each listed profile by running `hermes -p <profile> quota-router throttle apply-one <level> ...`. The child reads its own raw `config.yaml`, compares the **parsed** `model.provider`, `model.default` and `fallback_providers` with every level spec, and makes at most one `hermes_cli.config.atomic_config_write` call:
   - matches the desired level → no-op;
-  - matches the other level → backup to `<root>/backups/quota-throttle/<profile>-<ts>.yaml`, one atomic write, re-read to verify. If the throttle had already applied this level there, it alerts once: `re-applied <level> to <profile> after external overwrite`;
-  - matches neither → a hand edit: skipped, never overwritten, one alert per (profile, level);
+  - matches another level → backup to `<root>/backups/quota-throttle/<profile>-<ts>.yaml`, one atomic write, re-read to verify. If the throttle had already applied this level there, it alerts once: `re-applied <level> to <profile> after external overwrite`;
+  - matches no level → a hand edit: skipped, never overwritten, one alert per (profile, level);
   - a `model:` block carrying its own route (`base_url`, `api_mode`, ...) is skipped with an alert.
-- When both levels set `max_in_progress`, the root config's `kanban.max_in_progress` is reconciled the same way (`hermes -p default`). Otherwise the key is never touched.
-- A constrained chain containing `anthropic` is refused with one alert, and nothing is written.
+- When every level sets `max_in_progress`, the root config's `kanban.max_in_progress` is reconciled the same way (`hermes -p default`). Otherwise the key is never touched.
+- A config failing validation (above) is refused with one alert, and nothing is written. The child validates the specs it is given too.
 - Running workers are never touched; the next spawn reads the new config.
-- `throttle status [--json]`: level, source/rule, hold/disable, per-window numbers from the last decision, per-profile results, and the leak count (sessions started on `anthropic` by a throttled profile since entering `constrained`, read-only from its `state.db`).
-- `throttle hold <fast|constrained> --for 2h` / `throttle hold --clear`; `throttle disable [--level fast]` / `throttle disable --clear`. Each applies at once.
-- Rollback: `throttle disable`, check `throttle status` shows every profile at `fast`, then downgrade the plugin. Restoring a backup is the last resort.
+- `throttle status [--json]`: the selected level, source/rule, hold/disable, per-window numbers from the last decision, per-profile results, and the leak count. With several gate providers it also shows the ladder and each provider's state, reasons and windows. The leak count is per gate provider: sessions a throttled profile started on that provider since it became `constrained`, read-only from the profile's `state.db`. No selectable level routes to a constrained gate provider, so each of those sessions leaked. `--json` adds `ladder`, `providers` and per-profile `leaked_by_provider`.
+- `throttle hold <level> --for 2h` / `throttle hold --clear`; `throttle disable [--level <level>]` (default: the first level, `fast` for `levels:`) / `throttle disable --clear`. Level names are the ladder's. Each applies at once.
+- Rollback: `throttle disable`, check `throttle status` shows every profile at the first level, then downgrade the plugin. Restoring a backup is the last resort. With a `levels:` config, downgrading is safe both ways: 0.3.0 ignores `throttle.providers`, and 0.4.0 re-reads the level 0.3.0 last decided when it is upgraded again. 0.3.0 can't apply a `ladder:` config.
 
 ## Deliberately out of scope
 

@@ -37,8 +37,10 @@ DEFAULTS = {
     "backoff_window_s": 60 * 60,
     "backoff_interval_s": 15 * 60,
     # Forecast (v2 B5). Window labels are core's; kind picks the rate maths below.
+    # openai-codex: core labels its 5 h primary window "Session" and its secondary "Weekly".
     "forecast_windows": {"anthropic": {"Current session": "session", "Current week": "weekly",
-                                       "Opus week": "weekly"}},
+                                       "Opus week": "weekly"},
+                         "openai-codex": {"Session": "session", "Weekly": "weekly"}},
     "forecast_kinds": {
         # long rate: least squares over the whole current cycle
         "session": {"period_s": 5 * 3600, "short_lookback_s": 30 * 60, "long_rate": "lsq"},

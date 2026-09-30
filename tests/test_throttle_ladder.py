@@ -266,22 +266,34 @@ def test_a_single_gate_ladder_alerts_like_the_legacy_levels():
     assert "providers" not in st["throttle"]["log"][-1]
 
 
-BOTH_FIRST = [
-    {"name": "both", "gate": [CODEX, CLAUDE], "provider": CODEX, "model": "codex-x",
-     "fallback": [{"provider": CLAUDE, "model": "opus-x"}]},
-    {"name": "claude", "gate": [CLAUDE], "provider": CLAUDE, "model": "opus-x"},
-    {"name": "internal", "provider": "custom:internal", "model": "glm-x"},
-]
+def both_first(gate):
+    """``both`` (gated by both providers, in the given order), then ``claude``, then the floor."""
+    return [{"name": "both", "gate": list(gate), "provider": CODEX, "model": "codex-x",
+             "fallback": [{"provider": CLAUDE, "model": "opus-x"}]},
+            {"name": "claude", "gate": [CLAUDE], "provider": CLAUDE, "model": "opus-x"},
+            {"name": "internal", "provider": "custom:internal", "model": "glm-x"}]
 
 
-def test_forcing_a_level_never_leaves_its_own_gate_provider_constrained():
+GATE_ORDERS = pytest.mark.parametrize("gate", [(CODEX, CLAUDE), (CLAUDE, CODEX)], ids=["codex-first", "claude-first"])
+
+
+def _states_select(st, t):
+    """The level the recorded provider states select, ignoring hold and disable."""
+    rungs = core.throttle_ladder(t)
+    return core.select_level(rungs, {p: pstate(st, p).get("state") for p in core.gate_providers(rungs)})
+
+
+@GATE_ORDERS
+def test_forcing_a_level_never_leaves_its_own_gate_provider_constrained(gate):
     # an earlier level shares a gate provider with the forced one: only its other gates are marked
+    t = lcfg(ladder=both_first(gate))
     st = core.empty_state()
     feed(st, NOW, codex=(10, 30), claude=(10, 30))
     st["throttle"] = {"hold": {"level": "claude", "until": NOW + H, "since": NOW}}
-    d = step(st, NOW + 1, lcfg(ladder=BOTH_FIRST))
+    d = step(st, NOW + 1, t)
     assert d["level"] == "claude", d
     assert (pstate(st, CLAUDE).get("state"), pstate(st, CODEX).get("state")) == ("ok", "constrained")
+    assert _states_select(st, t) == "claude"            # the implied states select the forced level
     # the forced level's own gate provider was constrained: forcing the level makes it ok
     st = core.empty_state()
     feed(st, NOW, codex=(10, 90), claude=(10, 30))
@@ -291,17 +303,33 @@ def test_forcing_a_level_never_leaves_its_own_gate_provider_constrained():
     assert d["level"] == "codex" and (pstate(st, CODEX).get("state"), pstate(st, CODEX).get("source")) == ("ok", "hold")
 
 
-def test_forcing_a_level_with_two_gate_providers_sets_and_freezes_both():
-    ladder = [BOTH_FIRST[0], BOTH_FIRST[2]]
+@GATE_ORDERS
+def test_forcing_a_level_with_two_gate_providers_sets_and_freezes_both(gate):
+    ladder = [both_first(gate)[0], both_first(gate)[2]]
+    t = lcfg(ladder=ladder)
     st = core.empty_state()
     feed(st, NOW, codex=(10, 90), claude=(88, 30))
-    assert step(st, NOW, lcfg(ladder=ladder))["level"] == "internal"
+    assert step(st, NOW, t)["level"] == "internal"
     st["throttle"]["hold"] = {"level": "both", "until": NOW + H, "since": NOW}
     feed(st, NOW + 5 * M, codex=(10, 90), claude=(88, 30))
-    d = step(st, NOW + 5 * M, lcfg(ladder=ladder))
+    d = step(st, NOW + 5 * M, t)
     assert d["level"] == "both", d
     assert [(pstate(st, p).get("state"), pstate(st, p).get("source")) for p in (CODEX, CLAUDE)] == \
         [("ok", "hold"), ("ok", "hold")]
+    assert _states_select(st, t) == "both"
+
+
+@GATE_ORDERS
+def test_forcing_a_later_level_makes_every_earlier_multi_gate_level_unselectable(gate):
+    """Whatever order an earlier level lists its gates in, the forced level's implied states must
+    make that earlier level unselectable, or it would be selected the moment the hold ends."""
+    t = lcfg(ladder=both_first(gate))
+    for held in ("claude", "internal"):
+        st = core.empty_state()
+        feed(st, NOW, codex=(10, 30), claude=(10, 30))
+        st["throttle"] = {"hold": {"level": held, "until": NOW + H, "since": NOW}}
+        assert step(st, NOW + 1, t)["level"] == held
+        assert _states_select(st, t) == held, (held, {p: pstate(st, p).get("state") for p in (CODEX, CLAUDE)})
 
 
 def _blocked_then_low():
@@ -426,16 +454,73 @@ def test_the_built_in_aliases_cover_everything_hermes_routes_to_a_tracked_provid
     aux = _hermes_aux_normalizer()
     if aux is None:
         pytest.skip("Hermes is not importable here; this parity check needs its alias tables")
+    import importlib
     import agent.auxiliary_client as ac
     import hermes_cli.providers as hp
-    names = set(ac._PROVIDER_ALIASES) | set(hp.ALIASES) | set(core.WATCHED) | {"codex", "claude", "claude-code"}
+    # Primary routing (model.provider) resolves aliases through these tables; each one is read
+    # where it imports, so an alias added only there is noticed too.
+    primary = {"hermes_cli.providers.ALIASES": hp.ALIASES}
+    for mod, attr in (("hermes_cli.auth", "_PROVIDER_ALIASES"), ("hermes_cli.models_catalog_static", "_PROVIDER_ALIASES")):
+        try:
+            primary[f"{mod}.{attr}"] = getattr(importlib.import_module(mod), attr)
+        except Exception:
+            pass
+    names = set(ac._PROVIDER_ALIASES) | set(core.WATCHED) | {"codex", "claude", "claude-code"}
+    for table in primary.values():
+        names |= set(table)
     names |= {f"custom:{n}" for n in names} | {n.upper() for n in names}
     monkeypatch.setattr(core, "_hermes_normalizer", lambda: None, raising=False)
     tracked = {n: aux(n) for n in names if n != "main" and aux(n) in core.WATCHED}
+    for label, table in primary.items():
+        for alias, target in table.items():
+            if str(target).strip().lower() in core.WATCHED:
+                assert tracked.setdefault(alias, str(target).strip().lower()) == str(target).strip().lower(), label
     assert len(tracked) >= 12, tracked                                   # the probe found the aliases
     canon = getattr(core, "canonical_provider", core._norm_provider)
     assert {n: canon(n) for n in tracked} == tracked
     assert all(canon(n) not in core.WATCHED for n in names - set(tracked) if n != "main")
+
+
+GUARD_PROBE = """
+import importlib.util, json, os, sys
+home = os.environ["HERMES_HOME"]
+spec = importlib.util.spec_from_file_location("qr_core_guard", sys.argv[1])
+c = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(c)
+out = {"errs": c.validate_ladder(json.loads(sys.argv[2])), "canon": c.canonical_provider("Claude-Code"),
+       "loaded": "hermes_cli.config" in sys.modules, "home": sorted(os.listdir(home))}
+try:
+    import hermes_cli.config  # noqa: F401  (now the plugin runs "inside Hermes")
+    import agent.auxiliary_client as ac
+except ImportError:
+    out["hermes"] = False
+else:
+    out["hermes"], calls, real = True, [], ac._normalize_aux_provider
+    ac._normalize_aux_provider = lambda n: calls.append(n) or real(n)
+    out["canon_after"] = c.canonical_provider("Claude-Code")
+    out["calls"], out["home_after"] = calls, sorted(os.listdir(home))
+print("QRGUARD " + json.dumps(out))
+"""
+
+
+def test_the_plugin_never_imports_hermes_itself_but_uses_its_normaliser_once_loaded(tmp_path):
+    """A fresh interpreter (the back-test, a plain script): validating a ladder must not import
+    Hermes' config module, which seeds files in HERMES_HOME. Once Hermes is loaded, its fallback
+    normaliser is the one consulted."""
+    home = tmp_path / "home"
+    home.mkdir()
+    leaky = [*LADDER[:2], dict(LADDER[2], fallback=[{"provider": "claude", "model": "opus-x"}])]
+    r = subprocess.run([sys.executable, "-c", GUARD_PROBE, str(_root / "core.py"), json.dumps(leaky)],
+                       capture_output=True, text=True, timeout=120, env=dict(os.environ, HERMES_HOME=str(home)))
+    line = next((ln for ln in r.stdout.splitlines() if ln.startswith("QRGUARD ")), None)
+    assert line, (r.stdout[-2000:], r.stderr[-2000:])
+    out = json.loads(line.split(" ", 1)[1])
+    assert out["errs"] and out["errs"][0].startswith("throttle.ladder.internal must not contain anthropic"), out
+    assert out["canon"] == "anthropic"
+    assert (out["loaded"], out["home"]) == (False, []), out          # nothing imported, nothing written
+    if out["hermes"]:
+        assert out["home_after"], out                                 # control: the probe sees Hermes' seeding
+        assert (out["canon_after"], out["calls"]) == ("anthropic", ["claude-code"]), out
 
 
 def test_validation_rejects_a_level_policy_can_never_select():

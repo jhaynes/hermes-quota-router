@@ -385,9 +385,49 @@ def _slash(raw_args: str = "") -> str:
     return status_text(fetch="refresh" in (raw_args or ""))
 
 
+# ── startup refresh ────────────────────────────────────────────────────────────
+# On session start, fold a live usage refresh in so /quota has data without waiting for the
+# cron. Runs in a daemon thread (session start must never block on a network fetch) and is
+# skipped entirely when every watched provider has a successful core fetch younger than
+# STARTUP_REFRESH_THROTTLE_S (opening several sessions back-to-back must not hammer /usage).
+STARTUP_REFRESH_THROTTLE_S = 10 * 60
+
+
+def _startup_refresh_due(core, now: float) -> bool:
+    try:
+        providers = core.read_state(core.state_path()).get("providers") or {}
+    except Exception:
+        return True
+    for p in core.WATCHED:
+        fslot = ((providers.get(p) or {}).get("fetch") or {}).get("core") or {}
+        if not fslot.get("last_ok_at") or now - float(fslot["last_ok_at"]) > STARTUP_REFRESH_THROTTLE_S:
+            return True
+    return False
+
+
+def _on_session_start(session_id=None, **_kw):
+    try:
+        core = _core()
+        if not _startup_refresh_due(core, time.time()):
+            return
+        import threading
+
+        def _run():
+            try:
+                for ln in refresh(drain=False):
+                    logger.info("quota-router: %s", ln)
+            except Exception as exc:
+                logger.debug("quota-router: startup refresh failed: %s", exc)
+
+        threading.Thread(target=_run, name="quota-router-startup-refresh", daemon=True).start()
+    except Exception as exc:
+        logger.debug("quota-router: startup refresh hook failed: %s", exc)
+
+
 def register(ctx):
     ctx.register_hook("api_request_error", _on_api_error)
     ctx.register_hook("post_api_request", _on_api_success)
+    ctx.register_hook("on_session_start", _on_session_start)
     ctx.register_cli_command("quota-router", "Quota-aware routing state for anthropic / openai-codex",
                              _cli_setup, _cli_handler)
     ctx.register_command("quota", _slash, "Show provider quota state (/quota refresh to fetch live)",

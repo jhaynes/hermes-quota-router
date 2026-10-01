@@ -485,6 +485,42 @@ def record_error(state: dict, *, provider: str, status_code: Any, reason: Any, m
 # Adapted from rarf/hermes-quota-plugin quota_providers/builtin.py (MIT, © Ronald Reis et al.)
 _SKIP_SCOPE_NAMES = {"opus", "sonnet"}
 
+# Raw payload key -> core window label, for the direct-percent override below.
+_CORE_OVERRIDE_KEYS = (("five_hour", "Current session"), ("seven_day", "Current week"))
+
+
+def parse_core_overrides(payload: Any) -> dict[str, float]:
+    """Direct-percent fix for ``agent.account_usage``'s ``five_hour``/``seven_day`` windows.
+
+    Core's ``_usage_windows(..., fraction=True)`` multiplies ``utilization`` by 100 whenever it
+    is <= 1, assuming a 0..1 fraction. Anthropic's ``/api/oauth/usage`` now returns ``utilization``
+    already in percent (0..100), so a near-empty window (e.g. 1.0 meaning "1% used") gets
+    misread as "1.0 == fully-used fraction" and reported as 100% used. This plugin already makes
+    its own raw GET to that endpoint for scoped model limits (see ``_fetch_anthropic_scoped`` in
+    ``__init__.py``); reuse the same payload to read ``utilization`` as a plain percent, no
+    fraction heuristic, and override core's two corresponding windows before display.
+
+    ``percent`` must be a real, finite, non-bool number; it is clamped to 0..100 rather than
+    rejected out of range (mirrors ``parse_scoped_limits``). A missing/invalid entry is simply
+    absent from the returned dict so the caller falls back to core's own (possibly wrong) value
+    rather than inventing one.
+    """
+    if not isinstance(payload, dict):
+        return {}
+    out: dict[str, float] = {}
+    for key, label in _CORE_OVERRIDE_KEYS:
+        window = payload.get(key)
+        if not isinstance(window, dict):
+            continue
+        pct = window.get("utilization")
+        if isinstance(pct, bool) or not isinstance(pct, (int, float)):
+            continue
+        pct = float(pct)
+        if pct != pct or pct in (float("inf"), float("-inf")):  # NaN / inf
+            continue
+        out[label] = max(0.0, min(100.0, pct))
+    return out
+
 
 def parse_scoped_limits(payload: Any) -> list[dict]:
     """Extract Anthropic model-scoped weekly windows from a raw ``/api/oauth/usage`` payload.

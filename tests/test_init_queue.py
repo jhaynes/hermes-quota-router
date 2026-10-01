@@ -132,14 +132,14 @@ def test_fetch_anthropic_scoped_skips_without_oauth_token(tmp_path, monkeypatch)
     creds._is_oauth_token = lambda t: False
     monkeypatch.setitem(sys.modules, "agent", sys.modules.get("agent") or types.ModuleType("agent"))
     monkeypatch.setitem(sys.modules, "agent.anthropic_credentials", creds)
-    assert plugin_mod._fetch_anthropic_scoped() is None
+    assert plugin_mod._fetch_anthropic_raw() is None
 
 
 def test_fetch_anthropic_scoped_import_failure_reports_kind_import(tmp_path, monkeypatch):
     tmp_home = tmp_path / ".hermes"
     plugin_mod, core_mod = _load_plugin(tmp_home, monkeypatch)
     monkeypatch.setitem(sys.modules, "agent.anthropic_credentials", None)  # forces ImportError
-    ok, kind, msg, windows = plugin_mod._fetch_anthropic_scoped_outcome()
+    ok, kind, msg, windows, overrides = plugin_mod._fetch_anthropic_scoped_outcome()
     assert ok is False and kind == "import"
 
 
@@ -156,9 +156,10 @@ def test_refresh_wires_scoped_windows_into_anthropic_snapshot(tmp_path, monkeypa
     monkeypatch.setitem(sys.modules, "agent", types.ModuleType("agent"))
     monkeypatch.setitem(sys.modules, "agent.account_usage", fake_usage)
 
-    monkeypatch.setattr(plugin_mod, "_fetch_anthropic_scoped",
-                        lambda: [{"label": "Fable week (model)", "used_percent": 42.0,
-                                 "resets_at": now + 3600, "scope": "Fable"}])
+    monkeypatch.setattr(plugin_mod, "_fetch_anthropic_raw",
+                        lambda: {"limits": [{"kind": "weekly_scoped", "percent": 42.0,
+                                            "resets_at": now + 3600,
+                                            "scope": {"model": {"display_name": "Fable"}}}]})
     plugin_mod.refresh(now=now)
     state_file = tmp_home / "cache" / "quota-router" / "state.json"
     st = core_mod.read_state(state_file)
@@ -181,7 +182,7 @@ def test_refresh_scoped_exception_sets_scoped_error_but_keeps_core_windows(tmp_p
 
     def boom():
         raise RuntimeError("scoped boom")
-    monkeypatch.setattr(plugin_mod, "_fetch_anthropic_scoped", boom)
+    monkeypatch.setattr(plugin_mod, "_fetch_anthropic_raw", boom)
     plugin_mod.refresh(now=now)
     state_file = tmp_home / "cache" / "quota-router" / "state.json"
     st = core_mod.read_state(state_file)
@@ -205,8 +206,9 @@ def test_scoped_fetch_throttled_within_300s(tmp_path, monkeypatch):
     calls = {"n": 0}
     def fake_scoped():
         calls["n"] += 1
-        return [{"label": "Fable week (model)", "used_percent": 5.0, "resets_at": None, "scope": "Fable"}]
-    monkeypatch.setattr(plugin_mod, "_fetch_anthropic_scoped", fake_scoped)
+        return {"limits": [{"kind": "weekly_scoped", "percent": 5.0, "resets_at": None,
+                            "scope": {"model": {"display_name": "Fable"}}}]}
+    monkeypatch.setattr(plugin_mod, "_fetch_anthropic_raw", fake_scoped)
 
     plugin_mod.refresh(now=now)
     plugin_mod.refresh(now=now + 10)  # within 300s: should not call scoped fetch again

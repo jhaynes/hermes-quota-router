@@ -335,6 +335,28 @@ def test_parse_scoped_limits_keeps_only_new_scoped_windows():
     assert core.parse_scoped_limits({}) == [] and core.parse_scoped_limits(None) == []
 
 
+def test_parse_core_overrides_reads_utilization_as_direct_percent():
+    """Anthropic's ``/api/oauth/usage`` now returns ``utilization`` already in percent (0..100),
+    not a 0..1 fraction. ``parse_core_overrides`` must read it directly, with no ``*100``
+    heuristic -- a near-empty window (1.0 meaning "1% used") must come back as 1.0, not 100.0."""
+    payload = {
+        "five_hour": {"utilization": 4.0, "resets_at": "2026-10-01T20:00:00+00:00"},
+        "seven_day": {"utilization": 1.0, "resets_at": "2026-10-08T10:00:00+00:00"},
+    }
+    overrides = core.parse_core_overrides(payload)
+    assert overrides == {"Current session": 4.0, "Current week": 1.0}
+
+
+def test_parse_core_overrides_clamps_and_skips_invalid():
+    assert core.parse_core_overrides({"five_hour": {"utilization": 150}}) == {"Current session": 100.0}
+    assert core.parse_core_overrides({"five_hour": {"utilization": -5}}) == {"Current session": 0.0}
+    assert core.parse_core_overrides({"five_hour": {"utilization": True}}) == {}
+    assert core.parse_core_overrides({"five_hour": {"utilization": "x"}}) == {}
+    assert core.parse_core_overrides({"five_hour": {"utilization": float("nan")}}) == {}
+    assert core.parse_core_overrides({}) == {} and core.parse_core_overrides(None) == {}
+    assert core.parse_core_overrides({"seven_day_opus": {"utilization": 50}}) == {}  # not an override key
+
+
 def test_scoped_windows_alert_but_do_not_move_tier_or_block():
     st = core.empty_state()
     s = snap(("Current week", 10.0, NOW + 3 * 24 * H))

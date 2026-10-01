@@ -150,36 +150,40 @@ def _anthropic_headers(token: str) -> dict:
     }
 
 
-def _fetch_anthropic_scoped():
-    """Fetch and parse Anthropic model-scoped weekly limits, or ``None`` to skip (no token /
-    non-OAuth). Raises on a real fetch failure — callers record ``scoped_error`` and continue.
-    Never logs the token or the raw payload.
+def _fetch_anthropic_raw():
+    """Raw GET to Anthropic's ``/api/oauth/usage``, or ``None`` to skip (no token / non-OAuth).
+    Raises on a real fetch failure — callers record ``scoped_error`` and continue. Never logs the
+    token or the raw payload. Shared by scoped model limits AND the core-window percent-fix
+    override below: one fetch, two derived views.
     """
     import urllib.request
     from agent.anthropic_credentials import resolve_anthropic_token, _is_oauth_token
     token = resolve_anthropic_token()
     if not token or not _is_oauth_token(token):
         return None
-    core = _core()
     req = urllib.request.Request("https://api.anthropic.com/api/oauth/usage",
                                  headers=_anthropic_headers(token), method="GET")
     with urllib.request.urlopen(req, timeout=15) as resp:
-        payload = json.loads(resp.read().decode("utf-8"))
-    return core.parse_scoped_limits(payload)
+        return json.loads(resp.read().decode("utf-8"))
 
 
 def _fetch_anthropic_scoped_outcome():
-    """(ok, kind, message, windows|None). Wraps the credential import so an import failure maps
-    to a display-only ``scoped_error: {kind: 'import'}`` instead of crashing refresh()."""
+    """(ok, kind, message, windows|None, overrides|None). Wraps the credential import so an
+    import failure maps to a display-only ``scoped_error: {kind: 'import'}`` instead of
+    crashing refresh(). ``overrides`` is core.py's ``parse_core_overrides`` fix for the
+    ``Current session``/``Current week`` percent-unit bug (see core.py for why); ``None`` means
+    skipped, same as ``windows``.
+    """
+    core = _core()
     try:
-        windows = _fetch_anthropic_scoped()
+        payload = _fetch_anthropic_raw()
     except ImportError as exc:
-        return False, "import", f"{type(exc).__name__}: {exc}", None
+        return False, "import", f"{type(exc).__name__}: {exc}", None, None
     except Exception as exc:
-        return False, "scoped_error", f"{type(exc).__name__}: {str(exc)[:200]}", None
-    if windows is None:
-        return True, None, "", None  # skipped: no token / not OAuth, not an error
-    return True, None, "", windows
+        return False, "scoped_error", f"{type(exc).__name__}: {str(exc)[:200]}", None, None
+    if payload is None:
+        return True, None, "", None, None  # skipped: no token / not OAuth, not an error
+    return True, None, "", core.parse_scoped_limits(payload), core.parse_core_overrides(payload)
 
 
 def _snap_dict(core, snap, now):
@@ -227,16 +231,19 @@ def refresh(now: float | None = None, snapshots: dict | None = None, drain: bool
     core_anthropic_ok = outcomes.get("anthropic", (False, None, ""))[0] and "anthropic" in snapshots
     scoped_windows = None
     scoped_outcome = None
+    core_overrides = None
     if core_anthropic_ok:
         prior = core.read_state(core.state_path())
         pstate = prior["providers"].get("anthropic") or {}
         last_scoped_fetch = ((pstate.get("fetch") or {}).get("scoped") or {}).get("scoped_fetched_at")
         throttled = last_scoped_fetch is not None and now - last_scoped_fetch < SCOPED_THROTTLE_S
         if not throttled:
-            ok, kind, message, windows = _fetch_anthropic_scoped_outcome()
+            ok, kind, message, windows, overrides = _fetch_anthropic_scoped_outcome()
             scoped_outcome = (ok, kind, message)
             if ok and windows is not None:
                 scoped_windows = windows
+            if ok and overrides is not None:
+                core_overrides = overrides
 
     # Cache stats: read-only state.db aggregate, collected before taking the state lock.
     cache_outcome = core.collect_cache_outcome(core.state_db_path(), now, cfg)
@@ -256,6 +263,9 @@ def refresh(now: float | None = None, snapshots: dict | None = None, drain: bool
                 if scoped_windows is not None:
                     scoped_slot["scoped_windows"] = scoped_windows
                     scoped_slot["scoped_windows_fetched_at"] = now
+                if core_overrides is not None:
+                    scoped_slot["core_overrides"] = core_overrides
+                    scoped_slot["core_overrides_fetched_at"] = now
             # Merge fresh-or-carried scoped windows into the anthropic snapshot, dropping any
             # that are older than stale_after_s.
             carried = scoped_slot.get("scoped_windows") or []
@@ -292,6 +302,52 @@ def refresh(now: float | None = None, snapshots: dict | None = None, drain: bool
                         "fetched_at": now, "unavailable_reason": None, "plan": None,
                         "details": [], "windows": extra,
                     }
+            # Apply fresh-or-carried core-window percent overrides (see core.parse_core_overrides):
+            # core's own fraction-vs-percent heuristic misreads Anthropic's current ``five_hour``/
+            # ``seven_day`` payload, so rewrite ``used_percent`` on the matching labels using this
+            # plugin's own raw fetch of the same endpoint. Carry-forward follows the same
+            # stale_after_s rule as scoped windows above.
+            override_age = now - float(scoped_slot.get("core_overrides_fetched_at") or 0)
+            overrides_to_apply = scoped_slot.get("core_overrides") or {}
+            if overrides_to_apply and override_age <= cfg["stale_after_s"]:
+                snap = snapshots.get("anthropic")
+
+                def _wget2(w, k, d=None):
+                    return w.get(k, d) if isinstance(w, dict) else getattr(w, k, d)
+
+                def _woverride(w, pct):
+                    """New window with ``used_percent`` replaced; windows may be plain dicts or
+                    the frozen ``AccountUsageWindow`` dataclass, which rejects ``setattr``."""
+                    if isinstance(w, dict):
+                        return {**w, "used_percent": pct}
+                    import dataclasses
+                    if dataclasses.is_dataclass(w) and not isinstance(w, type):
+                        return dataclasses.replace(w, used_percent=pct)
+                    import copy
+                    w2 = copy.copy(w)
+                    setattr(w2, "used_percent", pct)
+                    return w2
+
+                if snap is not None:
+                    windows_list = list(snap.get("windows") if isinstance(snap, dict) else snap.windows) or []
+                    windows_list = [
+                        _woverride(w, overrides_to_apply[_wget2(w, "label")])
+                        if _wget2(w, "label") in overrides_to_apply else w
+                        for w in windows_list
+                    ]
+                    if isinstance(snap, dict):
+                        snap = dict(snap)
+                        snap["windows"] = windows_list
+                        snapshots["anthropic"] = snap
+                    else:
+                        import dataclasses
+                        if dataclasses.is_dataclass(snap) and not isinstance(snap, type):
+                            snapshots["anthropic"] = dataclasses.replace(snap, windows=windows_list)
+                        else:
+                            import copy
+                            snap2 = copy.copy(snap)
+                            snap2.windows = windows_list
+                            snapshots["anthropic"] = snap2
         core.apply_refresh(st, snapshots, now, cfg)
         core.apply_cache(st, cache_outcome, now, cfg)
         return core.drain_pending(st) if drain else []

@@ -403,8 +403,10 @@ def _slash(raw_args: str = "") -> str:
 # - STARTUP_REFRESH_THROTTLE_S: a provider is fetched only if it has no successful core
 #   fetch younger than this — so a permanently broken credential (revoked, not configured)
 #   never forces repeated fetches of the HEALTHY provider; each provider is judged alone.
-# - _STARTUP_LOCK: concurrent session starts (subagent fan-out) share one refresh; the
-#   thread that wins the non-blocking lock fetches, the others skip entirely.
+# - _STARTUP_LOCK: concurrent session starts (in-process fan-out) share one refresh;
+#   the thread that wins the non-blocking lock fetches, the others skip entirely.
+#   Note the lock is per-process; cross-process starts are bounded by the throttle
+#   and by core.fetch_due backoff instead.
 # The plugin's per-provider fetch backoff (core.fetch_due) still applies inside refresh().
 STARTUP_REFRESH_THROTTLE_S = 10 * 60
 _STARTUP_LOCK = threading.Lock()

@@ -383,9 +383,9 @@ def test_refresh_only_filter_skips_fresh_providers(tmp_path, monkeypatch):
     monkeypatch.setitem(sys.modules, "agent.account_usage", fake_au)
     # The scoped anthropic fetch resolves the operator's real OAuth token and GETs
     # api.anthropic.com — stub it so this test is fully offline.
-    monkeypatch.setattr(plugin_mod, "_fetch_anthropic_scoped", lambda: None)
+    monkeypatch.setattr(plugin_mod, "_fetch_anthropic_raw", lambda: None)
     monkeypatch.setattr(plugin_mod, "_fetch_anthropic_scoped_outcome",
-                        lambda: (True, None, "", None))
+                        lambda: (True, None, "", None, None))
 
     now = time.time()
     plugin_mod.refresh(drain=False, only={"openai-codex"})

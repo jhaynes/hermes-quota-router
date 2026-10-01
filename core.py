@@ -496,7 +496,7 @@ def parse_core_overrides(payload: Any) -> dict[str, float]:
     is <= 1, assuming a 0..1 fraction. Anthropic's ``/api/oauth/usage`` now returns ``utilization``
     already in percent (0..100), so a near-empty window (e.g. 1.0 meaning "1% used") gets
     misread as "1.0 == fully-used fraction" and reported as 100% used. This plugin already makes
-    its own raw GET to that endpoint for scoped model limits (see ``_fetch_anthropic_scoped`` in
+    its own raw GET to that endpoint for scoped model limits (see ``_fetch_anthropic_raw`` in
     ``__init__.py``); reuse the same payload to read ``utilization`` as a plain percent, no
     fraction heuristic, and override core's two corresponding windows before display.
 

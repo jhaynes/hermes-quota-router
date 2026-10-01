@@ -140,6 +140,16 @@ hermes cron create "every 15m" --name "Quota router: usage refresh + alerts" --s
 
 The refresh may run every 5 minutes (`hermes cron edit <id> --schedule "every 5m"`). Run shadow mode at 15 minutes first, then 5 minutes. A built-in backoff keeps a failing endpoint from being hammered: after 3 non-ok core fetches for a provider within an hour (from the `fetch_log` ring) with no success since, that provider is fetched at most every 15 minutes, with one `quota-router: <provider> usage fetch backing off to 15m (...)` alert per incident. The next success clears it.
 
+### Startup refresh
+
+In addition to the cron, the plugin registers an `on_session_start` hook: when a session starts on this host, providers that have no successful core usage fetch younger than 10 minutes are refreshed immediately, so `/quota` has live data on a host without the cron (or between cron runs). Design points:
+
+- **Per-provider throttle.** Due-ness is judged per provider, not globally: a permanently broken credential (revoked, not configured) never forces repeated fetches of the healthy provider — the broken one is attempted alone, and only its own backoff applies.
+- **Single flight.** Concurrent session starts (subagent fan-out) share one refresh: the first wins a non-blocking lock and fetches, the rest skip without spawning. The worker re-reads due-ness under the lock, so a refresh completed by the cron in between is not duplicated.
+- **Never blocks session start.** The refresh runs on a daemon thread and every failure path is swallowed (`logger.debug`); the hook cannot raise into the session-start caller.
+- **Cron owns the alert queue.** The startup refresh runs with `drain=False` (only the cron drains, see "Alert queue").
+- A provider inside its failure backoff window (see the backoff paragraph above) is skipped and simply waits for the cron or a later session start — expected and quiet.
+
 ## Evaluation (read-only)
 
 - `python eval/outcomes.py --state-db <profile>/state.db --kanban-db <board>/kanban.db [...] [--days 7] [--json]` groups a profile's top-level kanban worker sessions by `provider/model`: sessions, cards, card outcomes (task status), review rejects (`changes_requested` events) and turns. Both databases are opened read-only. Model is confounded with task, so it's a first signal, not a benchmark.

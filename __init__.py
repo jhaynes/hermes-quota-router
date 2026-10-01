@@ -24,6 +24,7 @@ import importlib.util
 import json
 import logging
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -181,7 +182,7 @@ def _snap_dict(core, snap, now):
 
 
 def refresh(now: float | None = None, snapshots: dict | None = None, drain: bool = False,
-            outcomes: dict | None = None) -> list[str]:
+            outcomes: dict | None = None, only: set | None = None) -> list[str]:
     core = _core()
     now = time.time() if now is None else now
     if snapshots is None:
@@ -192,6 +193,8 @@ def refresh(now: float | None = None, snapshots: dict | None = None, drain: bool
         with core.locked_state(core.state_path()) as st0:  # backoff decision + its one alert
             due = {p: core.fetch_due(st0, p, now, cfg0) for p in core.WATCHED}
         for p in core.WATCHED:
+            if only is not None and p not in only:
+                continue
             if not due[p]:
                 continue
             try:
@@ -387,41 +390,70 @@ def _slash(raw_args: str = "") -> str:
 
 # ── startup refresh ────────────────────────────────────────────────────────────
 # On session start, fold a live usage refresh in so /quota has data without waiting for the
-# cron. Runs in a daemon thread (session start must never block on a network fetch) and is
-# skipped entirely when every watched provider has a successful core fetch younger than
-# STARTUP_REFRESH_THROTTLE_S (opening several sessions back-to-back must not hammer /usage).
+# cron. Runs in a daemon thread (session start must never block on a network fetch). Two
+# guards keep the usage endpoints unhammered:
+# - STARTUP_REFRESH_THROTTLE_S: a provider is fetched only if it has no successful core
+#   fetch younger than this — so a permanently broken credential (revoked, not configured)
+#   never forces repeated fetches of the HEALTHY provider; each provider is judged alone.
+# - _STARTUP_LOCK: concurrent session starts (subagent fan-out) share one refresh; the
+#   thread that wins the non-blocking lock fetches, the others skip entirely.
+# The plugin's per-provider fetch backoff (core.fetch_due) still applies inside refresh().
 STARTUP_REFRESH_THROTTLE_S = 10 * 60
+_STARTUP_LOCK = threading.Lock()
 
 
-def _startup_refresh_due(core, now: float) -> bool:
+def _startup_refresh_due(core, now: float) -> set:
+    """Providers a startup refresh should fetch now (possibly empty). A provider is due
+    when it has no successful core fetch younger than STARTUP_REFRESH_THROTTLE_S. Any
+    state-read problem counts everything as due — fail open toward fetching."""
     try:
         providers = core.read_state(core.state_path()).get("providers") or {}
+        due = set()
+        for p in core.WATCHED:
+            fslot = ((providers.get(p) if isinstance(providers, dict) else None) or {}).get("fetch") or {}
+            last_ok = fslot.get("core", {}).get("last_ok_at") if isinstance(fslot, dict) else None
+            try:
+                fresh = last_ok is not None and now - float(last_ok) <= STARTUP_REFRESH_THROTTLE_S
+            except (TypeError, ValueError):
+                fresh = False
+            if not fresh:
+                due.add(p)
+        return due
     except Exception:
-        return True
-    for p in core.WATCHED:
-        fslot = ((providers.get(p) or {}).get("fetch") or {}).get("core") or {}
-        if not fslot.get("last_ok_at") or now - float(fslot["last_ok_at"]) > STARTUP_REFRESH_THROTTLE_S:
-            return True
-    return False
+        return set(core.WATCHED)
 
 
 def _on_session_start(session_id=None, **_kw):
     try:
         core = _core()
-        if not _startup_refresh_due(core, time.time()):
+        due = _startup_refresh_due(core, time.time())
+        if not due:
             return
-        import threading
-
-        def _run():
-            try:
-                for ln in refresh(drain=False):
-                    logger.info("quota-router: %s", ln)
-            except Exception as exc:
-                logger.debug("quota-router: startup refresh failed: %s", exc)
-
-        threading.Thread(target=_run, name="quota-router-startup-refresh", daemon=True).start()
+        if not _STARTUP_LOCK.acquire(blocking=False):
+            return  # a startup refresh is already in flight; it covers us
+        try:
+            threading.Thread(target=_startup_refresh_worker, name="quota-router-startup-refresh",
+                             daemon=True).start()
+        except Exception as exc:
+            _STARTUP_LOCK.release()
+            logger.debug("quota-router: startup refresh thread failed to start: %s", exc)
     except Exception as exc:
         logger.debug("quota-router: startup refresh hook failed: %s", exc)
+
+
+def _startup_refresh_worker():
+    try:
+        core = _core()
+        due = _startup_refresh_due(core, time.time())  # re-check: state may have moved on
+        if not due:
+            return
+        # A provider inside its failure backoff window (core.fetch_due False) is skipped by
+        # refresh() and simply waits for the cron / a later session start — expected and quiet.
+        refresh(drain=False, only=due)  # alerts stay queued for the cron per README
+    except Exception as exc:
+        logger.debug("quota-router: startup refresh failed: %s", exc)
+    finally:
+        _STARTUP_LOCK.release()
 
 
 def register(ctx):

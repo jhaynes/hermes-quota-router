@@ -1,9 +1,10 @@
 """Tests for the on_session_start startup refresh.
 
-Written against the review findings (r1/r2/r3): per-provider throttle,
+Written against the review findings (r1..r4): per-provider throttle,
 single-flight dedupe, drain=False preservation, and fail-open behavior. An
-autouse tripwire keeps every test in this file offline; the tests never touch
-the real ~/.hermes/cache/quota-router/state.json — they use the
+autouse tripwire records any real outbound TCP connect and fails the test at
+teardown (credential/DNS resolution are NOT intercepted); the tests never
+touch the real ~/.hermes/cache/quota-router/state.json — they use the
 tmp-HERMES_HOME harness pattern from test_init_queue.py.
 """
 import importlib.util
@@ -131,26 +132,35 @@ def _join_startup_threads(module, timeout=5.0):
 
 @pytest.fixture(autouse=True)
 def _offline_tripwire(monkeypatch):
-    """Fail any test in this file that tries a real outbound network connection.
+    """Record any outbound TCP connect attempt made by a test in this file and
+    fail the test at teardown.
 
     A future hook test that forgets to fake refresh() would otherwise silently
-    resolve the operator's real credentials and hit the live usage endpoints
-    (the r3 high). socket.socket.connect is the common chokepoint for httpx/
-    urllib; tests that legitimately need a socket may opt out by inserting a
+    hit the live usage endpoints (the r3 high). socket.socket.connect is the
+    common chokepoint for httpx/urllib. Product code swallows exceptions on
+    background threads, so the hit is RECORDED here and asserted at teardown —
+    not raised at the connect site. Note limits: DNS resolution (getaddrinfo)
+    and credential resolution are not intercepted; only the TCP connect is
+    blocked. Tests that legitimately need a socket may opt out by inserting a
     marker: monkeypatch.setitem(sys.modules, '_qr_allow_sockets', True).
     """
     real_socket = socket.socket
+    hits = []
 
     class _NoNetSocket(real_socket):
         def connect(self, address):
             if sys.modules.get("_qr_allow_sockets"):
                 return super().connect(address)
+            hits.append(address)
             raise AssertionError(
                 "test tried a real network connection — fake refresh()/fetchers "
                 "instead (see tests/test_startup_refresh.py docstring)")
 
     monkeypatch.setattr(socket, "socket", _NoNetSocket)
     yield
+    if hits:
+        pytest.fail(f"test attempted {len(hits)} real outbound network connection(s) "
+                    f"(first: {hits[0]!r}) — fake refresh()/fetchers instead")
 
 
 @pytest.fixture(autouse=True)

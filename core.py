@@ -1000,8 +1000,10 @@ def _norm_provider(p: Any) -> str:
 
 
 # Hermes' fallback routing (resolve_provider_client → agent.auxiliary_client._normalize_aux_provider)
-# drops a "custom:" prefix and maps these aliases onto the tracked providers.
-TRACKED_ALIASES = {"claude": "anthropic", "claude-code": "anthropic", "codex": "openai-codex"}
+# drops a "custom:" prefix and maps these aliases onto the tracked providers. The chatgpt spellings
+# route to openai-codex there too; without them the check would fail open standalone.
+TRACKED_ALIASES = {"claude": "anthropic", "claude-code": "anthropic",
+                   "codex": "openai-codex", "chatgpt": "openai-codex", "chatgpt-codex": "openai-codex"}
 
 
 def _hermes_normalizer():
@@ -1126,6 +1128,14 @@ def validate_ladder(ladder: Any, cfg: Optional[dict] = None) -> list[str]:
             errs.append(f"throttle.ladder.{r['name']} can never be selected: its gate includes every gate "
                         f"provider of {earlier['name']}, which comes first")
     gated_by = {p: [r["name"] for r in rungs if p in r["gate"]] for p in gate_providers(rungs)}
+    kanbanned = [r["name"] for r in rungs if isinstance(r["spec"].get("max_in_progress"), int)
+                 and not isinstance(r["spec"].get("max_in_progress"), bool)]
+    if kanbanned and len(kanbanned) != len(rungs):
+        # `max_in_progress` applies to all levels or none: a partial set silently makes
+        # kanban_managed() False, and kanban stops being managed with nothing on screen.
+        missing = ", ".join(r["name"] for r in rungs if r["name"] not in kanbanned)
+        errs.append(f"throttle.ladder: max_in_progress must be set on every level or on none; "
+                    f"{missing} {'has' if len(missing.split(', ')) == 1 else 'have'} none")
     for r in rungs:
         chain = level_chain(r["spec"])
         primary = canonical_provider(chain[0][0])
@@ -1143,6 +1153,33 @@ def validate_ladder(ladder: Any, cfg: Optional[dict] = None) -> list[str]:
                 errs.append(f"throttle.ladder.{levels[0]} gates on {p}, which has no forecast_windows, "
                             "so its usage can never constrain it")
     return errs
+
+
+def legacy_alias_warnings(t: dict) -> list[str]:
+    """``levels:`` configs, the names-as-written gap: like 0.3.0, ``validate_levels`` compares
+    provider names as written, so an alias in a chain or in ``protected_provider`` is accepted but
+    never matches the forecast windows (keyed by the canonical name) and never throttles. A warning
+    keeps every decision and log record byte-identical; rejecting would change 0.3.0 behaviour."""
+    errs = validate_levels(t.get("levels"), t["protected_provider"])
+    if errs or t.get("ladder") is not None or not isinstance(t.get("levels"), dict):
+        return []
+    warns = []
+    protected = _norm_provider(t.get("protected_provider"))
+    if protected and canonical_provider(protected) in WATCHED and protected not in WATCHED:
+        warns.append(f"throttle.protected_provider {t['protected_provider']!r} is the alias of "
+                     f"{canonical_provider(protected)}; the forecast windows are keyed "
+                     f"{canonical_provider(protected)}, so it never throttles")
+    for name in THROTTLE_LEVELS:
+        spec = t["levels"].get(name)
+        if not isinstance(spec, dict):
+            continue
+        for raw, _m in level_chain(spec):
+            p = _norm_provider(raw)
+            if p and canonical_provider(p) in WATCHED and p not in WATCHED:
+                warns.append(f"throttle.levels.{name} contains {raw.strip()!r}, the alias of "
+                             f"{canonical_provider(p)}; the legacy check compares names as written, "
+                             f"so write {canonical_provider(p)} or use ladder:")
+    return list(dict.fromkeys(warns))
 
 
 def validate_throttle(t: dict, cfg: Optional[dict] = None) -> list[str]:

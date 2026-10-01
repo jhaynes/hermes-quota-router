@@ -458,14 +458,24 @@ def test_the_built_in_aliases_cover_everything_hermes_routes_to_a_tracked_provid
     import agent.auxiliary_client as ac
     import hermes_cli.providers as hp
     # Primary routing (model.provider) resolves aliases through these tables; each one is read
-    # where it imports, so an alias added only there is noticed too.
+    # where it imports, so an alias added only there is noticed too. Hermes' fallback table moved
+    # into _provider_alias_table() (a merge of the auth table with the local servers); read it
+    # when it exists, fall back to the old module attribute, and fail on the gap otherwise.
     primary = {"hermes_cli.providers.ALIASES": hp.ALIASES}
     for mod, attr in (("hermes_cli.auth", "_PROVIDER_ALIASES"), ("hermes_cli.models_catalog_static", "_PROVIDER_ALIASES")):
         try:
             primary[f"{mod}.{attr}"] = getattr(importlib.import_module(mod), attr)
         except Exception:
             pass
-    names = set(ac._PROVIDER_ALIASES) | set(core.WATCHED) | {"codex", "claude", "claude-code"}
+    if hasattr(ac, "_provider_alias_table"):
+        primary["agent.auxiliary_client._provider_alias_table()"] = ac._provider_alias_table()
+    elif hasattr(ac, "_PROVIDER_ALIASES"):
+        primary["agent.auxiliary_client._PROVIDER_ALIASES"] = ac._PROVIDER_ALIASES
+    else:
+        pytest.fail("Hermes exposes no fallback alias table this test can read (neither "
+                    "_provider_alias_table() nor _PROVIDER_ALIASES); the built-in map is unchecked")
+    names = set().union(*(set(t) for t in primary.values())) \
+        | set(core.WATCHED) | {"codex", "claude", "claude-code"}
     for table in primary.values():
         names |= set(table)
     names |= {f"custom:{n}" for n in names} | {n.upper() for n in names}
@@ -544,7 +554,49 @@ def test_a_valid_ladder_passes_validation_including_a_level_containing_its_own_g
         assert msg is None or not msg.startswith("throttle."), msg     # it got past validation
 
 
+def test_a_partial_max_in_progress_is_a_validation_error():
+    """`max_in_progress` applies to all levels or none: a ladder that sets it on two of three makes
+    kanban_managed() False and kanban quietly stops being managed, with nothing on screen."""
+    ok = _refusal(LADDER)
+    assert ok is None or not ok.startswith("throttle."), ok
+    partial = [dict(LADDER[0], max_in_progress=64), dict(LADDER[1], max_in_progress=24), LADDER[2]]
+    msg = _refusal(partial)
+    assert msg and msg.startswith("throttle.ladder: max_in_progress must be set on every level or "
+                                  "on none"), msg
+    one = [dict(LADDER[0], max_in_progress=64), LADDER[1], LADDER[2]]
+    msg = _refusal(one)
+    assert msg and msg.startswith("throttle.ladder: max_in_progress must be set on every level or "
+                                  "on none"), msg
+    every = [dict(r, max_in_progress=64) for r in LADDER]
+    assert _refusal(every) is None or not _refusal(every).startswith("throttle.")
+
+
+def test_a_chatgpt_fallback_is_rejected_standalone():
+    """Hermes routes chatgpt / chatgpt-codex to openai-codex; the built-in map must say so too, so
+    the chain rule fails closed without Hermes loaded (the backtest, a plain script). Review r1
+    checked exactly this: a floor whose fallback is ``{provider: chatgpt}`` was accepted
+    standalone because the built-in map lacked the spellings."""
+    for spelling in ("chatgpt", "chatgpt-codex", "ChatGPT"):
+        leaky = [*LADDER[:2], dict(LADDER[2], fallback=[{"provider": spelling, "model": "codex-x"}])]
+        msg = _refusal(leaky)
+        assert msg and msg.startswith("throttle.ladder.internal must not contain openai-codex"), (spelling, msg)
+        spill = [LADDER[0], dict(LADDER[1], fallback=[{"provider": spelling, "model": "codex-x"}]), LADDER[2]]
+        msg = _refusal(spill)
+        assert msg and msg.startswith("throttle.ladder.claude must not contain openai-codex"), (spelling, msg)
+
+
+def test_a_chatgpt_fallback_passes_when_no_level_is_gated_by_codex():
+    # openai-codex gates nothing here, so routing the floor onto it cannot hit a capped account
+    fine = [dict(LADDER[1], fallback=[{"provider": "chatgpt", "model": "codex-x"}]), LADDER[2]]
+    msg = _refusal(fine)
+    assert msg is None or not msg.startswith("throttle."), msg
+
+
 # ── legacy equivalence: the 0.3.0 throttle_step as the oracle ──────────────────
+# Review r1 Q4: this vendored copy of 0.3.0 exists to prove the legacy ``levels:`` config decides
+# exactly as 0.3.0 did. It goes away when ``levels:`` is deprecated (README documents the ladder as
+# the only form): at that point there is no legacy behaviour left to be equivalent to, and a second
+# copy of the throttle nobody keeps in sync is worse than none.
 
 def legacy_step(state: dict, now: float, cfg: dict, t: dict) -> dict:
     """``core.throttle_step`` as of 0.3.0 (be638de), verbatim apart from ``core.`` prefixes and the
@@ -1227,11 +1279,32 @@ def test_legacy_levels_are_refused_with_the_old_message(env):
         "quota-router: throttle config invalid, not applying: set throttle.ladder or throttle.levels, not both"]
 
 
+def test_a_legacy_levels_alias_warns_but_decides_as_030(env):
+    """Review r1 Q2: warn, don't reject. A legacy config whose `protected_provider` is an alias is
+    accepted and decides exactly as 0.3.0 (byte-identical records), with one warning line that
+    names the canonical provider the forecast windows are keyed by."""
+    efeed(env, NOW, codex=(10, 90))
+    t = env.core.throttle_config({"levels": LEVELS, "protected_provider": "claude",
+                                  "profiles": ["worker"], "enabled": True})
+    lines = eapply(env, t)
+    assert [ln for ln in lines if "warning" in ln] == [
+        "quota-router: throttle warning: throttle.protected_provider 'claude' is the alias of "
+        "anthropic; the forecast windows are keyed anthropic, so it never throttles"], lines
+    assert all("warning" not in ln for ln in eapply(env, t, now=NOW + 60))   # once per config text
+    t2 = env.core.throttle_config({"levels": LEVELS, "profiles": ["worker"], "enabled": True})
+    assert all("warning" not in ln for ln in eapply(env, t2, now=NOW + 120))
+
+
 def test_kanban_key_is_managed_when_every_level_sets_it(env):
     efeed(env, NOW, codex=(10, 90))
+    # review r1: max_in_progress applies to all levels or none — a partial set is a validation
+    # error now, not a silent drop of the kanban key.
     some = [dict(LADDER[0], max_in_progress=64), LADDER[1], LADDER[2]]
-    eapply(env, etcfg(env, ladder=some))
-    assert [c[0] for c in env.calls] == ["worker"]
+    lines = eapply(env, etcfg(env, ladder=some))
+    assert env.calls == []
+    assert [ln for ln in lines if "config invalid" in ln] == [
+        "quota-router: throttle config invalid, not applying: throttle.ladder: max_in_progress must be "
+        "set on every level or on none; claude, internal have none"]
     env.calls.clear()
     every = [dict(LADDER[0], max_in_progress=64), dict(LADDER[1], max_in_progress=40),
              dict(LADDER[2], max_in_progress=24)]

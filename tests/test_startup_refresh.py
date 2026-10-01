@@ -1,13 +1,15 @@
 """Tests for the on_session_start startup refresh.
 
-Written against the review findings (r1): per-provider throttle, single-flight
-dedupe, drain=False preservation, and fail-open behavior. Never touches the real
-~/.hermes/cache/quota-router/state.json — uses the tmp-HERMES_HOME harness
-pattern from test_init_queue.py.
+Written against the review findings (r1/r2/r3): per-provider throttle,
+single-flight dedupe, drain=False preservation, and fail-open behavior. An
+autouse tripwire keeps every test in this file offline; the tests never touch
+the real ~/.hermes/cache/quota-router/state.json — they use the
+tmp-HERMES_HOME harness pattern from test_init_queue.py.
 """
 import importlib.util
 import json
 import re
+import socket
 import sys
 import threading
 import time
@@ -128,13 +130,37 @@ def _join_startup_threads(module, timeout=5.0):
 
 
 @pytest.fixture(autouse=True)
+def _offline_tripwire(monkeypatch):
+    """Fail any test in this file that tries a real outbound network connection.
+
+    A future hook test that forgets to fake refresh() would otherwise silently
+    resolve the operator's real credentials and hit the live usage endpoints
+    (the r3 high). socket.socket.connect is the common chokepoint for httpx/
+    urllib; tests that legitimately need a socket may opt out by inserting a
+    marker: monkeypatch.setitem(sys.modules, '_qr_allow_sockets', True).
+    """
+    real_socket = socket.socket
+
+    class _NoNetSocket(real_socket):
+        def connect(self, address):
+            if sys.modules.get("_qr_allow_sockets"):
+                return super().connect(address)
+            raise AssertionError(
+                "test tried a real network connection — fake refresh()/fetchers "
+                "instead (see tests/test_startup_refresh.py docstring)")
+
+    monkeypatch.setattr(socket, "socket", _NoNetSocket)
+    yield
+
+
+@pytest.fixture(autouse=True)
 def _no_stray_startup_threads(monkeypatch):
     """Fail if any quota-router-startup-refresh worker is alive at test end.
 
-    Requests monkeypatch so this fixture is set up BEFORE it and torn down AFTER
-    it — a leaked worker is caught while the fakes are still active, not after
-    sys.modules has been restored to the real (host-bound) modules. A leak is
-    failed even if it finishes within the grace window.
+    Requesting monkeypatch makes this fixture set up AFTER monkeypatch and tear
+    down BEFORE it — a leaked worker is caught while the fakes are still active,
+    not after sys.modules has been restored to the real (host-bound) modules. A
+    leak is failed even if it exits during the grace window.
     """
     before = {t for t in threading.enumerate() if t.name == "quota-router-startup-refresh"}
     saw_leak = []
@@ -186,6 +212,7 @@ def test_hook_fetches_only_due_providers_and_never_drains(tmp_path, monkeypatch)
     # drain=False is a frozen contract: the cron owns the alert queue.
     assert seen["drain"] is False
     assert watched[0] not in seen["only"]
+    _join_startup_threads(plugin_mod)
 
 
 def test_hook_single_flight_under_concurrent_starts(tmp_path, monkeypatch):
@@ -221,6 +248,9 @@ def test_hook_single_flight_under_concurrent_starts(tmp_path, monkeypatch):
     while len(calls) < 1 and time.time() < deadline:
         time.sleep(0.02)
     assert len(calls) == 1, f"expected single-flight, got {len(calls)} refresh calls"
+    # Join the just-released worker before teardown, or the leak guard can catch
+    # it mid-exit and fail the test on a false alarm.
+    _join_startup_threads(plugin_mod)
 
 
 def test_hook_is_async_not_inline(tmp_path, monkeypatch):
@@ -244,6 +274,7 @@ def test_hook_is_async_not_inline(tmp_path, monkeypatch):
     assert "thread" in seen, "refresh never ran"
     assert seen["thread"] is not caller_thread
     assert seen["daemon"] is True
+    _join_startup_threads(plugin_mod)
 
 
 def test_hook_skips_entirely_when_all_fresh(tmp_path, monkeypatch):
@@ -390,8 +421,9 @@ def test_thread_spawn_failure_releases_the_lock(tmp_path, monkeypatch):
 def test_hook_never_raises_on_unreadable_state_path(tmp_path, monkeypatch):
     """With an unreadable state path the hook must still not raise. refresh is faked
     (like every other hook test) so the spawned daemon worker can never reach the
-    real host state file even if it races monkeypatch teardown; the autouse fixture
-    joins it before teardown."""
+    real host state file even if it races monkeypatch teardown; the test joins its
+    own worker via _join_startup_threads, and the autouse leak guard fails on any
+    worker that still outlives the test."""
     plugin_mod, _ = _load_plugin(tmp_path / ".nonexistent-home", monkeypatch)
     monkeypatch.setattr(plugin_mod, "refresh",
                         lambda now=None, snapshots=None, drain=False, outcomes=None, only=None: [])

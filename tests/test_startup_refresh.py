@@ -6,11 +6,15 @@ dedupe, drain=False preservation, and fail-open behavior. Never touches the real
 pattern from test_init_queue.py.
 """
 import importlib.util
+import json
 import re
 import sys
 import threading
 import time
+import types
 from pathlib import Path
+
+import pytest
 
 _root = Path(__file__).resolve().parents[1]
 
@@ -83,17 +87,59 @@ def test_startup_due_set_is_per_provider(tmp_path, monkeypatch):
 
 def test_startup_due_survives_corrupt_state_fields(tmp_path, monkeypatch):
     """Malformed last_ok_at / non-dict providers must not raise and must fail toward
-    fetching, not toward silently skipping (r1 nit)."""
+    fetching, not toward silently skipping (r1-#5). The payload must carry
+    version: 1 or read_state discards it wholesale."""
     plugin_mod, core_mod = _load_plugin(tmp_path / ".hermes", monkeypatch)
+    now = 1_800_000_000.0
     state_file = core_mod.state_path()
     state_file.parent.mkdir(parents=True, exist_ok=True)
-    state_file.write_text('{"providers": {"anthropic": {"fetch": {"core": '
-                          '{"last_ok_at": "not-a-number"}}}, "mode": "normal"}')
-    due = plugin_mod._startup_refresh_due(core_mod, time.time())
-    assert "anthropic" in due
-    # Also: a garbage file must not raise.
+    # Non-numeric last_ok_at for anthropic, well-formed fresh ok for codex:
+    # anthropic must be due, codex must NOT be — this is the r1-#5 per-field fallback.
+    state_file.write_text(json.dumps({
+        "version": 1,
+        "providers": {
+            "anthropic": {"fetch": {"core": {"last_ok_at": "not-a-number"}}},
+            "openai-codex": {"fetch": {"core": {"last_ok_at": now}}},
+        },
+    }))
+    due = plugin_mod._startup_refresh_due(core_mod, now)
+    assert due == {"anthropic"}, due
+    # providers that is not a dict: everything due, no raise.
+    state_file.write_text(json.dumps({"version": 1, "providers": ["not", "a", "dict"]}))
+    assert plugin_mod._startup_refresh_due(core_mod, now) == set(core_mod.WATCHED)
+    # A garbage (non-JSON) file: read_state swallows the ValueError and yields
+    # empty_state, so every provider is due — same fail-open direction, no raise.
     state_file.write_text("not json at all")
-    assert plugin_mod._startup_refresh_due(core_mod, time.time()) == set(core_mod.WATCHED)
+    assert plugin_mod._startup_refresh_due(core_mod, now) == set(core_mod.WATCHED)
+
+
+def _join_startup_threads(module, timeout=5.0):
+    """Wait out any daemon startup-refresh worker this test spawned so it cannot
+    outlive monkeypatch teardown and touch the real host state file."""
+    deadline = time.time() + timeout
+    for t in threading.enumerate():
+        if t.name == "quota-router-startup-refresh" and t is not threading.current_thread():
+            t.join(timeout=max(0.0, deadline - time.time()))
+
+
+@pytest.fixture(autouse=True)
+def _no_stray_startup_threads():
+    """Fail if a startup-refresh worker outlives a test (it would race teardown and
+    could touch the real host state file once sys.modules is restored)."""
+    before = {t for t in threading.enumerate() if t.name == "quota-router-startup-refresh"}
+    yield
+    deadline = time.time() + 5.0
+    while time.time() < deadline:
+        leaked = {t for t in threading.enumerate()
+                  if t.name == "quota-router-startup-refresh"} - before
+        if not leaked:
+            return
+        for t in leaked:
+            t.join(timeout=0.2)
+    leaked = {t for t in threading.enumerate()
+              if t.name == "quota-router-startup-refresh"} - before
+    if leaked:
+        pytest.fail(f"startup-refresh worker(s) leaked past the test: {leaked}")
 
 
 def test_hook_fetches_only_due_providers_and_never_drains(tmp_path, monkeypatch):
@@ -239,12 +285,14 @@ def test_worker_rereads_due_under_lock(tmp_path, monkeypatch):
 
     monkeypatch.setattr(plugin_mod, "refresh", fake_refresh)
 
+    real_due = plugin_mod._startup_refresh_due
+
     def seed_then_check(core_arg, at):
-        # Runs inside the worker (its _core is our core_mod): by the time it checks,
-        # all providers are fresh => due set empty => refresh must not be called.
+        # Simulates the cron refreshing everything between the hook's check and the
+        # worker's re-check: mark all providers fresh, then run the REAL predicate.
         for p in core_arg.WATCHED:
             _seed_ok_fetch(core_arg, p, at)
-        return plugin_mod._startup_refresh_due(core_arg, at)
+        return real_due(core_arg, at)
 
     monkeypatch.setattr(plugin_mod, "_startup_refresh_due", seed_then_check)
     assert plugin_mod._STARTUP_LOCK.acquire(blocking=False)
@@ -252,8 +300,76 @@ def test_worker_rereads_due_under_lock(tmp_path, monkeypatch):
     assert calls == [], "worker refreshed despite everything fresh at re-check"
 
 
+def test_refresh_only_filter_skips_fresh_providers(tmp_path, monkeypatch):
+    """The refresh()-side half of the r1-#1 fix: only= restricts which providers are
+    fetched. With only={'openai-codex'}, the anthropic fetcher must never run even
+    though anthropic is due. Deleting the filter reintroduces the r1 high at the
+    fetch layer — this test must fail if it is."""
+    plugin_mod, core_mod = _load_plugin(tmp_path / ".hermes", monkeypatch)
+
+    fetched = []
+
+    class FakeSnap:
+        fetched_at = 1_800_000_000.0
+        unavailable_reason = None
+        plan = None
+        details = []
+        windows = []
+
+    # Inject a fake agent.account_usage module (same pattern as test_init_queue.py)
+    # so no real network fetch and no dependency on PYTHONPATH for this test.
+    fake_au = types.ModuleType("agent.account_usage")
+    fake_au.fetch_account_usage = lambda p, **k: fetched.append(p) or FakeSnap()
+    monkeypatch.setitem(sys.modules, "agent.account_usage", fake_au)
+
+    now = time.time()
+    plugin_mod.refresh(drain=False, only={"openai-codex"})
+    assert fetched == ["openai-codex"], fetched
+
+    # Sanity: no only= (the cron path) fetches everything due.
+    fetched.clear()
+    plugin_mod.refresh(drain=False)
+    assert set(fetched) == set(core_mod.WATCHED), fetched
+
+
+def test_thread_spawn_failure_releases_the_lock(tmp_path, monkeypatch):
+    """If threading.Thread fails to start, the lock acquired by the hook must be
+    released — otherwise startup refresh is permanently disabled in the process."""
+    plugin_mod, core_mod = _load_plugin(tmp_path / ".hermes", monkeypatch)
+
+    seen = {}
+
+    def fake_refresh(now=None, snapshots=None, drain=False, outcomes=None, only=None):
+        seen["only"] = only
+        return []
+
+    monkeypatch.setattr(plugin_mod, "refresh", fake_refresh)
+    real_thread = plugin_mod.threading.Thread
+
+    def boom_thread(*a, **k):
+        raise RuntimeError("cannot spawn thread")
+
+    monkeypatch.setattr(plugin_mod.threading, "Thread", boom_thread)
+    plugin_mod._on_session_start(session_id="s5")  # must not raise
+    # The lock is free again: the next start can acquire it and refresh.
+    assert not plugin_mod._STARTUP_LOCK.locked()
+
+    monkeypatch.setattr(plugin_mod.threading, "Thread", real_thread)
+    plugin_mod._on_session_start(session_id="s6")
+    deadline = time.time() + 5
+    while "only" not in seen and time.time() < deadline:
+        time.sleep(0.02)
+    assert "only" in seen, "startup refresh never ran after spawn-failure recovery"
+    _join_startup_threads(plugin_mod)
+
+
 def test_hook_never_raises_on_unreadable_state_path(tmp_path, monkeypatch):
-    """With an unwritable/unreadable state path the hook must still not raise."""
-    plugin_mod, _ = _load_plugin(
-        tmp_path / ".nonexistent-home", monkeypatch)
+    """With an unreadable state path the hook must still not raise. refresh is faked
+    (like every other hook test) so the spawned daemon worker can never reach the
+    real host state file even if it races monkeypatch teardown; the autouse fixture
+    joins it before teardown."""
+    plugin_mod, _ = _load_plugin(tmp_path / ".nonexistent-home", monkeypatch)
+    monkeypatch.setattr(plugin_mod, "refresh",
+                        lambda now=None, snapshots=None, drain=False, outcomes=None, only=None: [])
     plugin_mod._on_session_start(session_id="s4")  # must not raise
+    _join_startup_threads(plugin_mod)

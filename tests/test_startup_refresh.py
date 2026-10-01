@@ -111,6 +111,11 @@ def test_startup_due_survives_corrupt_state_fields(tmp_path, monkeypatch):
     # empty_state, so every provider is due — same fail-open direction, no raise.
     state_file.write_text("not json at all")
     assert plugin_mod._startup_refresh_due(core_mod, now) == set(core_mod.WATCHED)
+    # The predicate's own outer except (defence-in-depth): make read_state itself
+    # raise and confirm every provider is due rather than a crash.
+    monkeypatch.setattr(core_mod, "read_state",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("disk gone")))
+    assert plugin_mod._startup_refresh_due(core_mod, now) == set(core_mod.WATCHED)
 
 
 def _join_startup_threads(module, timeout=5.0):
@@ -123,23 +128,34 @@ def _join_startup_threads(module, timeout=5.0):
 
 
 @pytest.fixture(autouse=True)
-def _no_stray_startup_threads():
-    """Fail if a startup-refresh worker outlives a test (it would race teardown and
-    could touch the real host state file once sys.modules is restored)."""
+def _no_stray_startup_threads(monkeypatch):
+    """Fail if any quota-router-startup-refresh worker is alive at test end.
+
+    Requests monkeypatch so this fixture is set up BEFORE it and torn down AFTER
+    it — a leaked worker is caught while the fakes are still active, not after
+    sys.modules has been restored to the real (host-bound) modules. A leak is
+    failed even if it finishes within the grace window.
+    """
     before = {t for t in threading.enumerate() if t.name == "quota-router-startup-refresh"}
+    saw_leak = []
+
     yield
-    deadline = time.time() + 5.0
-    while time.time() < deadline:
-        leaked = {t for t in threading.enumerate()
-                  if t.name == "quota-router-startup-refresh"} - before
-        if not leaked:
-            return
-        for t in leaked:
-            t.join(timeout=0.2)
-    leaked = {t for t in threading.enumerate()
-              if t.name == "quota-router-startup-refresh"} - before
-    if leaked:
-        pytest.fail(f"startup-refresh worker(s) leaked past the test: {leaked}")
+
+    now_leaked = [t for t in threading.enumerate()
+                  if t.name == "quota-router-startup-refresh"
+                  and t is not threading.current_thread() and t not in before]
+    if now_leaked:
+        saw_leak.extend(now_leaked)
+        deadline = time.time() + 2.0
+        while time.time() < deadline:
+            alive = [t for t in saw_leak if t.is_alive()]
+            if not alive:
+                break
+            for t in alive:
+                t.join(timeout=0.2)
+    if saw_leak:
+        pytest.fail(f"startup-refresh worker(s) outlived the test "
+                    f"(would race teardown with real modules restored): {saw_leak}")
 
 
 def test_hook_fetches_only_due_providers_and_never_drains(tmp_path, monkeypatch):
@@ -318,9 +334,17 @@ def test_refresh_only_filter_skips_fresh_providers(tmp_path, monkeypatch):
 
     # Inject a fake agent.account_usage module (same pattern as test_init_queue.py)
     # so no real network fetch and no dependency on PYTHONPATH for this test.
+    fake_agent = types.ModuleType("agent")
     fake_au = types.ModuleType("agent.account_usage")
     fake_au.fetch_account_usage = lambda p, **k: fetched.append(p) or FakeSnap()
+    fake_agent.account_usage = fake_au
+    monkeypatch.setitem(sys.modules, "agent", fake_agent)
     monkeypatch.setitem(sys.modules, "agent.account_usage", fake_au)
+    # The scoped anthropic fetch resolves the operator's real OAuth token and GETs
+    # api.anthropic.com — stub it so this test is fully offline.
+    monkeypatch.setattr(plugin_mod, "_fetch_anthropic_scoped", lambda: None)
+    monkeypatch.setattr(plugin_mod, "_fetch_anthropic_scoped_outcome",
+                        lambda: (True, None, "", None))
 
     now = time.time()
     plugin_mod.refresh(drain=False, only={"openai-codex"})

@@ -136,6 +136,12 @@ def apply_one(path: Path, level: str, levels: Any, *, kanban: bool = False, back
                     else "both levels need an integer max_in_progress for the kanban key")
     if level not in level_specs(levels):
         errs.append(f"unknown level {level!r}")
+    if not errs and isinstance(levels, list):
+        # Validate outside Hermes too (the back-test, a plain script): the child refuses rather
+        # than touching a file, so the fail-closed checks do not depend on hermes_cli importing.
+        ladder_errs = _core().validate_ladder(levels)
+        if ladder_errs:
+            errs.append(ladder_errs[0])
     if errs:
         return {"result": "error", "actual": None, "message": errs[0]}
     try:
@@ -283,6 +289,15 @@ def run_apply(state_path: Path, cfg: dict, t: dict, runner: Runner, now: float, 
                 th["config_error"] = errs[0]
             else:
                 th.pop("config_error", None)
+                # answered review r1 Q2: warn, don't reject — legacy `levels:` still validates and
+                # decides exactly as 0.3.0, so an alias there is a warning line, not an error.
+                warns = core.legacy_alias_warnings(t) if t.get("enabled") else []
+                if warns and th.get("alias_warned") != warns:
+                    core.queue(st, *(f"quota-router: throttle warning: {w}" for w in warns))
+                if warns:
+                    th["alias_warned"] = warns
+                else:
+                    th.pop("alias_warned", None)
             prior = {p: dict(v) for p, v in (th.get("applied") or {}).items() if isinstance(v, dict)}
         results: dict = {}
         if t.get("enabled") and not errs:

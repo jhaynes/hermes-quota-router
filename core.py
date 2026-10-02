@@ -954,7 +954,7 @@ def claim_auto_redeem(state: dict, now: float, cfg: dict) -> tuple[bool, str]:
     windows_in = snap.get("windows")
     if not isinstance(windows_in, list):
         return False, "invalid snapshot windows"
-    windows = [w for w in windows_in if not w.get("scope")]
+    windows = [w for w in windows_in if isinstance(w, dict) and not w.get("scope")]
     by_label = {w.get("label"): w for w in windows}
     weekly = by_label.get("Weekly")
     if weekly is None:
@@ -990,7 +990,10 @@ def claim_auto_redeem(state: dict, now: float, cfg: dict) -> tuple[bool, str]:
         return False, "invalid auto_reset_max_redeems_per_week config"
     if float(weekly.get("used") or 0.0) < threshold:
         return False, f"Weekly {weekly.get('used', 0):.0f}% < {threshold:.0f}%"
-    details = [d.lower() for d in snap.get("details") or []]
+    details_in = snap.get("details") or []
+    if not isinstance(details_in, list) or not all(isinstance(d, str) for d in details_in):
+        return False, "invalid snapshot details"
+    details = [d.lower() for d in details_in]
     banked = next((int(d.split()[2]) for d in details if d.startswith("you have") and " banked" in d
                    and d.split()[2].isdigit()), 0)
     if banked <= 0:
@@ -1007,7 +1010,10 @@ def claim_auto_redeem(state: dict, now: float, cfg: dict) -> tuple[bool, str]:
         t = r.get("at") if isinstance(r, dict) else r
         return t if _num(t) else 0.0
 
-    redeems = [r for r in history.get("redeems") or []
+    redeems_in = history.get("redeems") or []
+    if not isinstance(redeems_in, list):
+        return False, "invalid auto_reset.redeems state"
+    redeems = [r for r in redeems_in
                if _entry_age(r) >= now - 7 * 24 * 3600]
     if len(redeems) >= max_redeems:
         return False, f"weekly redeem cap reached ({len(redeems)} in trailing 7d)"

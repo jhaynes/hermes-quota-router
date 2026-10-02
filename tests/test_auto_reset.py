@@ -148,11 +148,26 @@ def test_garbage_snapshot_fields_never_raise():
         (st_with(win, "soon"), "invalid snapshot fetched_at"),
         (st_with(win, fetched_at=float("nan")), "invalid snapshot fetched_at"),
         (st_with("bogus"), "invalid snapshot windows"),
+        (st_with([None]), "no Weekly window in snapshot"),
+        (st_with(["bogus"]), "no Weekly window in snapshot"),
         (st_with([{"label": "Weekly", "used": 100.0, "resets_at": "not-a-date"}]),
          "invalid Weekly resets_at"),
     ):
         ok, why = core.claim_auto_redeem(bad_st, NOW, CFG)
         assert ok is False and why == why_want
+
+
+def test_garbage_details_and_redeems_never_raise():
+    """r6-F2/F3: non-iterable details and non-list redeems refuse, never raise."""
+    s = state(snap(100.0))
+    s["providers"]["openai-codex"]["snapshot"]["details"] = 12345
+    ok, why = core.claim_auto_redeem(s, NOW, CFG)
+    assert ok is False and why == "invalid snapshot details"
+
+    s = state(snap(100.0))
+    s["auto_reset"] = {"redeems": 7}
+    ok, why = core.claim_auto_redeem(s, NOW, CFG)
+    assert ok is False and why == "invalid auto_reset.redeems state"
 
 
 def test_old_redeems_do_not_count_toward_cap():

@@ -942,6 +942,16 @@ def claim_auto_redeem(state: dict, now: float, cfg: dict) -> tuple[bool, str]:
     weekly = by_label.get("Weekly")
     if weekly is None:
         return False, "no Weekly window in snapshot"
+    session = by_label.get("Session")
+    # Guard BOTH window reads against provider NaN/garbage: float(nan) is truthy, and
+    # nan < threshold is False, so an unguarded `used or 0.0` lets NaN sail through the
+    # below-threshold early return and spend a banked credit on bad data. (r3-F1, high —
+    # reproduced end-to-end on the real refresh path.) _num() also catches None/inf/str.
+    for label, w in (("Weekly", weekly), ("Session", session)):
+        if w is not None:
+            u = w.get("used")
+            if not _num(u) or u in (float("inf"), float("-inf")) or abs(u) > 1e15:
+                return False, f"invalid {label} usage data"
     # A Weekly window whose reset has already passed is a NEW (freshly refilled) week — the
     # old exhaustion it shows is history, and redeeming into it would waste the credit.
     if weekly.get("resets_at") and float(weekly["resets_at"]) <= now:

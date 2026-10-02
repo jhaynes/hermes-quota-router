@@ -176,6 +176,18 @@ def test_garbage_details_and_redeems_never_raise():
     s["auto_reset"] = {"redeems": 7}
     core.settle_auto_redeem(s, NOW + 5.0, "Weekly at 100%", "error")
 
+    # r8 seam: state["auto_reset"] itself None / non-dict must not raise in claim or settle
+    s = state(snap(100.0)); s["auto_reset"] = None
+    ok, why = core.claim_auto_redeem(s, NOW, CFG)
+    assert ok is True, why  # None auto_reset history = no prior redeems; claim proceeds
+    s = state(snap(100.0)); s["auto_reset"] = None
+    core.settle_auto_redeem(s, NOW + 5.0, "Weekly at 100%", "error")
+    s = state(snap(100.0)); s["auto_reset"] = 5
+    ok, why = core.claim_auto_redeem(s, NOW, CFG)
+    assert ok is False and why == "invalid auto_reset state"
+    s = state(snap(100.0)); s["auto_reset"] = 5
+    core.settle_auto_redeem(s, NOW + 5.0, "Weekly at 100%", "error")
+
 
 def test_old_redeems_do_not_count_toward_cap():
     st = state(snap(100.0))

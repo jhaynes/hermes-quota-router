@@ -1001,7 +1001,10 @@ def claim_auto_redeem(state: dict, now: float, cfg: dict) -> tuple[bool, str]:
                    and d.split()[2].isdigit()), 0)
     if banked <= 0:
         return False, "no banked credits"
-    history = state.get("auto_reset") or {}
+    history = state.get("auto_reset")
+    if history is not None and not isinstance(history, dict):
+        return False, "invalid auto_reset state"
+    history = history or {}
     # Every entry counts against the cap: bare floats (settled successes) AND dicts
     # (in-flight reservations from claim_auto_redeem). Dict reservations age out on the
     # same trailing window: a claim older than 7d cannot still be in flight (the redeem
@@ -1024,6 +1027,11 @@ def claim_auto_redeem(state: dict, now: float, cfg: dict) -> tuple[bool, str]:
     # Reserve the slot NOW (placeholder dict, distinct from the bare-float successes), so a
     # concurrent refresh's claim sees it and stays under the cap.
     ar = state.setdefault("auto_reset", {})
+    if not isinstance(ar, dict):
+        # persisted auto_reset was None/non-dict: setdefault returned it unchanged —
+        # replace it so the reservation can be written.
+        ar = {}
+        state["auto_reset"] = ar
     ar["redeems"] = redeems + [{"at": now, "claim": reason}]
     return True, reason
 
@@ -1038,6 +1046,11 @@ def settle_auto_redeem(state: dict, now: float, reason: str, outcome: str) -> No
     one alert line either way.
     """
     ar = state.setdefault("auto_reset", {})
+    if not isinstance(ar, dict):
+        # persisted auto_reset is a non-dict (corrupt state): replace rather than raise,
+        # settle must not crash — but preserve nothing unparseable.
+        ar = {}
+        state["auto_reset"] = ar
     ar["last"] = {"at": now, "reason": reason, "outcome": outcome}
     # Claims are interchangeable — matching by reason string would fail when two concurrent
     # claims render the same reason. Settle touches exactly ONE reservation (this attempt's,

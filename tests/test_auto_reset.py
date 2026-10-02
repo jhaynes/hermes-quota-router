@@ -126,6 +126,15 @@ def test_invalid_threshold_config_never_raises():
     assert ok is False and why == "invalid auto_reset.weekly_threshold config"
 
 
+def test_invalid_max_redeems_config_never_raises():
+    """A garbage auto_reset_max_redeems_per_week must refuse the claim, not crash refresh."""
+    for bad in ("two", None, float("nan")):
+        cfg = dict(core.DEFAULTS, auto_reset={"weekly_threshold": 97.0},
+                   auto_reset_max_redeems_per_week=bad)
+        ok, why = core.claim_auto_redeem(state(snap(100.0)), NOW, cfg)
+        assert ok is False and why == "invalid auto_reset_max_redeems_per_week config", bad
+
+
 def test_old_redeems_do_not_count_toward_cap():
     st = state(snap(100.0))
     st["auto_reset"] = {"redeems": [NOW - 8 * 24 * 3600.0]}

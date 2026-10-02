@@ -226,3 +226,23 @@ def test_stranded_reservation_ages_out():
     st["providers"]["openai-codex"]["snapshot"]["fetched_at"] = NOW + 8 * 24 * 3600 - 60.0
     ok2, why2 = core.claim_auto_redeem(st, NOW + 8 * 24 * 3600, CFG)
     assert ok2 is True, why2
+
+
+def test_nan_weekly_used_never_claims():
+    """r3-F1 (high): provider NaN in the Weekly window's 'used' must refuse the claim,
+    not sail through (nan < threshold is False). Same for inf and garbage strings."""
+    for bad in (float("nan"), float("inf"), "98.0", None):
+        st = state(snap(100.0))
+        st["providers"]["openai-codex"]["snapshot"]["windows"][1]["used"] = bad
+        ok, why = core.claim_auto_redeem(st, NOW, CFG)
+        assert ok is False, f"bad={bad!r}"
+        assert "invalid Weekly usage data" in why
+
+
+def test_nan_session_used_never_claims():
+    """r3-F1 symmetry: NaN in the Session window also refuses (defensive; the Weekly
+    gate alone should already keep a dead-5h-window scenario out)."""
+    st = state(snap(100.0))
+    st["providers"]["openai-codex"]["snapshot"]["windows"][0]["used"] = float("nan")
+    ok, why = core.claim_auto_redeem(st, NOW, CFG)
+    assert ok is False and "invalid Session usage data" in why

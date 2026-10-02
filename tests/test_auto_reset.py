@@ -193,3 +193,36 @@ def test_settle_keeps_other_in_flight_claims():
     core.settle_auto_redeem(st2, NOW + 5.0, reason1, "not_exhausted")
     redeems = st2["auto_reset"]["redeems"]
     assert len(redeems) == 1 and isinstance(redeems[0], dict) and redeems[0]["claim"] == reason2
+    # cap accounting: 1 in-flight entry < cap 2, so the free slot is claimable again
+    ok3, _ = core.claim_auto_redeem(st2, NOW + 6.0, cfg2)
+    assert ok3 is True
+    assert len(st2["auto_reset"]["redeems"]) == 2
+
+
+def test_settle_success_keeps_sibling_reservation():
+    """r2-F2: settling one claim as SUCCESS must convert only its own slot; a sibling
+    in-flight reservation survives, so a concurrent third claim stays cap-blocked."""
+    cfg2 = dict(CFG, auto_reset_max_redeems_per_week=2)
+    st2 = state(snap(100.0))
+    ok1, reason1 = core.claim_auto_redeem(st2, NOW, cfg2)
+    ok2, reason2 = core.claim_auto_redeem(st2, NOW + 1.0, cfg2)
+    assert ok1 and ok2
+    core.settle_auto_redeem(st2, NOW + 5.0, reason1, "reset")
+    redeems = st2["auto_reset"]["redeems"]
+    assert redeems == [NOW + 5.0, {"at": NOW + 1.0, "claim": reason2}]
+    ok3, why3 = core.claim_auto_redeem(st2, NOW + 6.0, cfg2)
+    assert ok3 is False and "cap reached" in why3
+
+
+def test_stranded_reservation_ages_out():
+    """r2-F1: a crash between claim and settle strands the reservation; it must age out
+    on the trailing window instead of disabling auto-redeem indefinitely."""
+    st = state(snap(100.0))
+    ok, _ = core.claim_auto_redeem(st, NOW, CFG)
+    assert ok is True
+    # crash: no settle. A week later (weekly window still in the future, fresh snapshot)
+    # the stranded reservation must be gone from the cap accounting.
+    st["providers"]["openai-codex"]["snapshot"] = snap(100.0, week_reset=NOW + 10 * 24 * 3600)
+    st["providers"]["openai-codex"]["snapshot"]["fetched_at"] = NOW + 8 * 24 * 3600 - 60.0
+    ok2, why2 = core.claim_auto_redeem(st, NOW + 8 * 24 * 3600, CFG)
+    assert ok2 is True, why2

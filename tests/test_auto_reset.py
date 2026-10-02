@@ -150,6 +150,8 @@ def test_garbage_snapshot_fields_never_raise():
         (st_with("bogus"), "invalid snapshot windows"),
         (st_with([None]), "no Weekly window in snapshot"),
         (st_with(["bogus"]), "no Weekly window in snapshot"),
+        (st_with([{"label": ["Weekly"], "used": 100.0, "resets_at": NOW + 3 * 86400}]),
+         "invalid window label"),
         (st_with([{"label": "Weekly", "used": 100.0, "resets_at": "not-a-date"}]),
          "invalid Weekly resets_at"),
     ):
@@ -168,6 +170,11 @@ def test_garbage_details_and_redeems_never_raise():
     s["auto_reset"] = {"redeems": 7}
     ok, why = core.claim_auto_redeem(s, NOW, CFG)
     assert ok is False and why == "invalid auto_reset.redeems state"
+
+    # settle with non-list redeems must not raise either (r7 probe P2)
+    s = state(snap(100.0))
+    s["auto_reset"] = {"redeems": 7}
+    core.settle_auto_redeem(s, NOW + 5.0, "Weekly at 100%", "error")
 
 
 def test_old_redeems_do_not_count_toward_cap():

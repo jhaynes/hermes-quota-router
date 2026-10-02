@@ -172,11 +172,11 @@ Safety layers, in order:
 
 1. **Weekly-only gate** — the decision reads the fresh core snapshot's `Weekly` window; the 5h `Session` window never triggers a redeem.
 2. **Banked check** — the snapshot must report banked credits (`You have N resets banked`).
-3. **No force** — the redeem never passes `force`, so the runtime client-side guard (`account_usage._codex_reset_guard`) refuses while any window is below 100%, and the backend's own `nothing_to_reset` is a third layer. A stale snapshot can't spend a credit into a half-used window.
-4. **Rate cap** — at most `auto_reset_max_redeems_per_week` (default 1) attempts per trailing 7 days are recorded, so repeated bad data can't drain the bank.
+3. **No force** — the redeem never passes `force`, so the runtime client-side guard (`account_usage._codex_reset_guard`) refuses unless the busiest window is at 100% (`nothing_to_reset` from the backend is a third layer). The plugin's weekly gate is what keeps the dead-5h-window case out entirely; the claim's `resets_at` check keeps a freshly rolled-over (already refilled) week out.
+4. **Rate cap with atomic claim** — the decision and the cap-slot reservation are one step under the state lock (`claim_auto_redeem`), so overlapping refreshes cannot double-redeem; the slot is settled after the redeem and rolled back if the attempt did not succeed, so a refused attempt never burns `auto_reset_max_redeems_per_week` (default 1).
 5. **Stale snapshot** — snapshots older than `stale_after_s` are ignored.
 
-Every attempt is recorded in state (`auto_reset.last`, `auto_reset.redeems`) and queued as one `⚠️` alert line (`quota-router: auto-redeemed a banked codex reset credit (...)`), so outcomes are visible in `/quota`. A successful redemption lifts the runtime credential-pool cooldowns, and the next refresh cycle confirms the windows dropped.
+Every attempt is recorded in state (`auto_reset.last`, `auto_reset.redeems`) and queued as one `⚠️` alert line (`quota-router: auto-redeemed a banked codex reset credit (...)` or `auto-redeem not done (<outcome>)`), so outcomes are visible in `/quota`. A successful redemption lifts the runtime credential-pool cooldowns, and the next refresh cycle confirms the windows dropped.
 
 ## Deliberately out of scope
 

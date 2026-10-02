@@ -61,9 +61,10 @@ DEFAULTS = {
     # weekly window is the scarce one (it does not self-heal for days), while a dead 5h window
     # empties itself in hours. Redemption therefore fires ONLY on weekly exhaustion; a dead
     # 5h window alone never spends a credit — the throttle ladder covers that case on GLM.
-    # Never passes force: the runtime client-side guard (account_usage._codex_reset_guard)
-    # refuses redemption while any window is below 100%, and the backend's own
-    # nothing_to_reset is a third layer.
+    # The redeem never passes force: the runtime client-side guard
+    # (account_usage._codex_reset_guard) refuses unless the BUSIEST window is at 100%, and
+    # the backend's own nothing_to_reset is a third layer. The plugin's weekly gate is what
+    # keeps the 5h-window case out entirely (see claim_auto_redeem).
     "auto_reset": None,                    # None = off; {"weekly_threshold": 97.0} to enable
     "auto_reset_max_redeems_per_week": 1,  # guard against repeated bad data spending the bank
 }
@@ -901,21 +902,29 @@ def fetch_due(state: dict, provider: str, now: float, cfg: dict) -> bool:
 
 # ── auto-redeem banked Codex reset credits ────────────────────────────────────
 
-def auto_reset_decision(state: dict, now: float, cfg: dict) -> tuple[bool, str]:
-    """Whether to redeem one banked openai-codex reset credit now. Pure.
+def claim_auto_redeem(state: dict, now: float, cfg: dict) -> tuple[bool, str]:
+    """Whether to redeem one banked openai-codex reset credit now — and reserve the cap slot.
 
-    Returns ``(redeem, reason)``. Fires only when ALL of these hold:
+    MUST be called under ``locked_state``: the decision and the slot reservation are one
+    atomic step, so overlapping refreshes (cron + startup + ``status --refresh``) cannot
+    both pass the cap check and double-redeem. The reservation is a placeholder entry in
+    ``auto_reset.redeems``; ``settle_auto_redeem`` keeps it on success and rolls it back on
+    failure. Returns ``(claimed, reason)``.
+
+    Fires only when ALL of these hold:
 
     - ``auto_reset`` is configured (a dict; ``None`` = feature off);
     - the provider is ``openai-codex`` with a fresh core snapshot (no ``unavailable``);
     - the snapshot reports banked credits (``available_count`` > 0);
     - the **weekly** window (the secondary window — the one that does not self-heal for
-      days) is at or above ``weekly_threshold`` (default 97.0). A dead 5h window alone
-      never spends a credit: it empties itself in hours, while a reset restores the FULL
-      5h + weekly allowance — spending it into a half-used weekly wastes most of its value;
-    - fewer than ``auto_reset_max_redeems_per_week`` redemptions have been recorded in the
-      trailing 7 days (``auto_reset.redeems`` history in state), so repeated bad data
-      cannot drain the bank.
+      days) is at or above ``weekly_threshold`` (default 97.0) AND its ``resets_at`` is
+      still in the future (a window whose reset has passed is a freshly refilled NEW
+      week — its shown exhaustion is history). A dead 5h window alone never spends a
+      credit: it empties itself in hours, while a reset restores the FULL 5h + weekly
+      allowance — spending it into a half-used weekly wastes most of its value;
+    - fewer than ``auto_reset_max_redeems_per_week`` redemptions (including one in-flight
+      reservation) are recorded in the trailing 7 days, so repeated bad data or overlapping
+      refreshes cannot drain the bank.
 
     ``reason`` explains the decision either way (for the alert line / tests).
     """
@@ -933,7 +942,16 @@ def auto_reset_decision(state: dict, now: float, cfg: dict) -> tuple[bool, str]:
     weekly = by_label.get("Weekly")
     if weekly is None:
         return False, "no Weekly window in snapshot"
-    threshold = float(acfg.get("weekly_threshold", 97.0))
+    # A Weekly window whose reset has already passed is a NEW (freshly refilled) week — the
+    # old exhaustion it shows is history, and redeeming into it would waste the credit.
+    if weekly.get("resets_at") and float(weekly["resets_at"]) <= now:
+        return False, "Weekly window already reset (stale exhaustion)"
+    try:
+        threshold = float(acfg.get("weekly_threshold", 97.0))
+        if not threshold == threshold:  # NaN
+            raise ValueError
+    except (TypeError, ValueError):
+        return False, "invalid auto_reset.weekly_threshold config"
     if float(weekly.get("used") or 0.0) < threshold:
         return False, f"Weekly {weekly.get('used', 0):.0f}% < {threshold:.0f}%"
     details = [d.lower() for d in snap.get("details") or []]
@@ -942,23 +960,49 @@ def auto_reset_decision(state: dict, now: float, cfg: dict) -> tuple[bool, str]:
     if banked <= 0:
         return False, "no banked credits"
     history = state.get("auto_reset") or {}
-    redeems = [r for r in history.get("redeems") or [] if _num(r) and r >= now - 7 * 24 * 3600]
+    # Every entry counts against the cap: bare floats (settled successes) AND dicts
+    # (in-flight reservations from claim_auto_redeem).
+    redeems = [r for r in history.get("redeems") or []
+               if isinstance(r, dict) or (_num(r) and r >= now - 7 * 24 * 3600)]
     if len(redeems) >= int(cfg.get("auto_reset_max_redeems_per_week", 1)):
         return False, f"weekly redeem cap reached ({len(redeems)} in trailing 7d)"
-    return True, f"Weekly at {weekly.get('used', 0):.0f}% (>= {threshold:.0f}%), {banked} banked"
+    reason = f"Weekly at {weekly.get('used', 0):.0f}% (>= {threshold:.0f}%), {banked} banked"
+    # Reserve the slot NOW (placeholder dict, distinct from the bare-float successes), so a
+    # concurrent refresh's claim sees it and stays under the cap.
+    ar = state.setdefault("auto_reset", {})
+    ar["redeems"] = redeems + [{"at": now, "claim": reason}]
+    return True, reason
 
 
-def record_auto_redeem(state: dict, now: float, reason: str, outcome: str) -> None:
-    """Record one auto-redeem attempt in ``state['auto_reset']`` (history + one alert line).
+def settle_auto_redeem(state: dict, now: float, reason: str, outcome: str) -> None:
+    """Settle a claimed auto-redeem slot after the network call. Must be under ``locked_state``.
 
-    ``outcome`` is the runtime result status (``reset`` | ``not_exhausted`` | ...); every
-    attempt is recorded so failures are visible and rate-capped, not retried every cycle.
+    ``outcome == "reset"`` keeps the reservation (converted to a plain success timestamp);
+    any other outcome rolls the reservation back so the cap is not burned by a refused or
+    failed attempt (the runtime guard refuses below 100% usage; that must not block the
+    real redeem once the weekly window actually reaches 100%). Records ``last`` and queues
+    one alert line either way.
     """
     ar = state.setdefault("auto_reset", {})
-    ar["redeems"] = [r for r in ar.get("redeems") or [] if _num(r) and r >= now - 7 * 24 * 3600]
-    ar["redeems"].append(now)
     ar["last"] = {"at": now, "reason": reason, "outcome": outcome}
-    queue(state, f"quota-router: auto-redeemed a banked codex reset credit ({reason}; outcome {outcome})")
+    if outcome == "reset":
+        # settled: the reservation becomes a plain success stamp (fresh state; the redeem
+        # just succeeded, so nothing older than stale_after_s is relevant to keep)
+        ar["redeems"] = [now]
+    else:
+        # roll back ONE placeholder reservation (this attempt's); settled successes and any
+        # other in-flight claims stay. Claims are interchangeable — matching by reason string
+        # would fail when two concurrent claims render the same reason.
+        redeems = list(ar.get("redeems") or [])
+        for i, r in enumerate(redeems):
+            if isinstance(r, dict):
+                del redeems[i]
+                break
+        ar["redeems"] = redeems
+    verb = "auto-redeemed" if outcome == "reset" else f"auto-redeem not done ({outcome})"
+    # ⚠️ prefix: queue() evicts plain "quota-router:" lines first under PENDING_CAP, and a
+    # redemption (or a refused attempt) is exactly the event the user must not lose.
+    queue(state, f"⚠️ quota-router: {verb} a banked codex reset credit ({reason})")
 
 
 def clear_block_on_success(state: dict, provider: str, now: float) -> bool:

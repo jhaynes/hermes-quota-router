@@ -955,6 +955,9 @@ def claim_auto_redeem(state: dict, now: float, cfg: dict) -> tuple[bool, str]:
     if not isinstance(windows_in, list):
         return False, "invalid snapshot windows"
     windows = [w for w in windows_in if isinstance(w, dict) and not w.get("scope")]
+    for w in windows:
+        if not isinstance(w.get("label"), str):
+            return False, "invalid window label"
     by_label = {w.get("label"): w for w in windows}
     weekly = by_label.get("Weekly")
     if weekly is None:
@@ -1040,7 +1043,8 @@ def settle_auto_redeem(state: dict, now: float, reason: str, outcome: str) -> No
     # claims render the same reason. Settle touches exactly ONE reservation (this attempt's,
     # i.e. the first placeholder dict); all other entries (settled successes + sibling
     # in-flight claims) are preserved untouched.
-    redeems = list(ar.get("redeems") or [])
+    redeems_in = ar.get("redeems") or []
+    redeems = list(redeems_in) if isinstance(redeems_in, list) else []
     for i, r in enumerate(redeems):
         if isinstance(r, dict):
             if outcome == "reset":

@@ -970,6 +970,10 @@ def claim_auto_redeem(state: dict, now: float, cfg: dict) -> tuple[bool, str]:
             raise ValueError
     except (TypeError, ValueError):
         return False, "invalid auto_reset.weekly_threshold config"
+    try:
+        max_redeems = int(cfg.get("auto_reset_max_redeems_per_week", 1))
+    except (TypeError, ValueError):
+        return False, "invalid auto_reset_max_redeems_per_week config"
     if float(weekly.get("used") or 0.0) < threshold:
         return False, f"Weekly {weekly.get('used', 0):.0f}% < {threshold:.0f}%"
     details = [d.lower() for d in snap.get("details") or []]
@@ -991,7 +995,7 @@ def claim_auto_redeem(state: dict, now: float, cfg: dict) -> tuple[bool, str]:
 
     redeems = [r for r in history.get("redeems") or []
                if _entry_age(r) >= now - 7 * 24 * 3600]
-    if len(redeems) >= int(cfg.get("auto_reset_max_redeems_per_week", 1)):
+    if len(redeems) >= max_redeems:
         return False, f"weekly redeem cap reached ({len(redeems)} in trailing 7d)"
     reason = f"Weekly at {weekly.get('used', 0):.0f}% (>= {threshold:.0f}%), {banked} banked"
     # Reserve the slot NOW (placeholder dict, distinct from the bare-float successes), so a

@@ -350,7 +350,25 @@ def refresh(now: float | None = None, snapshots: dict | None = None, drain: bool
                             snapshots["anthropic"] = snap2
         core.apply_refresh(st, snapshots, now, cfg)
         core.apply_cache(st, cache_outcome, now, cfg)
-        return core.drain_pending(st) if drain else []
+
+    # Auto-redeem banked Codex reset credits. Decided from the just-written state; the redeem
+    # itself is a network call, so it runs OUTSIDE the state lock and the attempt is recorded
+    # in a second locked section. Never passes force: the runtime guard refuses while any
+    # window is below 100%, so a stale snapshot cannot spend a credit into a half-used window.
+    redeem, reason = core.auto_reset_decision(core.read_state(core.state_path()), now, cfg)
+    if redeem:
+        try:
+            from agent.account_usage import redeem_codex_reset_credit
+            result = redeem_codex_reset_credit()
+            outcome, message = result.status, result.message
+        except Exception as exc:  # pragma: no cover - redeem is never-raise by design
+            outcome, message = "error", f"{type(exc).__name__}: {exc}"
+        logger.info("quota-router: auto-redeem attempt (%s): %s — %s", reason, outcome, message)
+        with core.locked_state(core.state_path()) as st:
+            core.record_auto_redeem(st, now, reason, outcome)
+            return core.drain_pending(st) if drain else []
+
+    return [] if drain is False else core.drain_pending(core.read_state(core.state_path()))
 
 
 def status_text(fetch: bool = False) -> str:

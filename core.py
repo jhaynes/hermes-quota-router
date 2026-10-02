@@ -56,6 +56,16 @@ DEFAULTS = {
     "cache_alert_min_tokens": 20_000_000,  # ... on at least this much 24h input -> alert
     "cache_write_alert_tokens": 10_000_000,  # one session writing this much in 24h ...
     "cache_write_alert_below": 50.0,       # ... at a hit % below this -> alert
+    # Auto-redeem banked Codex reset credits (feature). A banked reset restores the FULL 5h +
+    # weekly allowance instantly, so its value is realised the moment it is redeemed — but the
+    # weekly window is the scarce one (it does not self-heal for days), while a dead 5h window
+    # empties itself in hours. Redemption therefore fires ONLY on weekly exhaustion; a dead
+    # 5h window alone never spends a credit — the throttle ladder covers that case on GLM.
+    # Never passes force: the runtime client-side guard (account_usage._codex_reset_guard)
+    # refuses redemption while any window is below 100%, and the backend's own
+    # nothing_to_reset is a third layer.
+    "auto_reset": None,                    # None = off; {"weekly_threshold": 97.0} to enable
+    "auto_reset_max_redeems_per_week": 1,  # guard against repeated bad data spending the bank
 }
 TIER_ORDER = {"ok": 0, "tight": 1, "exhausted": 2}
 
@@ -887,6 +897,68 @@ def fetch_due(state: dict, provider: str, now: float, cfg: dict) -> bool:
         queue(state, f"quota-router: {provider} usage fetch backing off to {int(cfg['backoff_interval_s'] // 60)}m "
                      f"({len(bad)} non-ok fetches in {int(cfg['backoff_window_s'] // 60)}m)")
     return now - max(e[0] for e in mine) >= cfg["backoff_interval_s"]
+
+
+# ── auto-redeem banked Codex reset credits ────────────────────────────────────
+
+def auto_reset_decision(state: dict, now: float, cfg: dict) -> tuple[bool, str]:
+    """Whether to redeem one banked openai-codex reset credit now. Pure.
+
+    Returns ``(redeem, reason)``. Fires only when ALL of these hold:
+
+    - ``auto_reset`` is configured (a dict; ``None`` = feature off);
+    - the provider is ``openai-codex`` with a fresh core snapshot (no ``unavailable``);
+    - the snapshot reports banked credits (``available_count`` > 0);
+    - the **weekly** window (the secondary window — the one that does not self-heal for
+      days) is at or above ``weekly_threshold`` (default 97.0). A dead 5h window alone
+      never spends a credit: it empties itself in hours, while a reset restores the FULL
+      5h + weekly allowance — spending it into a half-used weekly wastes most of its value;
+    - fewer than ``auto_reset_max_redeems_per_week`` redemptions have been recorded in the
+      trailing 7 days (``auto_reset.redeems`` history in state), so repeated bad data
+      cannot drain the bank.
+
+    ``reason`` explains the decision either way (for the alert line / tests).
+    """
+    acfg = cfg.get("auto_reset")
+    if not isinstance(acfg, dict):
+        return False, "auto_reset not configured"
+    pstate = (state.get("providers") or {}).get("openai-codex") or {}
+    snap = pstate.get("snapshot") or {}
+    if not snap or snap.get("unavailable"):
+        return False, "no fresh snapshot"
+    if now - float(snap.get("fetched_at") or 0) > cfg["stale_after_s"]:
+        return False, "snapshot stale"
+    windows = [w for w in snap.get("windows") or [] if not w.get("scope")]
+    by_label = {w.get("label"): w for w in windows}
+    weekly = by_label.get("Weekly")
+    if weekly is None:
+        return False, "no Weekly window in snapshot"
+    threshold = float(acfg.get("weekly_threshold", 97.0))
+    if float(weekly.get("used") or 0.0) < threshold:
+        return False, f"Weekly {weekly.get('used', 0):.0f}% < {threshold:.0f}%"
+    details = [d.lower() for d in snap.get("details") or []]
+    banked = next((int(d.split()[2]) for d in details if d.startswith("you have") and " banked" in d
+                   and d.split()[2].isdigit()), 0)
+    if banked <= 0:
+        return False, "no banked credits"
+    history = state.get("auto_reset") or {}
+    redeems = [r for r in history.get("redeems") or [] if _num(r) and r >= now - 7 * 24 * 3600]
+    if len(redeems) >= int(cfg.get("auto_reset_max_redeems_per_week", 1)):
+        return False, f"weekly redeem cap reached ({len(redeems)} in trailing 7d)"
+    return True, f"Weekly at {weekly.get('used', 0):.0f}% (>= {threshold:.0f}%), {banked} banked"
+
+
+def record_auto_redeem(state: dict, now: float, reason: str, outcome: str) -> None:
+    """Record one auto-redeem attempt in ``state['auto_reset']`` (history + one alert line).
+
+    ``outcome`` is the runtime result status (``reset`` | ``not_exhausted`` | ...); every
+    attempt is recorded so failures are visible and rate-capped, not retried every cycle.
+    """
+    ar = state.setdefault("auto_reset", {})
+    ar["redeems"] = [r for r in ar.get("redeems") or [] if _num(r) and r >= now - 7 * 24 * 3600]
+    ar["redeems"].append(now)
+    ar["last"] = {"at": now, "reason": reason, "outcome": outcome}
+    queue(state, f"quota-router: auto-redeemed a banked codex reset credit ({reason}; outcome {outcome})")
 
 
 def clear_block_on_success(state: dict, provider: str, now: float) -> bool:

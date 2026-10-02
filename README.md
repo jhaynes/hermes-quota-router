@@ -157,6 +157,27 @@ The legacy two-level form, unchanged:
 - Downgrading to 0.3.0 with a `levels:` config: 0.4.0 keeps every throttle field 0.3.0 reads exactly as 0.3.0 writes it. Those are `level`, `since`, `source`, `rule`, `decided_at`, `hold`, `disabled`, the stale-alert dedupe (`stale_alerted_for`), `log`, `applied` and `config_error`. So 0.3.0 carries on with the same level, dwell, hold and disable, and doesn't send a stale alert again. It ignores `throttle.providers`. When 0.4.0 runs again, it re-derives the protected provider's state from what 0.3.0 recorded.
 - Downgrading with a `ladder:` config preserves nothing useful. 0.3.0 doesn't know the `ladder` key, so it sees no `levels`, refuses to apply (`throttle.levels.fast needs provider and model`) and decides for `anthropic` only. A stored ladder level reads as `fast`, and a hold or disable naming a ladder level is taken literally. Switch the config back to `levels:` and clear any hold or disable first.
 
+## Auto-redeem banked Codex reset credits
+
+A banked Codex reset restores the **full** 5h + weekly allowance instantly, so its value is realised the moment it is redeemed — but the weekly window is the scarce one (it does not self-heal for days), while a dead 5h window empties itself in hours. The feature therefore redeems **only on weekly exhaustion**; a dead 5h window alone never spends a credit (the throttle ladder covers that case on the fallback rung).
+
+Off by default. Enable it in the plugin config (`plugins.entries.quota-router`):
+
+```yaml
+auto_reset:
+  weekly_threshold: 97.0   # redeem when the Weekly window is at/above this percent
+```
+
+Safety layers, in order:
+
+1. **Weekly-only gate** — the decision reads the fresh core snapshot's `Weekly` window; the 5h `Session` window never triggers a redeem.
+2. **Banked check** — the snapshot must report banked credits (`You have N resets banked`).
+3. **No force** — the redeem never passes `force`, so the runtime client-side guard (`account_usage._codex_reset_guard`) refuses while any window is below 100%, and the backend's own `nothing_to_reset` is a third layer. A stale snapshot can't spend a credit into a half-used window.
+4. **Rate cap** — at most `auto_reset_max_redeems_per_week` (default 1) attempts per trailing 7 days are recorded, so repeated bad data can't drain the bank.
+5. **Stale snapshot** — snapshots older than `stale_after_s` are ignored.
+
+Every attempt is recorded in state (`auto_reset.last`, `auto_reset.redeems`) and queued as one `⚠️` alert line (`quota-router: auto-redeemed a banked codex reset credit (...)`), so outcomes are visible in `/quota`. A successful redemption lifts the runtime credential-pool cooldowns, and the next refresh cycle confirms the windows dropped.
+
 ## Deliberately out of scope
 
 - **Error classification override.** Hermes already switches to fallback immediately on rate-limit and billing errors when the credential pool can't rotate (`agent/turn_recovery.py::route_classified_error`).

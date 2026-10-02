@@ -943,9 +943,18 @@ def claim_auto_redeem(state: dict, now: float, cfg: dict) -> tuple[bool, str]:
     snap = pstate.get("snapshot") or {}
     if not snap or snap.get("unavailable"):
         return False, "no fresh snapshot"
-    if now - float(snap.get("fetched_at") or 0) > cfg["stale_after_s"]:
+    try:
+        fetched_at = float(snap.get("fetched_at") or 0)
+        if fetched_at != fetched_at:  # NaN
+            raise ValueError
+    except (TypeError, ValueError):
+        return False, "invalid snapshot fetched_at"
+    if now - fetched_at > cfg["stale_after_s"]:
         return False, "snapshot stale"
-    windows = [w for w in snap.get("windows") or [] if not w.get("scope")]
+    windows_in = snap.get("windows")
+    if not isinstance(windows_in, list):
+        return False, "invalid snapshot windows"
+    windows = [w for w in windows_in if not w.get("scope")]
     by_label = {w.get("label"): w for w in windows}
     weekly = by_label.get("Weekly")
     if weekly is None:
@@ -962,8 +971,13 @@ def claim_auto_redeem(state: dict, now: float, cfg: dict) -> tuple[bool, str]:
                 return False, f"invalid {label} usage data"
     # A Weekly window whose reset has already passed is a NEW (freshly refilled) week — the
     # old exhaustion it shows is history, and redeeming into it would waste the credit.
-    if weekly.get("resets_at") and float(weekly["resets_at"]) <= now:
-        return False, "Weekly window already reset (stale exhaustion)"
+    if weekly.get("resets_at"):
+        try:
+            resets_at = float(weekly["resets_at"])
+        except (TypeError, ValueError):
+            return False, "invalid Weekly resets_at"
+        if resets_at <= now:
+            return False, "Weekly window already reset (stale exhaustion)"
     try:
         threshold = float(acfg.get("weekly_threshold", 97.0))
         if not threshold == threshold:  # NaN
@@ -972,7 +986,7 @@ def claim_auto_redeem(state: dict, now: float, cfg: dict) -> tuple[bool, str]:
         return False, "invalid auto_reset.weekly_threshold config"
     try:
         max_redeems = int(cfg.get("auto_reset_max_redeems_per_week", 1))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return False, "invalid auto_reset_max_redeems_per_week config"
     if float(weekly.get("used") or 0.0) < threshold:
         return False, f"Weekly {weekly.get('used', 0):.0f}% < {threshold:.0f}%"

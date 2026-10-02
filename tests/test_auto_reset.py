@@ -128,11 +128,31 @@ def test_invalid_threshold_config_never_raises():
 
 def test_invalid_max_redeems_config_never_raises():
     """A garbage auto_reset_max_redeems_per_week must refuse the claim, not crash refresh."""
-    for bad in ("two", None, float("nan")):
+    for bad in ("two", None, float("nan"), float("inf"), float("-inf")):
         cfg = dict(core.DEFAULTS, auto_reset={"weekly_threshold": 97.0},
                    auto_reset_max_redeems_per_week=bad)
         ok, why = core.claim_auto_redeem(state(snap(100.0)), NOW, cfg)
         assert ok is False and why == "invalid auto_reset_max_redeems_per_week config", bad
+
+
+def test_garbage_snapshot_fields_never_raise():
+    """Garbage provider-side data (fetched_at, windows, resets_at) refuses, never raises (r5-F2)."""
+    def st_with(windows, fetched_at=NOW - 60):
+        s = state(snap(100.0))
+        s["providers"]["openai-codex"]["snapshot"]["windows"] = windows
+        s["providers"]["openai-codex"]["snapshot"]["fetched_at"] = fetched_at
+        return s
+
+    win = [{"label": "Weekly", "used": 100.0, "resets_at": NOW + 3 * 86400}]
+    for bad_st, why_want in (
+        (st_with(win, "soon"), "invalid snapshot fetched_at"),
+        (st_with(win, fetched_at=float("nan")), "invalid snapshot fetched_at"),
+        (st_with("bogus"), "invalid snapshot windows"),
+        (st_with([{"label": "Weekly", "used": 100.0, "resets_at": "not-a-date"}]),
+         "invalid Weekly resets_at"),
+    ):
+        ok, why = core.claim_auto_redeem(bad_st, NOW, CFG)
+        assert ok is False and why == why_want
 
 
 def test_old_redeems_do_not_count_toward_cap():

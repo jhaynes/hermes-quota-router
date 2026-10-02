@@ -961,9 +961,18 @@ def claim_auto_redeem(state: dict, now: float, cfg: dict) -> tuple[bool, str]:
         return False, "no banked credits"
     history = state.get("auto_reset") or {}
     # Every entry counts against the cap: bare floats (settled successes) AND dicts
-    # (in-flight reservations from claim_auto_redeem).
+    # (in-flight reservations from claim_auto_redeem). Dict reservations age out on the
+    # same trailing window: a claim older than 7d cannot still be in flight (the redeem
+    # call settles in seconds), so a crash between claim and settle must not strand the
+    # feature — the reservation silently expires and the next eligible claim proceeds.
+    def _entry_age(r):
+        # in-flight reservation dict -> its claim time; settled success float -> itself.
+        # Unparseable entries age out immediately (0.0 = ancient).
+        t = r.get("at") if isinstance(r, dict) else r
+        return t if _num(t) else 0.0
+
     redeems = [r for r in history.get("redeems") or []
-               if isinstance(r, dict) or (_num(r) and r >= now - 7 * 24 * 3600)]
+               if _entry_age(r) >= now - 7 * 24 * 3600]
     if len(redeems) >= int(cfg.get("auto_reset_max_redeems_per_week", 1)):
         return False, f"weekly redeem cap reached ({len(redeems)} in trailing 7d)"
     reason = f"Weekly at {weekly.get('used', 0):.0f}% (>= {threshold:.0f}%), {banked} banked"
@@ -985,20 +994,19 @@ def settle_auto_redeem(state: dict, now: float, reason: str, outcome: str) -> No
     """
     ar = state.setdefault("auto_reset", {})
     ar["last"] = {"at": now, "reason": reason, "outcome": outcome}
-    if outcome == "reset":
-        # settled: the reservation becomes a plain success stamp (fresh state; the redeem
-        # just succeeded, so nothing older than stale_after_s is relevant to keep)
-        ar["redeems"] = [now]
-    else:
-        # roll back ONE placeholder reservation (this attempt's); settled successes and any
-        # other in-flight claims stay. Claims are interchangeable — matching by reason string
-        # would fail when two concurrent claims render the same reason.
-        redeems = list(ar.get("redeems") or [])
-        for i, r in enumerate(redeems):
-            if isinstance(r, dict):
-                del redeems[i]
-                break
-        ar["redeems"] = redeems
+    # Claims are interchangeable — matching by reason string would fail when two concurrent
+    # claims render the same reason. Settle touches exactly ONE reservation (this attempt's,
+    # i.e. the first placeholder dict); all other entries (settled successes + sibling
+    # in-flight claims) are preserved untouched.
+    redeems = list(ar.get("redeems") or [])
+    for i, r in enumerate(redeems):
+        if isinstance(r, dict):
+            if outcome == "reset":
+                redeems[i] = now  # this attempt's reservation -> plain success stamp
+            else:
+                del redeems[i]    # roll back: a refused/failed attempt must not burn the cap
+            break
+    ar["redeems"] = redeems
     verb = "auto-redeemed" if outcome == "reset" else f"auto-redeem not done ({outcome})"
     # ⚠️ prefix: queue() evicts plain "quota-router:" lines first under PENDING_CAP, and a
     # redemption (or a refused attempt) is exactly the event the user must not lose.

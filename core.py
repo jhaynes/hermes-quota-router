@@ -1374,17 +1374,22 @@ def _throttle_windows(state: dict, now: float, cfg: dict, provider: str) -> tupl
 
 def throttle_policy(level: str, since: float, windows: list, now: float, t: dict
                     ) -> tuple[str, Optional[str], Optional[str]]:
-    """Pure fresh-data policy: ``(level, rule, window_label)``. Rules a/b/c escalate unless the
-    window resets within ``ignore_reset_within_s``; leaving needs every window's short-rate
-    projection ≤ ``leave_projected`` (an unknown forecast counts as satisfied) and used <
-    ``leave_used``, after ``min_dwell_s``."""
+    """Pure fresh-data policy: ``(level, rule, window_label)``. Rule a requires both long- and
+    short-rate projections ≥ ``enter_projected``. Rules a/b/c cannot escalate a window resetting
+    within ``ignore_reset_within_s``; leaving needs every window's short-rate projection ≤
+    ``leave_projected`` (an unknown forecast counts as satisfied) and used < ``leave_used``,
+    after ``min_dwell_s``."""
     if level != "constrained":
         for w in windows:
             if w.get("resets_at") and w["resets_at"] - now < t["ignore_reset_within_s"]:
                 continue
             f = w.get("forecast") or {}
             ok = f.get("status") == "ok"
-            if ok and f["projected_at_reset"] >= t["enter_projected"]:
+            # A high cycle-average projection can outlast a burst after recent burn subsides.
+            # Require recent-rate confirmation too; otherwise short-rate recovery immediately
+            # re-enters on the old long projection, producing enter/dwell/leave oscillation.
+            if ok and f["projected_at_reset"] >= t["enter_projected"] \
+                    and f["projected_short"] >= t["enter_projected"]:
                 return "constrained", "a", w["label"]
             if w["used"] >= t["enter_used"]:
                 return "constrained", "b", w["label"]

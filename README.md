@@ -72,7 +72,7 @@ For each window in `forecast_windows` (default: Anthropic `Current session` as `
 
 - `rate_pct_h` (`r_long`): `session` uses the least-squares slope over the whole current cycle; `weekly` uses the cycle average (used ÷ elapsed cycle time), so quiet nights count.
 - `r_short`: least-squares slope over the last 30 minutes (`session`) or 6 hours (`weekly`).
-- `projected_at_reset = used + max(r_long, 0) × hours_to_reset`, clamped to [used, 200]; `projected_short` is the same with `r_short`. `accel = r_short − r_long`. `confidence` is the number of points.
+- `projected_at_reset = used + max(r_long, 0) × hours_to_reset`, clamped to [used, 200]; `projected_short` is the same with `r_short`, extrapolated no further than `forecast_short_horizon_s` (24 h) ahead — a recent burst decays within hours, so an old burn must not claim the whole remaining tail of a long window (e.g. a 6 h trend across 143 weekly hours would otherwise pin the router until the burn aged out of the lookback). `accel = r_short − r_long`. `confidence` is the number of points.
 - `status: "unknown"` (with a `reason`) when there is no reset time, fewer than 4 points, a span under 40 minutes, or `used` under 20%.
 
 Scoped (model) windows get `forecast: null`. The forecast doesn't change tiers or mode.
@@ -87,6 +87,7 @@ Per gate provider, over that provider's forecast windows:
 
 - **Enter `constrained`** on any window: (a) **both** `projected_at_reset` and `projected_short` are `≥ enter_projected` (95); (b) `used ≥ enter_used` (85); (c) `r_long > 0`, `r_short ≥ 1.5 × r_long` and `projected_at_reset ≥ early_projected` (85). A window resetting within `ignore_reset_within_s` (30 min) can't escalate.
 - Rule (a) requires recent-rate confirmation of the long trend: after an early-week burst subsides, the cycle-average forecast can remain high while the short projection permits recovery. Using the long projection alone would repeatedly re-enter immediately after leaving. Forecast values remain unchanged; this correction applies to both ladder and legacy configurations.
+- `projected_short` is horizon-capped (`forecast_short_horizon_s`, 24 h): the short lookback (30 min / 6 h) measures a burst, and extrapolating that burst across a multi-day tail made one quiet morning pin the router on `internal` for the rest of the week. With the cap the policy tracks the sawtooth: ride the fast level while the window is fresh, enter `constrained` as used genuinely climbs toward the thresholds (rule b on raw `used` is unaffected). Session windows (5 h) have tails shorter than the cap and are unchanged.
 - **Leave** (back to `ok`) when every window has `projected_short ≤ leave_projected` (80; an unknown forecast counts as satisfied) and `used < leave_used` (75), after `min_dwell_s` (30 min) in `constrained`.
 - **Stale data** (snapshot older than `stale_after_s`): hold the state. Older than `stale_hold_s` (60 min): `constrained` if any last-known window was at or above `leave_used` (one `stale usage data` alert per incident), otherwise `ok`.
 - An observed hard block on that provider makes it `constrained` until the block ends.

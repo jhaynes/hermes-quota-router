@@ -88,3 +88,33 @@ def test_steady_burn_waits_until_used_climbs_then_rides_the_sawtooth():
     f2 = dict(f, used=86.0)
     lvl, rule, _ = core.throttle_policy("fast", 0.0, [weekly_window(f2)], NOW, t)
     assert (lvl, rule) == ("constrained", "b")   # heavy usage still constrains immediately
+
+
+@pytest.mark.parametrize("current, expected_rule", [("fast", None), ("constrained", "leave")])
+def test_exact_retained_weekly_samples_do_not_pin_throttle(current, expected_rule):
+    """Real retained incident samples projected 122.25% on the parent and blocked
+    both staying fast and recovery; replay unchanged numbers at their stored clock.
+    This pins actual observations, not the synthetic incident shape above.
+    """
+    import json
+    fixture = json.loads((Path(__file__).parent / "fixtures" / "sawtooth_weekly_20261004.json").read_text())
+    f = core.forecast(fixture["points"], fixture["now"], WEEKLY, CFG)
+    assert f["status"] == "ok"
+    assert f["used"] == 26.0
+    assert f["r_short"] == pytest.approx(0.6712217047634567)
+    assert f["projected_short"] == pytest.approx(42.10932091432296)
+    assert f["projected_at_reset"] == pytest.approx(177.55347140512418)
+    level, rule, _ = core.throttle_policy(current, 0.0, [weekly_window(f)], fixture["now"], core.throttle_config({}))
+    assert (level, rule) == ("fast", expected_rule)
+
+
+@pytest.mark.parametrize("horizon_h", [0, 6, 24, 200])
+def test_configured_horizon_limits_only_short_projection(horizon_h):
+    """Custom horizons and zero are supported; a horizon beyond reset must not
+    overshoot it, while the cycle-average projection must remain uncapped.
+    """
+    cfg = dict(CFG, forecast_short_horizon_s=horizon_h * H)
+    f = core.forecast(live_shaped_history(), NOW, WEEKLY, cfg)
+    hours = min(horizon_h, 143.5)
+    assert f["projected_short"] == pytest.approx(min(f["used"] + max(f["r_short"], 0) * hours, 200))
+    assert f["projected_at_reset"] == pytest.approx(min(f["used"] + max(f["rate_pct_h"], 0) * 143.5, 200))

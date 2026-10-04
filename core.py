@@ -359,8 +359,9 @@ def forecast(points: Any, now: float, kind: dict, cfg: dict) -> dict:
 
     ``r_long``: least squares over the current cycle (``lsq``) or the cycle average
     (``cycle_average``: used ÷ elapsed cycle time). ``r_short``: least squares over the last
-    ``short_lookback_s``. ``projected_at_reset = used + max(r_long, 0) × hours_to_reset`` (and
-    ``projected_short`` with ``r_short``), clamped to [used, 200]. ``accel = r_short − r_long``.
+    ``short_lookback_s``. ``projected_at_reset = used + max(r_long, 0) × hours_to_reset``.
+    ``projected_short`` uses ``r_short`` over min(hours_to_reset, forecast_short_horizon_s / 3600),
+    clamped to [used, 200]. ``accel = r_short − r_long``.
     ``unknown`` with a ``reason`` when there is no reset time, fewer than ``forecast_min_points``
     points, a span under ``forecast_min_span_s`` or ``used`` under ``forecast_min_used``.
     """

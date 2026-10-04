@@ -172,6 +172,36 @@ def test_no_oscillation_under_jitter():
     assert sum(1 for a, b in zip(levels, levels[1:]) if a != b) == 1 and levels[-1] == "constrained"
 
 
+def test_rule_a_needs_the_short_rate_to_confirm_a_long_projection():
+    """An early weekly burst can keep the cycle-average projection high after recent burn subsides.
+    A high long projection with a low short projection must not re-enter after a leave, or the
+    policy limit-cycles enter → dwell → leave → enter."""
+    st = core.empty_state()
+    feed(st, NOW, 86)
+    assert step(st, NOW)["level"] == "constrained"
+    feed(st, NOW + 31 * M, 70)                    # burn stopped: rule leave
+    t = step(st, NOW + 31 * M)
+    assert t["level"] == "fast" and t["rule"] == "leave"
+    # identical later snapshot: long projection still ~196 (early in a weekly cycle), short ~23
+    t = tcfg()
+    win = {"label": "Current week", "used": 24.0, "resets_at": WEEK_RESET,
+           "forecast": {"status": "ok", "projected_at_reset": 196.0, "projected_short": 23.0,
+                        "rate_pct_h": 1.2, "r_short": 0.0}}
+    levels_seen = []
+    level, since = "fast", NOW + 31 * M           # where the leave above left the provider
+    for i in range(6):                            # several dwell periods: no new usage either way
+        now = NOW + 62 * M + i * 10 * M
+        new, rule, _label = core.throttle_policy(level, since, [win], now, t)
+        levels_seen.append(new)
+        if new != level:
+            level, since = new, now
+    assert levels_seen == ["fast"] * 6            # stays fast: 0 flips on an unchanged snapshot
+    # a genuine steady burn keeps the short projection high and still escalates
+    win["forecast"]["projected_short"] = 197.0
+    new, rule, _label = core.throttle_policy("fast", 0.0, [win], NOW, t)
+    assert (new, rule) == ("constrained", "a")
+
+
 def test_stale_data_holds_then_escalates_when_last_known_usage_was_high():
     st = core.empty_state()
     feed(st, NOW, 78)

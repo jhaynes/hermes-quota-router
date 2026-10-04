@@ -48,6 +48,9 @@ DEFAULTS = {
         # long rate: cycle average (used / elapsed cycle time) so quiet nights count
         "weekly": {"period_s": 7 * 24 * 3600, "short_lookback_s": 6 * 3600, "long_rate": "cycle_average"},
     },
+    # The short-rate projection extrapolates r_short no further than this many seconds
+    # ahead (a recent burst decays within hours or days, not across a whole weekly tail).
+    "forecast_short_horizon_s": 24 * 3600,
     "forecast_min_points": 4,
     "forecast_min_span_s": 40 * 60,
     "forecast_min_used": 20.0,
@@ -356,8 +359,9 @@ def forecast(points: Any, now: float, kind: dict, cfg: dict) -> dict:
 
     ``r_long``: least squares over the current cycle (``lsq``) or the cycle average
     (``cycle_average``: used ÷ elapsed cycle time). ``r_short``: least squares over the last
-    ``short_lookback_s``. ``projected_at_reset = used + max(r_long, 0) × hours_to_reset`` (and
-    ``projected_short`` with ``r_short``), clamped to [used, 200]. ``accel = r_short − r_long``.
+    ``short_lookback_s``. ``projected_at_reset = used + max(r_long, 0) × hours_to_reset``.
+    ``projected_short`` uses ``r_short`` over min(hours_to_reset, forecast_short_horizon_s / 3600),
+    clamped to [used, 200]. ``accel = r_short − r_long``.
     ``unknown`` with a ``reason`` when there is no reset time, fewer than ``forecast_min_points``
     points, a span under ``forecast_min_span_s`` or ``used`` under ``forecast_min_used``.
     """
@@ -389,12 +393,16 @@ def forecast(points: Any, now: float, kind: dict, cfg: dict) -> dict:
     r_short = _slope_per_h(recent) if len(recent) >= 3 else None
     r_short = r_long if r_short is None else r_short
     hours = max(resets_at - now, 0.0) / 3600.0
+    # A short-lookback trend is a burst, not a cycle-long rate: extrapolate it no further
+    # than ``forecast_short_horizon_s`` so an old burst cannot claim the whole remaining
+    # tail of a long window (e.g. a 6h trend across 143 weekly hours pinned the router).
+    short_hours = min(hours, cfg["forecast_short_horizon_s"] / 3600.0)
 
-    def project(rate: float) -> float:
-        return min(max(used + max(rate, 0.0) * hours, used), 200.0)
+    def project(rate: float, h: float) -> float:
+        return min(max(used + max(rate, 0.0) * h, used), 200.0)
 
     return {"status": "ok", **base, "rate_pct_h": r_long, "r_short": r_short, "accel": r_short - r_long,
-            "projected_at_reset": project(r_long), "projected_short": project(r_short)}
+            "projected_at_reset": project(r_long, hours), "projected_short": project(r_short, short_hours)}
 
 
 def forecast_state(state: dict, now: float, cfg: dict) -> dict:
@@ -1374,17 +1382,22 @@ def _throttle_windows(state: dict, now: float, cfg: dict, provider: str) -> tupl
 
 def throttle_policy(level: str, since: float, windows: list, now: float, t: dict
                     ) -> tuple[str, Optional[str], Optional[str]]:
-    """Pure fresh-data policy: ``(level, rule, window_label)``. Rules a/b/c escalate unless the
-    window resets within ``ignore_reset_within_s``; leaving needs every window's short-rate
-    projection ≤ ``leave_projected`` (an unknown forecast counts as satisfied) and used <
-    ``leave_used``, after ``min_dwell_s``."""
+    """Pure fresh-data policy: ``(level, rule, window_label)``. Rule a requires both long- and
+    short-rate projections ≥ ``enter_projected``. Rules a/b/c cannot escalate a window resetting
+    within ``ignore_reset_within_s``; leaving needs every window's short-rate projection ≤
+    ``leave_projected`` (an unknown forecast counts as satisfied) and used < ``leave_used``,
+    after ``min_dwell_s``."""
     if level != "constrained":
         for w in windows:
             if w.get("resets_at") and w["resets_at"] - now < t["ignore_reset_within_s"]:
                 continue
             f = w.get("forecast") or {}
             ok = f.get("status") == "ok"
-            if ok and f["projected_at_reset"] >= t["enter_projected"]:
+            # A high cycle-average projection can outlast a burst after recent burn subsides.
+            # Require recent-rate confirmation too; otherwise short-rate recovery immediately
+            # re-enters on the old long projection, producing enter/dwell/leave oscillation.
+            if ok and f["projected_at_reset"] >= t["enter_projected"] \
+                    and f["projected_short"] >= t["enter_projected"]:
                 return "constrained", "a", w["label"]
             if w["used"] >= t["enter_used"]:
                 return "constrained", "b", w["label"]

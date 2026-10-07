@@ -412,6 +412,8 @@ def render_throttle_status(s: dict) -> str:
             proj = "unknown" if w.get("projected") is None else (
                 f"{w['projected']:.0f}% (short {w['projected_short']:.0f}%), "
                 f"r_long {w['r_long']:.1f}%/h r_short {w['r_short']:.1f}%/h")
+            if w.get("projection_allowance"):
+                proj += f"; banked weekly allowance +{w['projection_allowance']:.0f}%"
             out.append(f"{indent}{label:<16} {w['used']:5.1f}%  → {proj}")
 
     gates = [p for r in s.get("ladder") or [] for p in r["gate"]]

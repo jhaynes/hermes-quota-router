@@ -8,14 +8,14 @@ import register from '../quota.mjs'
 
 const theme = { color: { text: 'text', muted: 'muted', error: 'error', warning: 'warning' } }
 
-function setup(snapshot, arg = '', { profileHome = false } = {}) {
+function setup(snapshot, arg = '', { profileHome = false, homeSuffix = '' } = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'quota-widget-'))
   // A profile session gets HERMES_HOME=<root>/profiles/<name>; the shared state
   // cache deliberately stays at the root home (core.state_path uses root_home).
   const home = profileHome ? path.join(root, 'profiles', 'worker-a') : root
   fs.mkdirSync(home, { recursive: true })
   const oldHome = process.env.HERMES_HOME
-  process.env.HERMES_HOME = home
+  process.env.HERMES_HOME = `${home}${homeSuffix}`
   if (snapshot) {
     const dir = path.join(root, 'cache/quota-router')
     fs.mkdirSync(dir, { recursive: true })
@@ -99,6 +99,16 @@ test('profile sessions read the shared root-home cache, not a per-profile home',
   try { assert.match(text(fixture.render()), /Weekly [█░]+ 27%/) }
   finally { fixture.cleanup() }
 })
+
+for (const homeSuffix of ['/', '/.']) {
+  test(`profile-home normalization handles suffix ${JSON.stringify(homeSuffix)}`, () => {
+    // core.root_home uses pathlib, which removes trailing separators/dot components.
+    // Raw string splitting diverged and silently looked under the profile cache.
+    const fixture = setup(state(), '', { profileHome: true, homeSuffix })
+    try { assert.match(text(fixture.render()), /Weekly [█░]+ 27%/) }
+    finally { fixture.cleanup() }
+  })
+}
 
 test('missing cache reports unavailable instead of inventing usage', () => {
   // Empty-state compatibility matters while startup refresh has not created the shared cache.

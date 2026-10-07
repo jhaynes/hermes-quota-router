@@ -9,6 +9,7 @@
 // always-on contract for ambient widgets (re-docks on /widgets-reload).
 import { readFileSync } from 'node:fs'
 import { homedir } from 'node:os'
+import { basename, dirname, normalize } from 'node:path'
 
 export default function register(sdk) {
   const { Box, Dialog, React, Text, defineWidgetApp, h, gauge, openWidget } = sdk
@@ -18,11 +19,10 @@ export default function register(sdk) {
   // quota cache deliberately lives at the root home (core.state_path → core.
   // root_home). Normalize a profile home back to its root so profile sessions
   // read the same cache as the root session.
-  const parts = HERMES_HOME.split('/')
-  const isProfileHome = parts.at(-2) === 'profiles'
-  const ROOT_HOME = isProfileHome
-    ? parts.slice(0, -2).join('/')
-    : HERMES_HOME
+  const homePath = normalize(HERMES_HOME)
+  const ROOT_HOME = basename(dirname(homePath)) === 'profiles'
+    ? dirname(dirname(homePath))
+    : homePath
   const STATE = `${ROOT_HOME}/cache/quota-router/state.json`
 
   // ESM imports are ready before registration, so the first render has cached data.

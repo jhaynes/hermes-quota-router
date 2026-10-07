@@ -4,6 +4,7 @@ Host-level quota awareness for `anthropic` and `openai-codex`.
 
 - **Observed blocks:** `api_request_error` records a hard quota error, and the next successful request from that provider clears it (`post_api_request`).
 - **Usage tiers:** `/usage` snapshots are sorted into ok, tight or exhausted, with hysteresis. Thresholds are 85/75 for tight and 97/90 for exhausted, with a 15-minute dwell. A window that resets within 30 minutes can't escalate a tier.
+- **Window scope:** account-wide windows use Hermes's explicit `scope: "account"`, or a null/empty scope in older cached data. Only those windows feed account tiers, block expiry, history/forecasts, throttle policy and banked-reset eligibility. `scope: "model"`, model-name scopes and unknown scopes are display/alert only; the wire scope is preserved in state and JSON status.
 - **Mode:** normal, shift (one provider constrained) or internal (both constrained).
 - **Alerts:** at 75% and 90%, once per window per reset cycle.
 - **Alert queue:** only `hermes quota-router refresh` (the cron path) **drains** and delivers pending alert/transition lines. A manual refresh (`/quota refresh`, `hermes quota-router status --refresh`) folds fresh usage in and enqueues any new lines, but leaves the queue for the next cron run to deliver — it no longer swallows them. Delivery is **at-most-once**: drained lines are removed from state immediately, so if the cron script's delivery step then fails, those lines are lost, not retried.
@@ -12,7 +13,7 @@ Host-level quota awareness for `anthropic` and `openai-codex`.
 
 State lives at `<root HERMES_HOME>/cache/quota-router/state.json` and is shared by every profile on the host.
 
-- **Usage history:** every refresh appends `[fetched_at, used_pct, resets_at]` per core (non-scoped) window to `history[provider][label]`. Earlier reset cycles are kept (a `resets_at` move of more than 10 minutes, or null ↔ value, starts a new cycle); points are pruned by age (7 days) and count (2,500 per window). Malformed history is dropped, never fatal.
+- **Usage history:** every refresh appends `[fetched_at, used_pct, resets_at]` per account-wide window to `history[provider][label]`. Earlier reset cycles are kept (a `resets_at` move of more than 10 minutes, or null ↔ value, starts a new cycle); points are pruned by age (7 days) and count (2,500 per window). Malformed history is dropped, never fatal.
 - **Fetch-outcome ring:** every core fetch appends `[t, provider, outcome]` (`ok`, `fetch_error`, `unavailable`, `no_data`) to `fetch_log`, capped at 24 h / 1,000 entries.
 - Both keys are additive under `version: 1`; older plugin versions ignore them.
 
@@ -24,7 +25,7 @@ Every `refresh()` records each provider's fetch outcome per slot (`core`: the st
 
 Anthropic's `/api/oauth/usage` response includes a `limits[]` list with per-model weekly caps (`kind: "weekly_scoped"`, e.g. a "Fable" window). Core (`agent/account_usage.py`) does not surface these, so the plugin makes its own GET using the same OAuth token and headers core uses, throttled to at most once per 300 seconds per host. This fetch is a **permanent** part of the plugin (there is no plan to upstream it into core).
 
-- **Display and alert only.** A scoped window shows up under a `model limits:` sub-heading in `status` and triggers the normal 75/90% alerts, but it can **never** change a provider's tier, `mode`, or an observed block's expiry. Only Opus/Sonnet weekly windows (reported by core, not this fetch) count toward the anthropic tier, unchanged from before.
+- **Display and alert only.** A model-scoped window shows up under a `model limits:` sub-heading in `status` and triggers the normal 75/90% alerts, but it can **never** change a provider's tier, `mode`, or an observed block's expiry. This also applies to core's `scope: "model"` Opus/Sonnet windows. Only account-wide windows count toward the account tier.
 - **Fail-open with carry-forward.** If the scoped fetch fails or is throttled, the last good scoped windows are kept in state and shown in `status`/`--json` with a `stale` marker, until they are older than `stale_after_s`, at which point they drop from the snapshot.
 - A scoped failure never blocks or delays the core `anthropic` fetch, and is recorded independently under the `scoped` fetch slot (never alerts).
 
@@ -64,7 +65,17 @@ plugins:
 
 `hermes quota-router status --json [--refresh]` prints exactly one `QRJSON <payload>` line to stdout (nothing else on stdout; logging goes to stderr) for the desktop widget or any other machine reader. `--refresh --json` fetches fresh data but does **not** drain the pending-alert queue — only `hermes quota-router refresh` (the cron path) does that.
 
-The payload (`v: 1`) has `host`, `now`, `mode`/`mode_since`, and per-provider `tier`, `fetched_at`, `stale`, `plan`, `windows` (each with `affects_tier: bool` — `false` for scoped windows — and `forecast`), `block`, `fetch.core`/`fetch.scoped` outcomes, and `details`; plus top-level `recent_errors` (last 5) and `pending_count`.
+The payload (`v: 1`) has `host`, `now`, `mode`/`mode_since`, and per-provider `tier`, `fetched_at`, `stale`, `plan`, `windows` (each with `affects_tier: bool` — `true` for account-wide windows and `false` for model-scoped windows — and `forecast`), `block`, `fetch.core`/`fetch.scoped` outcomes, and `details`; plus top-level `recent_errors` (last 5) and `pending_count`.
+
+## TUI widget
+
+`tui/quota.mjs` is the ambient `/quota [provider]` widget. Install it at
+`$HERMES_HOME/tui-widgets/quota.mjs` (default `~/.hermes/tui-widgets/quota.mjs`).
+The TUI hot-loads it and docks it above the status bar. It reads the existing shared
+quota-router cache immediately and every 60 seconds, without network calls, displaying
+account-wide usage bars, percentages, reset countdowns and snapshot age. Model-only
+caps remain available in the detailed plugin status but do not enter the ambient account bars.
+Run `node --test tui/tests/quota.test.mjs` for the widget's on-disk regression fixtures.
 
 ## Forecast
 

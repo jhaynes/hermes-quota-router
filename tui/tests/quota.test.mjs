@@ -8,12 +8,16 @@ import register from '../quota.mjs'
 
 const theme = { color: { text: 'text', muted: 'muted', error: 'error', warning: 'warning' } }
 
-function setup(snapshot, arg = '') {
-  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'quota-widget-'))
+function setup(snapshot, arg = '', { profileHome = false } = {}) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'quota-widget-'))
+  // A profile session gets HERMES_HOME=<root>/profiles/<name>; the shared state
+  // cache deliberately stays at the root home (core.state_path uses root_home).
+  const home = profileHome ? path.join(root, 'profiles', 'worker-a') : root
+  fs.mkdirSync(home, { recursive: true })
   const oldHome = process.env.HERMES_HOME
   process.env.HERMES_HOME = home
   if (snapshot) {
-    const dir = path.join(home, 'cache/quota-router')
+    const dir = path.join(root, 'cache/quota-router')
     fs.mkdirSync(dir, { recursive: true })
     fs.writeFileSync(path.join(dir, 'state.json'), JSON.stringify(snapshot))
   }
@@ -33,7 +37,7 @@ function setup(snapshot, arg = '') {
     cleanup: () => {
       if (oldHome == null) delete process.env.HERMES_HOME
       else process.env.HERMES_HOME = oldHome
-      fs.rmSync(home, { recursive: true, force: true })
+      fs.rmSync(root, { recursive: true, force: true })
     },
   }
 }
@@ -84,6 +88,14 @@ test('legacy scopes and provider filtering remain compatible', async () => {
 test('first render reads existing cached state without a 60-second blank period', () => {
   // Async fs initialization previously left the real React useState initializer null until polling.
   const fixture = setup(state(null))
+  try { assert.match(text(fixture.render()), /Weekly [█░]+ 27%/) }
+  finally { fixture.cleanup() }
+})
+
+test('profile sessions read the shared root-home cache, not a per-profile home', () => {
+  // Regression: STATE built from a profile HERMES_HOME (<root>/profiles/<name>)
+  // never found the shared root cache and rendered 'state unavailable' forever.
+  const fixture = setup(state(), '', { profileHome: true })
   try { assert.match(text(fixture.render()), /Weekly [█░]+ 27%/) }
   finally { fixture.cleanup() }
 })

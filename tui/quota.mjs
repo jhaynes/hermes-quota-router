@@ -14,7 +14,16 @@ export default function register(sdk) {
   const { Box, Dialog, React, Text, defineWidgetApp, h, gauge, openWidget } = sdk
 
   const HERMES_HOME = process.env.HERMES_HOME?.trim() || `${homedir()}/.hermes`
-  const STATE = `${HERMES_HOME}/cache/quota-router/state.json`
+  // A profile session gets HERMES_HOME=<root>/profiles/<name>, but the shared
+  // quota cache deliberately lives at the root home (core.state_path → core.
+  // root_home). Normalize a profile home back to its root so profile sessions
+  // read the same cache as the root session.
+  const parts = HERMES_HOME.split('/')
+  const isProfileHome = parts.at(-2) === 'profiles'
+  const ROOT_HOME = isProfileHome
+    ? parts.slice(0, -2).join('/')
+    : HERMES_HOME
+  const STATE = `${ROOT_HOME}/cache/quota-router/state.json`
 
   // ESM imports are ready before registration, so the first render has cached data.
   function loadState() {

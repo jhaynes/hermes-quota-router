@@ -210,12 +210,21 @@ def normalize_snapshot(snapshot: Any, now: float) -> dict:
 
 # ── policy ─────────────────────────────────────────────────────────────────────
 
+def is_account_window(window: dict) -> bool:
+    """Account-wide quota, including persisted legacy windows without an explicit scope.
+
+    Hermes labels account windows ``account`` and model windows ``model``; the plugin's
+    additional model limits use their display names. Unknown scopes never gate an account.
+    """
+    return window.get("scope") in (None, "", "account")
+
+
 def percent_tier(windows: Iterable[dict], current: str, now: float, cfg: dict) -> str:
     """Tier implied by usage percentages alone, with enter/leave hysteresis per level.
 
-    Model-scoped windows (``scope`` set) are display+alert only and never feed the tier.
+    Model-scoped windows are display+alert only and never feed the account tier.
     """
-    windows = [w for w in windows if not w.get("scope")]
+    windows = [w for w in windows if is_account_window(w)]
     escalating = [w for w in windows
                   if not (w.get("resets_at") and w["resets_at"] - now < cfg["ignore_reset_within_s"])]
     all_windows = list(windows)
@@ -263,7 +272,7 @@ def block_until(windows: list, observed_at: float, cfg: dict) -> float:
 
     Model-scoped windows are excluded: a scoped 100% window must not set the wrong block expiry.
     """
-    windows = [w for w in windows if not w.get("scope")]
+    windows = [w for w in windows if is_account_window(w)]
     future = [w for w in windows if w.get("resets_at") and w["resets_at"] > observed_at]
     if future:
         top = max(future, key=lambda w: w["used"])
@@ -303,7 +312,7 @@ def _valid_point(p: Any) -> bool:
 
 
 def append_history(state: dict, provider: str, snap: dict, now: float) -> None:
-    """Append ``[fetched_at, used, resets_at]`` per core (unscoped, non-stale) window of a normalized
+    """Append ``[fetched_at, used, resets_at]`` per account-wide, non-stale window of a normalized
     snapshot to ``state['history'][provider][label]``. A snapshot no newer than the last point is
     ignored (manual status refreshes re-fold the same data). Points from earlier reset cycles are
     kept; pruning is by age (``HISTORY_MAX_AGE_S``) and count (``HISTORY_MAX_POINTS``) only.
@@ -315,7 +324,7 @@ def append_history(state: dict, provider: str, snap: dict, now: float) -> None:
         per = state["history"][provider] = {}
     t = float(snap.get("fetched_at") or now)
     for w in snap.get("windows") or []:
-        if w.get("scope") or w.get("stale"):
+        if not is_account_window(w) or w.get("stale"):
             continue
         pts = per.get(w["label"])
         pts = [p for p in pts if _valid_point(p)] if isinstance(pts, list) else []
@@ -546,10 +555,10 @@ def parse_scoped_limits(payload: Any) -> list[dict]:
 
     Only ``kind == "weekly_scoped"`` entries with a non-empty ``scope.model.display_name`` are
     kept. Entries named ``opus``/``sonnet`` (case-insensitive) are skipped: core already reports
-    those and they feed the tier. ``percent`` must be a real, finite, non-bool number; it is
+    those as model windows. ``percent`` must be a real, finite, non-bool number; it is
     clamped to 0..100 rather than rejected out of range. Duplicate names keep the highest percent.
     ``resets_at`` is normalized to an epoch float (or ``None``). Returned dicts never change the
-    tier: readers must filter on ``scope`` themselves (``percent_tier``, ``block_until``).
+    tier: readers must use ``is_account_window`` (``percent_tier``, ``block_until``).
     """
     if not isinstance(payload, dict):
         return []
@@ -822,9 +831,9 @@ def status_payload(state: dict, now: float, cfg: dict, host: str) -> dict:
         scoped_fetch = fetch.get("scoped") or {}
         pf = forecasts.get(p) or {}
         windows = [{"label": w["label"], "used": w["used"], "resets_at": w.get("resets_at"),
-                   "scope": w.get("scope"), "affects_tier": not w.get("scope"),
+                   "scope": w.get("scope"), "affects_tier": is_account_window(w),
                    "stale": bool(w.get("stale")),
-                   "forecast": None if w.get("scope") else pf.get(w["label"])}
+                   "forecast": pf.get(w["label"]) if is_account_window(w) else None}
                   for w in (snap.get("windows") or [])]
         block = state["blocks"].get(p)
         block_out = {"until": block["until"], "message": block.get("message", "")[:200]} \
@@ -954,7 +963,7 @@ def claim_auto_redeem(state: dict, now: float, cfg: dict) -> tuple[bool, str]:
     windows_in = snap.get("windows")
     if not isinstance(windows_in, list):
         return False, "invalid snapshot windows"
-    windows = [w for w in windows_in if isinstance(w, dict) and not w.get("scope")]
+    windows = [w for w in windows_in if isinstance(w, dict) and is_account_window(w)]
     for w in windows:
         if not isinstance(w.get("label"), str):
             return False, "invalid window label"
@@ -1104,8 +1113,8 @@ def render_status(state: dict, now: float, cfg: dict) -> str:
         stale = is_stale(snap, now, cfg) if snap else True
         out.append(f"{p}: tier={ps.get('tier', 'ok')}"
                    + (f"  snapshot {int(age // 60)}m old{' (STALE — ignored)' if stale else ''}" if age is not None else "  no snapshot"))
-        core_windows = [w for w in (snap.get("windows") or []) if not w.get("scope")]
-        scoped_windows = [w for w in (snap.get("windows") or []) if w.get("scope")]
+        core_windows = [w for w in (snap.get("windows") or []) if is_account_window(w)]
+        scoped_windows = [w for w in (snap.get("windows") or []) if not is_account_window(w)]
         for w in core_windows:
             reset = datetime.fromtimestamp(w["resets_at"]).strftime("%a %H:%M") if w.get("resets_at") else "?"
             out.append(f"    {w['label']:<16} {w['used']:5.1f}%  resets {reset}"
@@ -1417,7 +1426,7 @@ def _throttle_windows(state: dict, now: float, cfg: dict, provider: str) -> tupl
     labels = (cfg.get("forecast_windows") or {}).get(provider) or {}
     fc = forecast_state(state, now, cfg).get(provider) or {}
     wins = [dict(w, forecast=fc.get(w["label"])) for w in snap.get("windows") or []
-            if w["label"] in labels and not w.get("scope")]
+            if w["label"] in labels and is_account_window(w)]
     return wins, (float(snap["fetched_at"]) if snap.get("fetched_at") else None)
 
 

@@ -397,6 +397,19 @@ def test_status_reports_level_profiles_and_leak_count(env):
     assert "constrained" in text and "worker" in text and "leak" in text
 
 
+@pytest.mark.parametrize("allowance", [0, 100])
+def test_status_explains_admitted_banked_weekly_allowance(env, allowance):
+    status = {"configured": True, "enabled": True, "level": "fast", "since": NOW,
+              "source": "policy", "profiles": {}, "last": {"windows": {"Weekly": {
+                  "used": 31.0, "projected": 200.0, "projected_short": 150.0,
+                  "r_long": 2.0, "r_short": 5.0,
+                  **({"projection_allowance": allowance} if allowance else {}),
+              }}}}
+    text = env.thr.render_throttle_status(status)
+    assert ("banked weekly allowance +100%" in text) is bool(allowance)
+    assert "31.0%" in text and "200% (short 150%)" in text
+
+
 def _cli(e, monkeypatch, t, *argv):
     import argparse
     parser = argparse.ArgumentParser()

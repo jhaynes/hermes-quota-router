@@ -945,6 +945,14 @@ def claim_auto_redeem(state: dict, now: float, cfg: dict) -> tuple[bool, str]:
 
     ``reason`` explains the decision either way (for the alert line / tests).
     """
+    return _auto_redeem(state, now, cfg)
+
+
+def _auto_redeem(state: dict, now: float, cfg: dict, *, planning: bool = False) -> tuple[bool, str]:
+    """Shared eligibility checks. Planning skips the actual exhaustion gate and NEVER
+    reserves a slot; claim_auto_redeem always uses the exhaustion gate and reservation.
+    Planning is stricter about missing/future/stale data because it promises future capacity.
+    """
     acfg = cfg.get("auto_reset")
     if not isinstance(acfg, dict):
         return False, "auto_reset not configured"
@@ -960,6 +968,9 @@ def claim_auto_redeem(state: dict, now: float, cfg: dict) -> tuple[bool, str]:
         return False, "invalid snapshot fetched_at"
     if now - fetched_at > cfg["stale_after_s"]:
         return False, "snapshot stale"
+    if planning and (not _num(snap.get("fetched_at")) or fetched_at > now
+                     or fetched_at in (float("inf"), float("-inf"))):
+        return False, "invalid snapshot fetched_at for planning"
     windows_in = snap.get("windows")
     if not isinstance(windows_in, list):
         return False, "invalid snapshot windows"
@@ -971,6 +982,11 @@ def claim_auto_redeem(state: dict, now: float, cfg: dict) -> tuple[bool, str]:
     weekly = by_label.get("Weekly")
     if weekly is None:
         return False, "no Weekly window in snapshot"
+    if planning:
+        reset = weekly.get("resets_at")
+        if (weekly.get("stale") or reset is None or not _num(reset)
+                or reset in (float("inf"), float("-inf")) or reset <= now):
+            return False, "no usable Weekly reset for planning"
     session = by_label.get("Session")
     # Guard BOTH window reads against provider NaN/garbage: float(nan) is truthy, and
     # nan < threshold is False, so an unguarded `used or 0.0` lets NaN sail through the
@@ -1000,7 +1016,9 @@ def claim_auto_redeem(state: dict, now: float, cfg: dict) -> tuple[bool, str]:
         max_redeems = int(cfg.get("auto_reset_max_redeems_per_week", 1))
     except (TypeError, ValueError, OverflowError):
         return False, "invalid auto_reset_max_redeems_per_week config"
-    if float(weekly.get("used") or 0.0) < threshold:
+    if planning and not 0 < threshold <= 100:
+        return False, "unreachable auto_reset.weekly_threshold for planning"
+    if not planning and float(weekly.get("used") or 0.0) < threshold:
         return False, f"Weekly {weekly.get('used', 0):.0f}% < {threshold:.0f}%"
     details_in = snap.get("details") or []
     if not isinstance(details_in, list) or not all(isinstance(d, str) for d in details_in):
@@ -1033,6 +1051,8 @@ def claim_auto_redeem(state: dict, now: float, cfg: dict) -> tuple[bool, str]:
     if len(redeems) >= max_redeems:
         return False, f"weekly redeem cap reached ({len(redeems)} in trailing 7d)"
     reason = f"Weekly at {weekly.get('used', 0):.0f}% (>= {threshold:.0f}%), {banked} banked"
+    if planning:
+        return True, f"one future Weekly refill available ({banked} banked)"
     # Reserve the slot NOW (placeholder dict, distinct from the bare-float successes), so a
     # concurrent refresh's claim sees it and stays under the cap.
     ar = state.setdefault("auto_reset", {})
@@ -1427,6 +1447,11 @@ def _throttle_windows(state: dict, now: float, cfg: dict, provider: str) -> tupl
     fc = forecast_state(state, now, cfg).get(provider) or {}
     wins = [dict(w, forecast=fc.get(w["label"])) for w in snap.get("windows") or []
             if w["label"] in labels and is_account_window(w)]
+    if provider == "openai-codex" and _auto_redeem(state, now, cfg, planning=True)[0]:
+        for w in wins:
+            if w["label"] == "Weekly":
+                # Forecasts cap at 200%, so credit at most one refill even for a larger bank.
+                w["projection_allowance"] = 100.0
     return wins, (float(snap["fetched_at"]) if snap.get("fetched_at") else None)
 
 
@@ -1443,23 +1468,26 @@ def throttle_policy(level: str, since: float, windows: list, now: float, t: dict
                 continue
             f = w.get("forecast") or {}
             ok = f.get("status") == "ok"
+            allowance = w.get("projection_allowance", 0.0)
             # A high cycle-average projection can outlast a burst after recent burn subsides.
             # Require recent-rate confirmation too; otherwise short-rate recovery immediately
             # re-enters on the old long projection, producing enter/dwell/leave oscillation.
-            if ok and f["projected_at_reset"] >= t["enter_projected"] \
-                    and f["projected_short"] >= t["enter_projected"]:
+            if ok and f["projected_at_reset"] >= t["enter_projected"] + allowance \
+                    and f["projected_short"] >= t["enter_projected"] + allowance:
                 return "constrained", "a", w["label"]
             if w["used"] >= t["enter_used"]:
                 return "constrained", "b", w["label"]
             if (ok and f["rate_pct_h"] > 0 and f["r_short"] >= t["accel_ratio"] * f["rate_pct_h"]
-                    and f["projected_at_reset"] >= t["early_projected"]):
+                    and f["projected_at_reset"] >= t["early_projected"] + allowance
+                    and (not allowance or f["projected_short"] >= t["early_projected"] + allowance)):
                 return "constrained", "c", w["label"]
         return "fast", None, None
     for w in windows:
         f = w.get("forecast") or {}
         if w["used"] >= t["leave_used"]:
             return "constrained", "hold_used", w["label"]
-        if f.get("status") == "ok" and f["projected_short"] > t["leave_projected"]:
+        if (f.get("status") == "ok"
+                and f["projected_short"] > t["leave_projected"] + w.get("projection_allowance", 0.0)):
             return "constrained", "hold_projected", w["label"]
     if now - since < t["min_dwell_s"]:
         return "constrained", "dwell", None
@@ -1603,6 +1631,8 @@ def _window_summary(windows: list) -> dict:
                             "projected_short": f.get("projected_short") if ok else None,
                             "r_long": f.get("rate_pct_h") if ok else None,
                             "r_short": f.get("r_short") if ok else None}
+        if w.get("projection_allowance"):
+            wsum[w["label"]]["projection_allowance"] = w["projection_allowance"]
     return wsum
 
 

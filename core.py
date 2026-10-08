@@ -11,7 +11,9 @@ from __future__ import annotations
 import contextlib
 import fcntl
 import json
+import math
 import os
+import re
 import sqlite3
 import sys
 import time
@@ -311,12 +313,14 @@ def _valid_point(p: Any) -> bool:
             and (p[2] is None or _num(p[2])))
 
 
-def append_history(state: dict, provider: str, snap: dict, now: float) -> None:
+def append_history(state: dict, provider: str, snap: dict, now: float,
+                   models: list[str] | None = None) -> None:
     """Append ``[fetched_at, used, resets_at]`` per account-wide, non-stale window of a normalized
     snapshot to ``state['history'][provider][label]``. A snapshot no newer than the last point is
     ignored (manual status refreshes re-fold the same data). Points from earlier reset cycles are
     kept; pruning is by age (``HISTORY_MAX_AGE_S``) and count (``HISTORY_MAX_POINTS``) only.
-    Malformed history is repaired by dropping the bad parts, never raised."""
+    Malformed history is repaired by dropping the bad parts, never raised. When explicitly given
+    models, also retain their family caps for the opt-in throttle's model-specific forecasts."""
     if not isinstance(state.get("history"), dict):
         state["history"] = {}
     per = state["history"].get(provider)
@@ -324,7 +328,8 @@ def append_history(state: dict, provider: str, snap: dict, now: float) -> None:
         per = state["history"][provider] = {}
     t = float(snap.get("fetched_at") or now)
     for w in snap.get("windows") or []:
-        if not is_account_window(w) or w.get("stale"):
+        if (w.get("stale") or (not is_account_window(w) and not _model_window(w, models or []))
+                or (models is not None and not _valid_usage(w))):
             continue
         pts = per.get(w["label"])
         pts = [p for p in pts if _valid_point(p)] if isinstance(pts, list) else []
@@ -1188,6 +1193,7 @@ THROTTLE_DEFAULTS = {
     "levels": {},                   # model specs are config, never code defaults
     "protected_provider": "anthropic",
     "ladder": None,                 # ordered levels; None means the legacy levels + protected_provider
+    "prefer_short_windows": False,  # opt-in: spend replenishing session headroom before weekly-only
     "enter_projected": 95.0,        # rule a
     "enter_used": 85.0,             # rule b
     "early_projected": 85.0,        # rule c (with acceleration)
@@ -1432,6 +1438,8 @@ def legacy_alias_warnings(t: dict) -> list[str]:
 
 def validate_throttle(t: dict, cfg: Optional[dict] = None) -> list[str]:
     """Config errors for the throttle block: the ladder rules, or exactly the legacy B1 check."""
+    if not isinstance(t.get("prefer_short_windows", False), bool):
+        return ["throttle.prefer_short_windows must be a boolean"]
     if t.get("ladder") is not None:
         if t.get("levels"):
             return ["set throttle.ladder or throttle.levels, not both"]
@@ -1439,14 +1447,35 @@ def validate_throttle(t: dict, cfg: Optional[dict] = None) -> list[str]:
     return validate_levels(t.get("levels"), t["protected_provider"])
 
 
-def _throttle_windows(state: dict, now: float, cfg: dict, provider: str) -> tuple[list, Optional[float]]:
+def _valid_usage(w: dict) -> bool:
+    used = w.get("used")
+    return isinstance(used, (int, float)) and not isinstance(used, bool) and math.isfinite(used) and used >= 0
+
+
+def _model_window(w: dict, models: Iterable[str]) -> bool:
+    """Recognised Anthropic family caps apply only to chains using that family."""
+    scope = str(w.get("scope") or "").lower()
+    if scope not in ("model", "opus", "sonnet", "haiku", "fable"):
+        return False
+    for model in models:
+        family = re.search(r"(?:^|/)claude-(opus|sonnet|haiku|fable)(?:-|$)", model.lower())
+        if family and (scope == family[1] or (scope == "model" and
+                       re.search(r"\b" + family[1] + r"\b", str(w.get("label") or "").lower()))):
+            return True
+    return False
+
+
+def _throttle_windows(state: dict, now: float, cfg: dict, provider: str,
+                      models: list[str] | None = None) -> tuple[list, Optional[float]]:
     """Last-known tier-affecting windows for ``provider`` joined with their forecasts, plus the
     snapshot's ``fetched_at``."""
     snap = ((state.get("providers") or {}).get(provider) or {}).get("snapshot") or {}
     labels = (cfg.get("forecast_windows") or {}).get(provider) or {}
     fc = forecast_state(state, now, cfg).get(provider) or {}
     wins = [dict(w, forecast=fc.get(w["label"])) for w in snap.get("windows") or []
-            if w["label"] in labels and is_account_window(w)]
+            if (models is None or _valid_usage(w)) and (
+                (w["label"] in labels and is_account_window(w))
+                or (provider == "anthropic" and models is not None and _model_window(w, models)))]
     if provider == "openai-codex" and _auto_redeem(state, now, cfg, planning=True)[0]:
         for w in wins:
             if w["label"] == "Weekly":
@@ -1530,6 +1559,8 @@ def _why(source: str, rule: Optional[str], label: Optional[str], windows: list) 
         return ", ".join(bits) + f"; rule {rule}"
     if source == "policy":
         return f"rule {rule}"
+    if source == "preference":
+        return f"short window {label}" if rule == "short_window" else "provider preference dwell"
     return {"hold": "manual hold", "disable": "throttle disabled", "block": "observed quota block",
             "stale": "stale usage data"}.get(source, source)
 
@@ -1622,6 +1653,56 @@ def select_level(rungs: list[dict], states: dict) -> str:
     return rungs[-1]["name"]
 
 
+def _short_window(state: dict, provider: str, now: float, cfg: dict, t: dict) -> str | None:
+    """Positive evidence of usable, fresh account session capacity; absence is unknown, not zero.
+
+    Zero usage without a reset is the provider's idle session, whose clock starts on first use.
+    A running window must have a future reset consistent with its configured session duration.
+    """
+    snap = ((state.get("providers") or {}).get(provider) or {}).get("snapshot") or {}
+    at = snap.get("fetched_at")
+    if (not isinstance(at, (int, float)) or not math.isfinite(at)
+            or not 0 <= now - at <= cfg["stale_after_s"] or snap.get("unavailable")):
+        return None
+    kinds = (cfg.get("forecast_windows") or {}).get(provider) or {}
+    for w in snap.get("windows") or []:
+        label = w.get("label")
+        if (kinds.get(label) != "session" or not is_account_window(w) or w.get("stale")
+                or not _valid_usage(w) or w["used"] >= min(100, t["enter_used"])):
+            continue
+        period = (cfg.get("forecast_kinds", {}).get("session") or {}).get("period_s", 0)
+        if not isinstance(period, (int, float)) or not 0 < period <= 5 * 3600:
+            continue
+        reset = w.get("resets_at")
+        if reset is None and w["used"] == 0:
+            return label
+        if (isinstance(reset, (int, float)) and not isinstance(reset, bool) and math.isfinite(reset)
+                and 0 < reset - now <= period + cfg["cycle_tolerance_s"]):
+            return label
+    return None
+
+
+def _preferred_level(state: dict, rungs: list[dict], per: dict, level: str | None,
+                     now: float, cfg: dict, t: dict) -> tuple[str, str | None, str | None]:
+    """Rank only already-eligible gated levels; static order breaks ties, dwell avoids flapping."""
+    eligible = [r for r in rungs if r["gate"] and all(per[p]["state"] == "ok" for p in r["gate"])]
+    if not eligible:
+        return rungs[-1]["name"], None, None
+    preferred, label = eligible[0], None
+    for r in eligible:
+        provider = canonical_provider(r["spec"]["provider"])
+        # A fallback's replenishing budget must not promote a weekly-only primary.
+        if provider in r["gate"] and (short := _short_window(state, provider, now, cfg, t)):
+            preferred, label = r, f"{provider}: {short}"
+            break
+    th = state.get("throttle") or {}
+    if (level is not None and preferred["name"] != level and any(r["name"] == level for r in eligible)
+            and th.get("level") == level and th.get("since") is not None
+            and now - float(th["since"]) < t["min_dwell_s"]):
+        return level, "preference_dwell", label
+    return preferred["name"], "short_window" if label else None, label
+
+
 def _window_summary(windows: list) -> dict:
     wsum = {}
     for w in windows:
@@ -1688,7 +1769,14 @@ def throttle_step(state: dict, now: float, cfg: dict, t: dict) -> dict:
     per = {}
     for p in gates:
         ps = pstates[p]
-        windows, fetched_at = _throttle_windows(state, now, cfg, p)
+        models = [m for r in rungs for provider, m in level_chain(r["spec"])
+                  if canonical_provider(provider if provider != "main" else r["spec"]["provider"]) == p
+                  ] if t.get("prefer_short_windows") else None
+        if models is not None:
+            snap = ((state.get("providers") or {}).get(p) or {}).get("snapshot") or {}
+            if snap and not snap.get("unavailable"):
+                append_history(state, p, snap, now, models=models if p == "anthropic" else [])
+        windows, fetched_at = _throttle_windows(state, now, cfg, p, models)
         rule = label = stale = None
         if p in frozen:
             new_state, source = implied[p], forced[1]
@@ -1718,6 +1806,10 @@ def throttle_step(state: dict, now: float, cfg: dict, t: dict) -> dict:
         source, rule, label = only["source"], only["rule"], only["label"]
     else:
         source, rule, label = "policy", None, None
+    if not forced and t.get("prefer_short_windows"):
+        new, preference_rule, preference_label = _preferred_level(state, rungs, per, level, now, cfg, t)
+        if preference_rule:
+            source, rule, label = "preference", preference_rule, preference_label
     changed = new != level
     note = f"{level} is not a level of this config" if unknown else None
     if single:

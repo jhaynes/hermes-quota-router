@@ -92,7 +92,7 @@ Since 0.3.0 it also carries `cache`: `collected_at`, `stale` (older than `stale_
 
 ## Throttle policy
 
-A separate, host-local decision over an ordered **ladder** of levels. Every provider that gates a level (a **gate provider**, `anthropic` or `openai-codex`) has its own `ok`/`constrained` state, decided from its own `forecast_windows` by the rules below, with its own dwell timer and reasons. The **selected level is the first whose gate providers are all `ok`**. The last level has no gate, so there is always a floor. The throttle doesn't change tiers or mode. Config lives under `plugins.entries.quota-router.throttle`. The thresholds default as below and apply to every gate provider. The level specs (`provider`, `model`, `fallback: [{provider, model}]`, optional `max_in_progress`) have **no code defaults**.
+A separate, host-local decision over an ordered **ladder** of levels. Every provider that gates a level (a **gate provider**, `anthropic` or `openai-codex`) has its own `ok`/`constrained` state, decided from its own `forecast_windows` by the rules below, with its own dwell timer and reasons. The **selected level is normally the first whose gate providers are all `ok`**; `prefer_short_windows` optionally ranks eligible levels by replenishing session capacity (below). The last level has no gate, so there is always a floor. The throttle doesn't change tiers or mode. Config lives under `plugins.entries.quota-router.throttle`. The thresholds default as below and apply to every gate provider. The level specs (`provider`, `model`, `fallback: [{provider, model}]`, optional `max_in_progress`) have **no code defaults**.
 
 Per gate provider, over that provider's forecast windows:
 
@@ -114,6 +114,40 @@ Per gate provider, over that provider's forecast windows:
 
 ## Throttle apply
 
+### Prefer replenishing short windows (opt-in)
+
+Set `throttle.prefer_short_windows: true` to spend usable session capacity before
+weekly-only headroom. For example, with the ladder below, fresh Anthropic session
+capacity selects Claude even when Codex's weekly-only allowance is healthy. When
+both providers have usable session capacity (or neither does), ladder order breaks
+the tie. This does not create a second allowance: session usage also consumes the
+provider's weekly budget.
+
+- Eligibility is checked **before** preference: account weekly/session forecasts,
+  raw usage thresholds, observed blocks, stale-data policy and provider recovery
+  dwell still apply. Hold and disable always win; the ungated floor is never promoted.
+- Preference requires a fresh available snapshot and a non-stale, account-wide
+  window mapped to `session` in `forecast_windows`, with usage below `enter_used`
+  and a future reset compatible with the configured session duration (at most 5 h,
+  allowing `cycle_tolerance_s` drift). An explicit zero-usage idle session without a
+  reset qualifies; missing windows or unknown running resets do not. Only the
+  primary's window counts, not a fallback's.
+- `min_dwell_s` also damps preference-only switches between eligible gated levels.
+  A newly constrained current provider switches immediately; reaching/leaving the
+  floor is governed by provider policy, not this extra preference dwell.
+- This opt-in also gates Anthropic on caps applicable to model families used in its
+  ladder chains (Opus, Sonnet, Haiku or Fable), instead of treating those caps as
+  display-only. For example, `claude-opus-5-5` observes `Opus week`, but not a Sonnet
+  cap. Decision runs retain fresh model-cap history for forecasts when its label
+  has a configured forecast kind. Raw usage guards still work without a forecast.
+  With the option off, model caps remain display-only and existing decision shapes
+  and static preference are unchanged. Account tiers/mode are unchanged either way.
+- Decisions/logs identify `source: preference` with `rule: short_window` or
+  `preference_dwell`; level-change alerts name the preferred short window.
+
+The option defaults to **false**, preserving static ladder behavior. Add the
+Anthropic rung explicitly; the policy cannot route to an unconfigured provider.
+
 A codex → claude → internal ladder: codex while Codex has room, Claude while Codex is nearly out and Claude isn't, internal when both are:
 
 ```yaml
@@ -122,6 +156,7 @@ plugins:
     quota-router:
       throttle:
         enabled: false            # shadow mode (default): decide + log, never write
+        prefer_short_windows: false # opt in to the window-aware preference above
         profiles: [worker-a, worker-b]
         ladder:                   # highest preference first
           - name: codex

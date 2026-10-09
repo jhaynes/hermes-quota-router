@@ -1198,6 +1198,7 @@ THROTTLE_DEFAULTS = {
     "enter_used": 85.0,             # rule b
     "early_projected": 85.0,        # rule c (with acceleration)
     "accel_ratio": 1.5,
+    "leave_accel_ratio": 1.25,      # rule c hysteresis: hold until r_short < this × r_long
     "leave_projected": 80.0,
     "leave_used": 75.0,
     "min_dwell_s": 30 * 60,
@@ -1484,12 +1485,24 @@ def _throttle_windows(state: dict, now: float, cfg: dict, provider: str,
     return wins, (float(snap["fetched_at"]) if snap.get("fetched_at") else None)
 
 
+def _accelerating(w: dict, ratio: float, t: dict) -> bool:
+    """Rule (c)'s condition at ``ratio``: recent burn ≥ ``ratio`` × the long rate with the long
+    projection ≥ ``early_projected`` (and, under a projection allowance, the short one too)."""
+    f = w.get("forecast") or {}
+    allowance = w.get("projection_allowance", 0.0)
+    return (f.get("status") == "ok" and f["rate_pct_h"] > 0 and f["r_short"] >= ratio * f["rate_pct_h"]
+            and f["projected_at_reset"] >= t["early_projected"] + allowance
+            and (not allowance or f["projected_short"] >= t["early_projected"] + allowance))
+
+
 def throttle_policy(level: str, since: float, windows: list, now: float, t: dict
                     ) -> tuple[str, Optional[str], Optional[str]]:
     """Pure fresh-data policy: ``(level, rule, window_label)``. Rule a requires both long- and
     short-rate projections ≥ ``enter_projected``. Rules a/b/c cannot escalate a window resetting
     within ``ignore_reset_within_s``; leaving needs every window's short-rate projection ≤
-    ``leave_projected`` (an unknown forecast counts as satisfied) and used < ``leave_used``,
+    ``leave_projected`` (an unknown forecast counts as satisfied) and used < ``leave_used``, and no
+    window still accelerating at ``leave_accel_ratio`` (rule c's hysteresis, capped at
+    ``accel_ratio``; windows resetting within ``ignore_reset_within_s`` are skipped as on entry),
     after ``min_dwell_s``."""
     if level != "constrained":
         for w in windows:
@@ -1506,9 +1519,7 @@ def throttle_policy(level: str, since: float, windows: list, now: float, t: dict
                 return "constrained", "a", w["label"]
             if w["used"] >= t["enter_used"]:
                 return "constrained", "b", w["label"]
-            if (ok and f["rate_pct_h"] > 0 and f["r_short"] >= t["accel_ratio"] * f["rate_pct_h"]
-                    and f["projected_at_reset"] >= t["early_projected"] + allowance
-                    and (not allowance or f["projected_short"] >= t["early_projected"] + allowance)):
+            if _accelerating(w, t["accel_ratio"], t):
                 return "constrained", "c", w["label"]
         return "fast", None, None
     for w in windows:
@@ -1518,6 +1529,14 @@ def throttle_policy(level: str, since: float, windows: list, now: float, t: dict
         if (f.get("status") == "ok"
                 and f["projected_short"] > t["leave_projected"] + w.get("projection_allowance", 0.0)):
             return "constrained", "hold_projected", w["label"]
+    # Rule (c)'s entry is invisible to the projection/used checks above, so without this the level
+    # left on the very data that entered it and re-entered at the next refresh (flapping).
+    leave_ratio = min(t["leave_accel_ratio"], t["accel_ratio"])
+    for w in windows:
+        if w.get("resets_at") and w["resets_at"] - now < t["ignore_reset_within_s"]:
+            continue
+        if _accelerating(w, leave_ratio, t):
+            return "constrained", "hold_accel", w["label"]
     if now - since < t["min_dwell_s"]:
         return "constrained", "dwell", None
     return "fast", "leave", None

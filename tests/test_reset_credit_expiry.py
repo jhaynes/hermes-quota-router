@@ -176,6 +176,32 @@ def test_a_second_concurrent_claim_is_refused():
     assert not ok
 
 
+def test_a_peer_exhaustion_redeem_in_flight_blocks_expiry_even_with_a_newer_list():
+    """Peer reserved the cap slot (claim at t0), our list is fetched after t0 but before its POST
+    lands: the list still shows the credit, but the window may be resetting right now."""
+    st = state(week=50.0)
+    st["auto_reset"] = {"redeems": [{"at": NOW - 120, "claim": "peer"}]}
+    core.apply_reset_credits(st, core.parse_reset_credits(payload(credit("a", NOW + 10 * H))), NOW - 60)
+    assert core.usable_reset_credits(st, NOW, CFG) is not None
+    ok, why, _ = claim(st)
+    assert not ok and "exhaustion" in why
+    # A placeholder abandoned by a crashed process stops blocking after EXPIRY_INFLIGHT_S.
+    later = NOW - 120 + core.EXPIRY_INFLIGHT_S + 1
+    st["providers"]["openai-codex"]["snapshot"] = snap(50.0, fetched_at=later - 30)
+    core.apply_reset_credits(st, core.parse_reset_credits(payload(credit("a", NOW + 10 * H))), later - 30)
+    assert claim(st, now=later)[0]
+
+
+def test_an_expiry_redeem_in_flight_blocks_an_exhaustion_claim():
+    st = state(week=50.0, credits=[credit("a", NOW + 10 * H)])
+    assert claim(st)[0]
+    st["providers"]["openai-codex"]["snapshot"] = snap(100.0)
+    ok, why = core.claim_auto_redeem(st, NOW + 1, CFG)
+    assert not ok and "expiry" in why
+    core.settle_expiry_redeem(st, NOW + 2, "x", "unavailable", "a")
+    assert core.claim_auto_redeem(st, NOW + 3, CFG)[0]
+
+
 def test_failed_attempt_backs_off_then_retries():
     st = state(week=50.0, credits=[credit("a", NOW + 10 * H)])
     ok, why, cid = claim(st)

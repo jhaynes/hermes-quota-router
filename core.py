@@ -963,10 +963,14 @@ def claim_auto_redeem(state: dict, now: float, cfg: dict) -> tuple[bool, str]:
       allowance — spending it into a half-used weekly wastes most of its value;
     - fewer than ``auto_reset_max_redeems_per_week`` redemptions (including one in-flight
       reservation) are recorded in the trailing 7 days, so repeated bad data or overlapping
-      refreshes cannot drain the bank.
+      refreshes cannot drain the bank;
+    - no expiry-driven redemption (``claim_expiry_redeem``) is in flight: its credit may be
+      resetting this same window, and a second credit spent into it would be wasted.
 
     ``reason`` explains the decision either way (for the alert line / tests).
     """
+    if _expiry_inflight(state, now):
+        return False, "an expiry-driven redemption is in flight"
     return _auto_redeem(state, now, cfg)
 
 
@@ -1260,6 +1264,21 @@ def _expiry_state(state: dict) -> dict:
     return ex
 
 
+def _expiry_inflight(state: dict, now: float) -> bool:
+    ar = state.get("auto_reset")
+    ex = ar.get("expiry") if isinstance(ar, dict) else None
+    inflight = ex.get("inflight") if isinstance(ex, dict) else None
+    return isinstance(inflight, dict) and _num(inflight.get("at")) and 0 <= now - inflight["at"] < EXPIRY_INFLIGHT_S
+
+
+def _exhaustion_inflight(state: dict, now: float) -> bool:
+    """A recent unsettled ``claim_auto_redeem`` reservation (placeholder dict in ``redeems``)."""
+    ar = state.get("auto_reset")
+    redeems = ar.get("redeems") if isinstance(ar, dict) else None
+    return any(isinstance(r, dict) and _num(r.get("at")) and 0 <= now - r["at"] < EXPIRY_INFLIGHT_S
+               for r in (redeems if isinstance(redeems, list) else []))
+
+
 def _fmt_in(seconds: float) -> str:
     return f"{seconds / 3600:.0f}h" if seconds < 48 * 3600 else f"{seconds / 86400:.1f}d"
 
@@ -1277,7 +1296,8 @@ def claim_expiry_redeem(state: dict, now: float, cfg: dict, *, supports_credit_i
     - its soonest unexpired credit expires within ``expiry_lead_s`` AND no later than the Weekly
       reset (otherwise it can still be spent at exhaustion in the next window);
     - Weekly is at least ``expiry_min_used`` (default 10%) used: that much is restored instead of lost;
-    - no expiry claim is in flight, and none failed within ``EXPIRY_RETRY_S``;
+    - no claim of either kind is in flight (a peer's exhaustion redeem may be resetting the
+      window this credit would restore), and no expiry claim failed within ``EXPIRY_RETRY_S``;
     - Hermes can redeem a specific credit id. Untargeted, the backend may spend a later credit and
       the expiring one lapses anyway, so without it this refuses and queues one alert per credit.
 
@@ -1321,10 +1341,11 @@ def claim_expiry_redeem(state: dict, now: float, cfg: dict, *, supports_credit_i
         return False, f"Weekly resets before the credit expires {when}; it stays spendable next window", None
     if used < min_used:
         return False, f"Weekly {used:.0f}% < expiry_min_used {min_used:.0f}%; credit expiring {when}", None
-    ex = _expiry_state(state)
-    inflight = ex.get("inflight")
-    if isinstance(inflight, dict) and _num(inflight.get("at")) and now - inflight["at"] < EXPIRY_INFLIGHT_S:
+    if _expiry_inflight(state, now):
         return False, "an expiry-driven redemption is already in flight", None
+    if _exhaustion_inflight(state, now):
+        return False, "a weekly-exhaustion redemption is in flight", None
+    ex = _expiry_state(state)
     failed = ex.get("failed_at")
     if _num(failed) and 0 <= now - failed < EXPIRY_RETRY_S:
         return False, "retrying a failed expiry-driven redemption later", None

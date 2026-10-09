@@ -141,6 +141,34 @@ def test_never_acts_on_a_list_that_predates_the_last_redemption():
     assert not ok and "list" in why
 
 
+@pytest.mark.parametrize("settle", ["exhaustion", "expiry"])
+def test_a_list_fetched_before_a_concurrent_settle_is_unusable_and_due(settle):
+    """Process A's GET starts at t0; process B redeems and settles at t1 > t0; A applies its list
+    (stamped t0, the GET start) afterwards. A must neither act on it nor treat it as fresh."""
+    t0, t1 = NOW - 30, NOW - 10
+    st = state(week=50.0)
+    # B: claim before A's GET started, settle after it.
+    st["auto_reset"] = {"redeems": [{"at": NOW - 300, "claim": "x"}]} if settle == "exhaustion" else {}
+    if settle == "exhaustion":
+        core.settle_auto_redeem(st, t1, "x", "reset")
+    else:
+        core.settle_expiry_redeem(st, t1, "x", "reset", "a")
+    core.apply_reset_credits(st, core.parse_reset_credits(payload(credit("a", NOW + 10 * H))), t0)
+    assert core.usable_reset_credits(st, NOW, CFG) is None
+    assert core.reset_credits_due(st, NOW, CFG)
+    assert not claim(st)[0]
+    core.apply_reset_credits(st, core.parse_reset_credits(payload(credit("b", NOW + 10 * H))), t1 + 1)
+    assert core.usable_reset_credits(st, NOW, CFG) is not None
+
+
+@pytest.mark.parametrize("bad", ["x", None, float("nan"), -5, True])
+def test_invalid_refresh_interval_falls_back_to_the_default(bad):
+    cfg = dict(CFG, reset_credits_refresh_s=bad)
+    st = state(credits=[credit("a", NOW + 5 * D)], credits_at=NOW - 60)
+    assert not core.reset_credits_due(st, NOW, cfg)
+    assert core.usable_reset_credits(st, NOW, cfg) is not None
+
+
 def test_a_second_concurrent_claim_is_refused():
     st = state(week=50.0, credits=[credit("a", NOW + 10 * H), credit("b", NOW + 11 * H)])
     assert claim(st)[0]

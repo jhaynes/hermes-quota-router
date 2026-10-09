@@ -436,6 +436,8 @@ def refresh(now: float | None = None, snapshots: dict | None = None, drain: bool
             core.note_fetch(st, "openai-codex", slot="reset_credits", ok=ok, kind=None if ok else "fetch_error",
                             message=message, now=now, cfg=cfg)
             if ok:
+                # Stamped with this refresh's start (<= the GET start), never apply time: a
+                # peer's redemption settled mid-GET must still invalidate this list.
                 core.apply_reset_credits(st, parsed, now)
 
         # Auto-redeem banked Codex reset credits. Claim (decision + cap-slot reservation) is
@@ -459,7 +461,7 @@ def refresh(now: float | None = None, snapshots: dict | None = None, drain: bool
         outcome, message = _redeem_codex_credit(credit_id)
         logger.info("quota-router: expiry auto-redeem attempt (%s): %s — %s", reason, outcome, message)
         with core.locked_state(core.state_path()) as st:
-            core.settle_expiry_redeem(st, time.time(), reason, outcome, credit_id)
+            core.settle_expiry_redeem(st, now, reason, outcome, credit_id, settled_at=time.time())
             return core.drain_pending(st) if drain else []
 
     try:
@@ -471,7 +473,7 @@ def refresh(now: float | None = None, snapshots: dict | None = None, drain: bool
     logger.info("quota-router: auto-redeem attempt (%s): %s — %s", reason, outcome, message)
 
     with core.locked_state(core.state_path()) as st:
-        core.settle_auto_redeem(st, now, reason, outcome)
+        core.settle_auto_redeem(st, now, reason, outcome, settled_at=time.time())
         return core.drain_pending(st) if drain else []
 
 

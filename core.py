@@ -1094,7 +1094,8 @@ def _auto_redeem(state: dict, now: float, cfg: dict, *, planning: bool = False) 
     return True, reason
 
 
-def settle_auto_redeem(state: dict, now: float, reason: str, outcome: str) -> None:
+def settle_auto_redeem(state: dict, now: float, reason: str, outcome: str,
+                       settled_at: Optional[float] = None) -> None:
     """Settle a claimed auto-redeem slot after the network call. Must be under ``locked_state``.
 
     ``outcome == "reset"`` keeps the reservation (converted to a plain success timestamp);
@@ -1124,7 +1125,7 @@ def settle_auto_redeem(state: dict, now: float, reason: str, outcome: str) -> No
                 del redeems[i]    # roll back: a refused/failed attempt must not burn the cap
             break
     ar["redeems"] = redeems
-    _mark_reset_credits_stale(state)
+    _mark_reset_credits_stale(state, now if settled_at is None else max(now, settled_at))
     verb = "auto-redeemed" if outcome == "reset" else f"auto-redeem not done ({outcome})"
     # ⚠️ prefix: queue() evicts plain "quota-router:" lines first under PENDING_CAP, and a
     # redemption (or a refused attempt) is exactly the event the user must not lose.
@@ -1171,27 +1172,41 @@ def apply_reset_credits(state: dict, parsed: dict, now: float) -> None:
                                "credits": list(parsed.get("credits") or [])}
 
 
-def _mark_reset_credits_stale(state: dict) -> None:
-    slot = _reset_credits_slot(state)
-    if slot:
-        slot["needs_refresh"] = True
+def _mark_reset_credits_stale(state: dict, settled_at: float) -> None:
+    """Invalidate every credit list fetched at or before ``settled_at`` (a redemption attempt's
+    wall-clock settle time; a failed or timed-out POST may still have spent a credit).
+
+    Kept in ``auto_reset``, not on the list, so a list another process fetched BEFORE the settle
+    but applies AFTER it (``apply_reset_credits`` replaces the slot) is still invalid: lists are
+    stamped no later than their GET started.
+    """
+    ar = state.get("auto_reset")
+    if not isinstance(ar, dict):
+        ar = {}
+        state["auto_reset"] = ar
+    prev = ar.get("credits_invalid_before")
+    ar["credits_invalid_before"] = max(settled_at, prev) if _num(prev) and math.isfinite(prev) else settled_at
+
+
+def _reset_credits_refresh_s(cfg: dict) -> float:
+    v = cfg.get("reset_credits_refresh_s")
+    return float(v) if _num(v) and math.isfinite(v) and v > 0 else float(DEFAULTS["reset_credits_refresh_s"])
 
 
 def reset_credits_due(state: dict, now: float, cfg: dict) -> bool:
     """Whether to (re)fetch the credit list: none yet, older than ``reset_credits_refresh_s``,
-    or marked after a redemption attempt."""
-    slot = _reset_credits_slot(state)
-    at = slot.get("fetched_at")
-    return (not _num(at) or slot.get("needs_refresh") is True
-            or now - at >= float(cfg.get("reset_credits_refresh_s") or DEFAULTS["reset_credits_refresh_s"]))
+    or not newer than the latest redemption attempt, claim, or settle."""
+    at = _reset_credits_slot(state).get("fetched_at")
+    return not _num(at) or at <= _last_redeem_at(state) or now - at >= _reset_credits_refresh_s(cfg)
 
 
 def _last_redeem_at(state: dict) -> float:
-    """Latest redemption or in-flight claim of either kind (0.0 when none)."""
+    """Latest redemption, in-flight claim, or settle of either kind (0.0 when none)."""
     ar = state.get("auto_reset")
     if not isinstance(ar, dict):
         return 0.0
-    times = []
+    inv = ar.get("credits_invalid_before")
+    times = [inv] if _num(inv) and math.isfinite(inv) else []
     redeems = ar.get("redeems")
     for r in redeems if isinstance(redeems, list) else []:
         t = r.get("at") if isinstance(r, dict) else r
@@ -1211,13 +1226,13 @@ def _last_redeem_at(state: dict) -> float:
 
 def usable_reset_credits(state: dict, now: float, cfg: dict) -> Optional[dict]:
     """The stored credit list when it can drive a decision, else None: fetched within two
-    refresh intervals, not marked for refresh, and AFTER the latest redemption or in-flight claim
-    (an older list may still show the credit that was just spent)."""
+    refresh intervals, and AFTER the latest redemption, in-flight claim, or settle (an older list
+    may still show the credit that was just spent)."""
     slot = _reset_credits_slot(state)
     at = slot.get("fetched_at")
-    if not _num(at) or at > now or slot.get("needs_refresh") is True or not isinstance(slot.get("credits"), list):
+    if not _num(at) or at > now or not isinstance(slot.get("credits"), list):
         return None
-    if now - at > 2 * float(cfg.get("reset_credits_refresh_s") or DEFAULTS["reset_credits_refresh_s"]):
+    if now - at > 2 * _reset_credits_refresh_s(cfg):
         return None
     if at <= _last_redeem_at(state):
         return None
@@ -1327,7 +1342,8 @@ def claim_expiry_redeem(state: dict, now: float, cfg: dict, *, supports_credit_i
     return True, reason, target["id"]
 
 
-def settle_expiry_redeem(state: dict, now: float, reason: str, outcome: str, credit_id: Optional[str]) -> None:
+def settle_expiry_redeem(state: dict, now: float, reason: str, outcome: str, credit_id: Optional[str],
+                         settled_at: Optional[float] = None) -> None:
     """Settle a ``claim_expiry_redeem`` reservation. Must be under ``locked_state``. Success is
     recorded in ``auto_reset.expiry.redeemed`` (not the weekly cap); a failure starts the
     ``EXPIRY_RETRY_S`` back-off. Either way the credit list is marked for re-fetch and one alert
@@ -1343,7 +1359,7 @@ def settle_expiry_redeem(state: dict, now: float, reason: str, outcome: str, cre
     else:
         ex["failed_at"] = now
     state["auto_reset"]["last"] = {"at": now, "reason": reason, "outcome": outcome, "kind": "expiry"}
-    _mark_reset_credits_stale(state)
+    _mark_reset_credits_stale(state, now if settled_at is None else max(now, settled_at))
     verb = "auto-redeemed" if outcome == "reset" else f"auto-redeem not done ({outcome}) for"
     queue(state, f"⚠️ quota-router: {verb} an expiring banked codex reset credit ({reason})")
 

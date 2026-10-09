@@ -102,7 +102,9 @@ def test_live_refresh_gathers_the_list_then_redeems_the_expiring_credit_by_id(tm
     assert not any(c[0] == "untargeted" for c in calls)
     st = core.read_state(core.state_path())
     rc = st["providers"]["openai-codex"]["reset_credits"]
-    assert [c["id"] for c in rc["credits"]] == ["soon", "late"] and rc["needs_refresh"] is True
+    assert [c["id"] for c in rc["credits"]] == ["soon", "late"]
+    assert core.reset_credits_due(st, NOW + 1, core.DEFAULTS)
+    assert core.usable_reset_credits(st, NOW + 1, core.DEFAULTS) is None
     assert st["auto_reset"]["expiry"]["redeemed"][0]["credit_id"] == "soon"
     assert any("expiring" in p for p in st["pending"])
 
@@ -146,3 +148,24 @@ def test_backend_refusal_backs_off_and_keeps_the_credit_counted(tmp_path, monkey
     ex = st["auto_reset"]["expiry"]
     assert ex["failed_at"] and not ex.get("redeemed")
     assert any("not done (nothing_to_reset)" in p for p in st["pending"])
+
+
+def test_a_peer_redemption_settled_during_our_get_blocks_our_claim(tmp_path, monkeypatch):
+    """Process A's GET is in flight while process B claims, POSTs and settles a redemption.
+    A applies its (pre-redemption) list after B's settle; A must not POST on it."""
+    plugin, core = _load(tmp_path / ".hermes", monkeypatch)
+    calls = []
+    inner = _handler(calls)
+
+    def handle(req):
+        if req.method == "GET":
+            with core.locked_state(core.state_path()) as st:   # B settles mid-GET
+                st.setdefault("auto_reset", {})["redeems"] = [{"at": NOW - 5, "claim": "b"}]
+                core.settle_auto_redeem(st, NOW - 5, "b", "reset", settled_at=NOW + 3)
+        return inner(req)
+    _fake_hermes(monkeypatch, 45.0, handle, calls)
+    plugin.refresh(now=NOW)
+    assert [c[0] for c in calls if c[0] in ("GET", "POST")] == ["GET"]
+    st = core.read_state(core.state_path())
+    assert core.reset_credits_due(st, NOW + 4, core.DEFAULTS)
+    assert not (st["auto_reset"].get("expiry") or {}).get("inflight")

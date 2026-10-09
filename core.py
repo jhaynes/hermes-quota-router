@@ -323,6 +323,41 @@ def _valid_point(p: Any) -> bool:
             and (p[2] is None or _num(p[2])))
 
 
+def export_payload(state: dict, since: Optional[float], host: str) -> dict:
+    """Read-only export payload for ``hermes quota-router export`` (issue #22).
+
+    One sample per retained, well-formed history point whose label is an ACCOUNT window of the
+    provider's CURRENT snapshot (labels missing from the snapshot are excluded — fail closed;
+    a provider with history but no snapshot exports nothing). Pure: no I/O, no lock, no
+    mutation of ``state``. ``since`` filters points to ``ts > since`` (strict); ``None``
+    keeps every retained point. No snapshot-age staleness filter: history already carries
+    only windows ``append_history`` accepted (non-stale at write time).
+    """
+    history = state.get("history")
+    providers = state.get("providers")
+    samples = []
+    if not isinstance(history, dict):
+        return {"v": 1, "host": host, "samples": samples}
+    for provider, per in history.items():
+        if not isinstance(per, dict):
+            continue
+        ps = (providers or {}).get(provider) if isinstance(providers, dict) else None
+        snap = ps.get("snapshot") if isinstance(ps, dict) else None
+        windows = (snap or {}).get("windows") if isinstance(snap, dict) else None
+        if not isinstance(windows, list):
+            continue
+        account_labels = {w["label"] for w in windows
+                          if isinstance(w, dict) and "label" in w and is_account_window(w)}
+        for label, pts in per.items():
+            if label not in account_labels or not isinstance(pts, list):
+                continue
+            for p in pts:
+                if _valid_point(p) and (since is None or p[0] > since):
+                    samples.append({"ts": p[0], "provider": provider, "window": label,
+                                    "used_pct": p[1], "resets_at": p[2]})
+    return {"v": 1, "host": host, "samples": samples}
+
+
 def append_history(state: dict, provider: str, snap: dict, now: float,
                    models: list[str] | None = None) -> None:
     """Append ``[fetched_at, used, resets_at]`` per account-wide, non-stale window of a normalized

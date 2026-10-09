@@ -29,10 +29,12 @@ from __future__ import annotations
 import importlib.util
 import json
 import logging
+import math
 import sys
 import threading
 import time
 from pathlib import Path
+from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -495,6 +497,33 @@ def status_json_line(fetch: bool = False) -> str:
     return "QRJSON " + json.dumps(payload)
 
 
+def export_line() -> str:
+    """Build the ``QRJSON <payload>`` line for ``export``. Read-only: never fetches, never
+    drains the queue, never writes state."""
+    return _export_line_with_since(None)
+
+
+def _export_line_with_since(since: Optional[float]) -> str:
+    import socket
+    core = _core()
+    payload = core.export_payload(core.read_state(core.state_path()), since, socket.gethostname())
+    return "QRJSON " + json.dumps(payload)
+
+
+def _since_value(raw: Optional[str]) -> Optional[float]:
+    """Parse ``--since``; ``None`` means omitted. Raises ``ValueError`` for anything that is
+    not a finite number (the CLI turns that into one ``quota-router: ...`` stderr line)."""
+    if raw is None:
+        return None
+    try:
+        v = float(raw)
+    except (TypeError, ValueError):
+        raise ValueError(f"--since must be a unix timestamp, got {raw!r}") from None
+    if not math.isfinite(v):
+        raise ValueError(f"--since must be a finite number, got {raw!r}")
+    return v
+
+
 def _cli_setup(sub):
     sp = sub.add_subparsers(dest="qr_cmd")
     s = sp.add_parser("status", help="Show quota state (add --refresh to fetch live usage first)")
@@ -519,6 +548,12 @@ def _cli_setup(sub):
     a1.add_argument("level")
     a1.add_argument("--levels-json", required=True)
     a1.add_argument("--kanban", action="store_true")
+    e = sp.add_parser("export", help="Print one QRJSON line of history samples for downstream "
+                                     "consumers (read-only; account windows only)")
+    e.add_argument("--since", default=None, metavar="UNIX_TS",
+                   help="only points with ts > this unix timestamp (strict)")
+    e.add_argument("--json", action="store_true",
+                   help="accepted for symmetry; the output is the QRJSON line either way")
 
 
 def _throttle_handler(args) -> int:
@@ -562,6 +597,14 @@ def _cli_handler(args):
         return 0
     if cmd == "path":
         print(_core().state_path())
+        return 0
+    if cmd == "export":
+        try:
+            since = _since_value(getattr(args, "since", None))
+        except ValueError as exc:
+            print(f"quota-router: {exc}", file=sys.stderr)
+            return 2
+        print(_export_line_with_since(since))
         return 0
     if cmd == "throttle":
         return _throttle_handler(args)

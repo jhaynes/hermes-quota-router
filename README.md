@@ -8,7 +8,7 @@ Host-level quota awareness for `anthropic` and `openai-codex`.
 - **Mode:** normal, shift (one provider constrained) or internal (both constrained).
 - **Alerts:** at 75% and 90%, once per window per reset cycle.
 - **Alert queue:** only `hermes quota-router refresh` (the cron path) **drains** and delivers pending alert/transition lines. A manual refresh (`/quota refresh`, `hermes quota-router status --refresh`) folds fresh usage in and enqueues any new lines, but leaves the queue for the next cron run to deliver — it no longer swallows them. Delivery is **at-most-once**: drained lines are removed from state immediately, so if the cron script's delivery step then fails, those lines are lost, not retried.
-- **Surfaces:** `hermes quota-router status [--refresh] | refresh | path | throttle <apply|status|hold|disable>`, `/quota [refresh]`.
+- **Surfaces:** `hermes quota-router status [--refresh] | refresh | path | export [--since <unix-ts>] | throttle <apply|status|hold|disable>`, `/quota [refresh]`.
 - **Cache efficiency:** 24h/7d prompt-cache hit rates per provider and source, the top-burner sessions, and low-hit alerts, all from this host's `state.db` (see below).
 
 State lives at `<root HERMES_HOME>/cache/quota-router/state.json` and is shared by every profile on the host.
@@ -66,6 +66,14 @@ plugins:
 `hermes quota-router status --json [--refresh]` prints exactly one `QRJSON <payload>` line to stdout (nothing else on stdout; logging goes to stderr) for the desktop widget or any other machine reader. `--refresh --json` fetches fresh data but does **not** drain the pending-alert queue — only `hermes quota-router refresh` (the cron path) does that.
 
 The payload (`v: 1`) has `host`, `now`, `mode`/`mode_since`, and per-provider `tier`, `fetched_at`, `stale`, `plan`, `windows` (each with `affects_tier: bool` — `true` for account-wide windows and `false` for model-scoped windows — and `forecast`), `block`, `fetch.core`/`fetch.scoped` outcomes, and `details`; plus top-level `recent_errors` (last 5) and `pending_count`.
+
+## export
+
+`hermes quota-router export [--since <unix-ts>] [--json]` prints exactly one `QRJSON <payload>` line to stdout for downstream consumers (e.g. a cross-provider usage telemetry push). It is **read-only**: it reads the shared state file lock-free and never fetches live usage, drains the alert queue or writes state. `--json` is accepted for symmetry; the output is the same line either way.
+
+The payload (`v: 1`) carries `host` and a `samples` list, one sample per retained, well-formed history point: `{"ts": fetched_at, "provider": <provider key>, "window": <history label>, "used_pct": used, "resets_at": <number|null>}`. `--since` keeps only points with `ts > since` (strict); omitted means every retained point.
+
+Only **account-wide** windows are exported: a history label is kept only if the provider's *current* snapshot has a window with that label whose scope is account (`scope: "account"`, or null/empty in older data). Model-scoped windows (`Opus week`, `Sonnet week`, model-name scopes like `Fable`) and labels no longer present in the snapshot are excluded — fail closed, so a provider with history but no snapshot exports nothing. There is no snapshot-age staleness filter: history already contains only the non-stale points accepted at write time, and points from a snapshot older than `stale_after_s` are still exported so a downstream watermark cannot skip points withheld during a fetch outage.
 
 ## TUI widget
 

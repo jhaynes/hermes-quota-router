@@ -60,8 +60,10 @@ def write_state(e, st):
 
 
 def base_state():
+    # list(SNAP_WINDOWS): return a copy so mutating tests never pollute the
+    # module-level fixture for later tests (order-dependent fixture state).
     return {"version": 1, "providers": {"anthropic": {"snapshot": {"fetched_at": NOW,
-                                                                   "windows": SNAP_WINDOWS}}},
+                                                                   "windows": list(SNAP_WINDOWS)}}},
             "history": {"anthropic": {"Current week": [[1, 40.0, None]],
                                       "Current session": [[1, 10.0, None]],
                                       "Opus week": [[1, 50.0, None]],

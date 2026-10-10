@@ -347,7 +347,8 @@ def export_payload(state: dict, since: Optional[float], host: str) -> dict:
         if not isinstance(windows, list):
             continue
         account_labels = {w["label"] for w in windows
-                          if isinstance(w, dict) and "label" in w and is_account_window(w)}
+                          if isinstance(w, dict) and isinstance(w.get("label"), str)
+                          and is_account_window(w)}
         for label, pts in per.items():
             if label not in account_labels or not isinstance(pts, list):
                 continue

@@ -228,6 +228,25 @@ Safety layers, in order:
 
 Every attempt is recorded in state (`auto_reset.last`, `auto_reset.redeems`) and queued as one `⚠️` alert line (`quota-router: auto-redeemed a banked codex reset credit (...)` or `auto-redeem not done (<outcome>)`), so outcomes are visible in `/quota`. A successful redemption lifts the runtime credential-pool cooldowns, and the next refresh cycle confirms the windows dropped.
 
+### Credit expiry
+
+Each banked credit expires: on the live account, 30 days after it was granted. Usage gives only a count, so on a live refresh that reached Codex, the plugin also fetches `GET <codex backend>/rate-limit-reset-credits`. That endpoint lists every credit with `expires_at`, and the plugin re-fetches it every `reset_credits_refresh_s` (default 1 h) and after any redemption attempt. The list is stored as `providers.openai-codex.reset_credits`, holding available credits only, soonest-expiring first. `/quota` shows `reset credits: N available; next expires …`, and `status --json` carries the expiry times without credit ids.
+
+Weekly exhaustion is capped at one redemption per week and may not recur before a credit expires. So when `auto_reset` is enabled, a credit that would otherwise lapse is spent anyway, by **expiry-driven redemption** (`claim_expiry_redeem`):
+
+```yaml
+auto_reset:
+  weekly_threshold: 97.0
+  expiry_lead_s: 86400      # redeem a credit expiring within this many seconds (0 = off)
+  expiry_min_used: 10.0     # ... if Weekly is at least this percent used
+```
+
+- **When it fires:** the soonest unexpired credit expires within `expiry_lead_s`, and no later than the current Weekly reset. Otherwise the credit is still spendable after the reset and can be used at exhaustion then. Waiting until close to expiry maximises the usage the credit restores.
+- **Inputs it requires:** a fresh snapshot and a credit list fetched after the latest redemption or in-flight claim. An older list may still show a credit that was just spent.
+- **How it redeems:** it targets the credit by id (`credit_id` on the consume POST, as the Codex CLI does) and without the exhaustion guard. The redemption is deliberate, and an untargeted redeem could spend a later credit and still let this one lapse.
+- **Accounting:** these redemptions do not count toward `auto_reset_max_redeems_per_week`. A failed attempt (including a backend `nothing_to_reset`) retries after 30 minutes against a re-fetched list. One claim can be in flight at a time.
+- **Effect on planning:** banked Weekly headroom is counted only if at least one listed credit expires after the Weekly reset. When the list is unavailable, the count-based behaviour above applies.
+
 ## Deliberately out of scope
 
 - **Error classification override.** Hermes already switches to fallback immediately on rate-limit and billing errors when the credential pool can't rotate (`agent/turn_recovery.py::route_classified_error`).

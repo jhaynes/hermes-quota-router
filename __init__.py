@@ -191,10 +191,81 @@ def _snap_dict(core, snap, now):
     return core.normalize_snapshot(snap, now)
 
 
+# ── Codex reset-credit list + targeted consume ────────────────────────────────────────────────
+# Hermes exposes only a count of banked credits and an untargeted redeem. The list endpoint gives
+# each credit's expires_at, and the consume endpoint accepts a credit_id (the Codex CLI's
+# consume_rate_limit_reset_credit_by_id), so both calls are made here on Hermes's credential,
+# URL and outcome helpers.
+_CODEX_HELPERS = ("_resolve_codex_usage_credentials", "_codex_backend_urls", "_codex_headers",
+                  "_codex_reset_outcome")
+
+
+def _codex_api():
+    """``agent.account_usage`` when it has every helper the calls below need, else None."""
+    try:
+        from agent import account_usage as au
+    except Exception:
+        return None
+    return au if all(callable(getattr(au, n, None)) for n in _CODEX_HELPERS) else None
+
+
+def _codex_call(au, fn):
+    """Run ``fn(urls, headers)`` with Codex credentials, retrying once with refreshed ones on 401."""
+    import httpx
+    token, base, account = au._resolve_codex_usage_credentials(None, None)
+    for attempt in range(2):
+        try:
+            return fn(au._codex_backend_urls(base), au._codex_headers(token, account))
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code != 401 or attempt:
+                raise
+            token, base, account = au._resolve_codex_usage_credentials(None, None, force_refresh=True)
+
+
+def _fetch_codex_reset_credits() -> dict:
+    """GET the banked reset-credit list (raises on failure)."""
+    au = _codex_api()
+    if au is None:
+        raise ImportError("agent.account_usage lacks the Codex helpers")
+    import httpx
+
+    def get(urls, headers):
+        with httpx.Client(timeout=15.0) as client:
+            resp = client.get(urls[1], headers=headers)
+            resp.raise_for_status()
+            return resp.json()
+    return _codex_call(au, get)
+
+
+def _redeem_codex_credit(credit_id: str):
+    """POST consume for one specific credit, with force semantics (no exhaustion guard): the
+    caller has decided the credit would otherwise lapse. Returns ``(status, message)``; never raises."""
+    import uuid
+    au = _codex_api()
+    if au is None:
+        return "unavailable", "agent.account_usage lacks the Codex helpers"
+    request_id = str(uuid.uuid4())   # reused across the 401 retry: the backend dedupes on it
+
+    def consume(urls, headers):
+        import httpx
+        with httpx.Client(timeout=15.0) as client:
+            resp = client.post(urls[2], headers={**headers, "Content-Type": "application/json"},
+                               json={"redeem_request_id": request_id, "credit_id": credit_id})
+            resp.raise_for_status()
+            return resp.json() or {}
+    try:
+        body = _codex_call(au, consume)
+        result = au._codex_reset_outcome(body, 1)
+        return result.status, result.message
+    except Exception as exc:
+        return "unavailable", f"{type(exc).__name__}: {str(exc)[:200]}"
+
+
 def refresh(now: float | None = None, snapshots: dict | None = None, drain: bool = False,
             outcomes: dict | None = None, only: set | None = None) -> list[str]:
     core = _core()
     now = time.time() if now is None else now
+    fetching_live = snapshots is None
     if snapshots is None:
         from agent.account_usage import fetch_account_usage
         snapshots = {}
@@ -247,6 +318,16 @@ def refresh(now: float | None = None, snapshots: dict | None = None, drain: bool
 
     # Cache stats: read-only state.db aggregate, collected before taking the state lock.
     cache_outcome = core.collect_cache_outcome(core.state_db_path(), now, cfg)
+
+    # Banked reset-credit list (expiry per credit), only on a live fetch that reached Codex.
+    credits_outcome = None
+    if fetching_live and outcomes.get("openai-codex", (False,))[0]:
+        due_credits = core.reset_credits_due(core.read_state(core.state_path()), now, cfg)
+        if due_credits:
+            try:
+                credits_outcome = (True, "", core.parse_reset_credits(_fetch_codex_reset_credits()))
+            except Exception as exc:
+                credits_outcome = (False, f"{type(exc).__name__}: {str(exc)[:200]}", None)
 
     with core.locked_state(core.state_path()) as st:
         for p, (ok, kind, message) in outcomes.items():
@@ -350,6 +431,14 @@ def refresh(now: float | None = None, snapshots: dict | None = None, drain: bool
                             snapshots["anthropic"] = snap2
         core.apply_refresh(st, snapshots, now, cfg)
         core.apply_cache(st, cache_outcome, now, cfg)
+        if credits_outcome is not None:
+            ok, message, parsed = credits_outcome
+            core.note_fetch(st, "openai-codex", slot="reset_credits", ok=ok, kind=None if ok else "fetch_error",
+                            message=message, now=now, cfg=cfg)
+            if ok:
+                # Stamped with this refresh's start (<= the GET start), never apply time: a
+                # peer's redemption settled mid-GET must still invalidate this list.
+                core.apply_reset_credits(st, parsed, now)
 
         # Auto-redeem banked Codex reset credits. Claim (decision + cap-slot reservation) is
         # atomic in this locked section, so overlapping refreshes (cron + startup +
@@ -360,7 +449,19 @@ def refresh(now: float | None = None, snapshots: dict | None = None, drain: bool
         # below 100% usage on every window, and the backend's own nothing_to_reset is a
         # third layer — a stale snapshot cannot spend a credit into a half-used window.
         redeem, reason = core.claim_auto_redeem(st, now, cfg)
+        credit_id = None
         if not redeem:
+            # Not exhausted: spend a credit that would otherwise lapse (targeted, forced).
+            redeem, reason, credit_id = core.claim_expiry_redeem(
+                st, now, cfg, supports_credit_id=_codex_api() is not None)
+            if not redeem:
+                return core.drain_pending(st) if drain else []
+
+    if credit_id is not None:
+        outcome, message = _redeem_codex_credit(credit_id)
+        logger.info("quota-router: expiry auto-redeem attempt (%s): %s — %s", reason, outcome, message)
+        with core.locked_state(core.state_path()) as st:
+            core.settle_expiry_redeem(st, now, reason, outcome, credit_id, settled_at=time.time())
             return core.drain_pending(st) if drain else []
 
     try:
@@ -372,7 +473,7 @@ def refresh(now: float | None = None, snapshots: dict | None = None, drain: bool
     logger.info("quota-router: auto-redeem attempt (%s): %s — %s", reason, outcome, message)
 
     with core.locked_state(core.state_path()) as st:
-        core.settle_auto_redeem(st, now, reason, outcome)
+        core.settle_auto_redeem(st, now, reason, outcome, settled_at=time.time())
         return core.drain_pending(st) if drain else []
 
 

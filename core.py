@@ -72,7 +72,17 @@ DEFAULTS = {
     # keeps the 5h-window case out entirely (see claim_auto_redeem).
     "auto_reset": None,                    # None = off; {"weekly_threshold": 97.0} to enable
     "auto_reset_max_redeems_per_week": 1,  # guard against repeated bad data spending the bank
+    # Each banked credit expires (30 days after grant on the live account). Expiry-driven
+    # redemption (claim_expiry_redeem) spends the soonest-expiring credit, by id and with force,
+    # when it would otherwise lapse: it expires within auto_reset.expiry_lead_s (default 24 h)
+    # and before the current Weekly window resets, and Weekly is at least
+    # auto_reset.expiry_min_used (default 10%) used. The credit list is re-fetched this often:
+    "reset_credits_refresh_s": 60 * 60,
 }
+EXPIRY_LEAD_S = 24 * 3600
+EXPIRY_MIN_USED = 10.0
+EXPIRY_RETRY_S = 30 * 60        # after a failed expiry-driven attempt
+EXPIRY_INFLIGHT_S = 15 * 60     # a claim older than this cannot still be in flight
 TIER_ORDER = {"ok": 0, "tight": 1, "exhausted": 2}
 
 
@@ -856,6 +866,13 @@ def status_payload(state: dict, now: float, cfg: dict, host: str) -> dict:
                                "error": scoped_fetch.get("error")}},
             "details": snap.get("details") or [],
         }
+        rc = _reset_credits_slot(state) if p == "openai-codex" else {}
+        if _num(rc.get("fetched_at")):
+            # Ids are omitted: the widget only needs counts and expiry times.
+            providers[p]["reset_credits"] = {
+                "fetched_at": rc["fetched_at"], "available_count": rc.get("available_count"),
+                "credits": [{"expires_at": c.get("expires_at"), "granted_at": c.get("granted_at")}
+                            for c in rc.get("credits") or [] if isinstance(c, dict)]}
     errs = [{"at": e["at"], "provider": e["provider"], "status": e.get("status"),
             "reason": e.get("reason"), "message": e.get("message", "")[:200]}
            for e in (state.get("errors") or [])[-5:]]
@@ -946,10 +963,14 @@ def claim_auto_redeem(state: dict, now: float, cfg: dict) -> tuple[bool, str]:
       allowance — spending it into a half-used weekly wastes most of its value;
     - fewer than ``auto_reset_max_redeems_per_week`` redemptions (including one in-flight
       reservation) are recorded in the trailing 7 days, so repeated bad data or overlapping
-      refreshes cannot drain the bank.
+      refreshes cannot drain the bank;
+    - no expiry-driven redemption (``claim_expiry_redeem``) is in flight: its credit may be
+      resetting this same window, and a second credit spent into it would be wasted.
 
     ``reason`` explains the decision either way (for the alert line / tests).
     """
+    if _expiry_inflight(state, now):
+        return False, "an expiry-driven redemption is in flight"
     return _auto_redeem(state, now, cfg)
 
 
@@ -1033,6 +1054,13 @@ def _auto_redeem(state: dict, now: float, cfg: dict, *, planning: bool = False) 
                    and d.split()[2].isdigit()), 0)
     if banked <= 0:
         return False, "no banked credits"
+    if planning:
+        # Err toward constraining: a credit that lapses before the Weekly reset may be gone (or
+        # spent early by claim_expiry_redeem) before exhaustion, so it is not a full refill.
+        listed = usable_reset_credits(state, now, cfg)
+        if listed is not None and not any(c["expires_at"] is None or c["expires_at"] >= float(weekly["resets_at"])
+                                          for c in listed["credits"]):
+            return False, "banked credits all expire before the Weekly reset"
     history = state.get("auto_reset")
     if history is not None and not isinstance(history, dict):
         return False, "invalid auto_reset state"
@@ -1070,7 +1098,8 @@ def _auto_redeem(state: dict, now: float, cfg: dict, *, planning: bool = False) 
     return True, reason
 
 
-def settle_auto_redeem(state: dict, now: float, reason: str, outcome: str) -> None:
+def settle_auto_redeem(state: dict, now: float, reason: str, outcome: str,
+                       settled_at: Optional[float] = None) -> None:
     """Settle a claimed auto-redeem slot after the network call. Must be under ``locked_state``.
 
     ``outcome == "reset"`` keeps the reservation (converted to a plain success timestamp);
@@ -1100,10 +1129,273 @@ def settle_auto_redeem(state: dict, now: float, reason: str, outcome: str) -> No
                 del redeems[i]    # roll back: a refused/failed attempt must not burn the cap
             break
     ar["redeems"] = redeems
+    _mark_reset_credits_stale(state, now if settled_at is None else max(now, settled_at))
     verb = "auto-redeemed" if outcome == "reset" else f"auto-redeem not done ({outcome})"
     # ⚠️ prefix: queue() evicts plain "quota-router:" lines first under PENDING_CAP, and a
     # redemption (or a refused attempt) is exactly the event the user must not lose.
     queue(state, f"⚠️ quota-router: {verb} a banked codex reset credit ({reason})")
+
+
+# ── banked reset credit list + expiry-driven redemption ───────────────────────────────────────
+
+def parse_reset_credits(payload: Any) -> dict:
+    """``GET <codex backend>/rate-limit-reset-credits`` -> ``{"available_count", "credits"}``.
+
+    Keeps only credits the account can spend now (``status == "available"`` and not
+    ``is_supported_by_plan: false``) as ``{"id", "expires_at", "granted_at"}`` in epoch seconds
+    (``expires_at`` None = does not expire), soonest-expiring first — the order the Codex CLI's
+    picker offers them. Raises ``ValueError`` when the payload has no credit list.
+    """
+    if not isinstance(payload, dict) or not isinstance(payload.get("credits"), list):
+        raise ValueError("reset-credits payload has no credits list")
+    credits = []
+    for c in payload["credits"]:
+        if not isinstance(c, dict) or str(c.get("status") or "").lower() != "available" \
+                or c.get("is_supported_by_plan") is False:
+            continue
+        cid = c.get("id")
+        if not isinstance(cid, str) or not cid:
+            continue
+        exp, granted = _epoch(c.get("expires_at")), _epoch(c.get("granted_at"))
+        credits.append({"id": cid,
+                        "expires_at": exp if exp is not None and math.isfinite(exp) else None,
+                        "granted_at": granted if granted is not None and math.isfinite(granted) else None})
+    credits.sort(key=lambda c: (c["expires_at"] is None, c["expires_at"] or 0.0))
+    count = payload.get("available_count")
+    return {"available_count": count if _num(count) else None, "credits": credits}
+
+
+def _reset_credits_slot(state: dict) -> dict:
+    slot = ((state.get("providers") or {}).get("openai-codex") or {}).get("reset_credits")
+    return slot if isinstance(slot, dict) else {}
+
+
+def apply_reset_credits(state: dict, parsed: dict, now: float) -> None:
+    pstate = state["providers"].setdefault("openai-codex", {"tier": "ok", "tier_since": now})
+    pstate["reset_credits"] = {"fetched_at": now, "available_count": parsed.get("available_count"),
+                               "credits": list(parsed.get("credits") or [])}
+
+
+def _mark_reset_credits_stale(state: dict, settled_at: float) -> None:
+    """Invalidate every credit list fetched at or before ``settled_at`` (a redemption attempt's
+    wall-clock settle time; a failed or timed-out POST may still have spent a credit).
+
+    Kept in ``auto_reset``, not on the list, so a list another process fetched BEFORE the settle
+    but applies AFTER it (``apply_reset_credits`` replaces the slot) is still invalid: lists are
+    stamped no later than their GET started.
+    """
+    ar = state.get("auto_reset")
+    if not isinstance(ar, dict):
+        ar = {}
+        state["auto_reset"] = ar
+    prev = ar.get("credits_invalid_before")
+    ar["credits_invalid_before"] = max(settled_at, prev) if _num(prev) and math.isfinite(prev) else settled_at
+
+
+def _reset_credits_refresh_s(cfg: dict) -> float:
+    v = cfg.get("reset_credits_refresh_s")
+    return float(v) if _num(v) and math.isfinite(v) and v > 0 else float(DEFAULTS["reset_credits_refresh_s"])
+
+
+def reset_credits_due(state: dict, now: float, cfg: dict) -> bool:
+    """Whether to (re)fetch the credit list: none yet, older than ``reset_credits_refresh_s``,
+    or not newer than the latest redemption attempt, claim, or settle."""
+    at = _reset_credits_slot(state).get("fetched_at")
+    return not _num(at) or at <= _last_redeem_at(state) or now - at >= _reset_credits_refresh_s(cfg)
+
+
+def _last_redeem_at(state: dict) -> float:
+    """Latest redemption, in-flight claim, or settle of either kind (0.0 when none)."""
+    ar = state.get("auto_reset")
+    if not isinstance(ar, dict):
+        return 0.0
+    inv = ar.get("credits_invalid_before")
+    times = [inv] if _num(inv) and math.isfinite(inv) else []
+    redeems = ar.get("redeems")
+    for r in redeems if isinstance(redeems, list) else []:
+        t = r.get("at") if isinstance(r, dict) else r
+        if _num(t):
+            times.append(t)
+    ex = ar.get("expiry")
+    if isinstance(ex, dict):
+        inflight = ex.get("inflight")
+        if isinstance(inflight, dict) and _num(inflight.get("at")):
+            times.append(inflight["at"])
+        redeemed = ex.get("redeemed")
+        for r in redeemed if isinstance(redeemed, list) else []:
+            if isinstance(r, dict) and _num(r.get("at")):
+                times.append(r["at"])
+    return max(times, default=0.0)
+
+
+def usable_reset_credits(state: dict, now: float, cfg: dict) -> Optional[dict]:
+    """The stored credit list when it can drive a decision, else None: fetched within two
+    refresh intervals, and AFTER the latest redemption, in-flight claim, or settle (an older list
+    may still show the credit that was just spent)."""
+    slot = _reset_credits_slot(state)
+    at = slot.get("fetched_at")
+    if not _num(at) or at > now or not isinstance(slot.get("credits"), list):
+        return None
+    if now - at > 2 * _reset_credits_refresh_s(cfg):
+        return None
+    if at <= _last_redeem_at(state):
+        return None
+    return slot
+
+
+def redeem_target(state: dict, now: float, cfg: dict) -> Optional[str]:
+    """Id of the soonest-expiring unexpired credit from a usable list (None: let the backend pick)."""
+    listed = usable_reset_credits(state, now, cfg)
+    for c in (listed or {}).get("credits") or []:
+        if c.get("expires_at") is None or c["expires_at"] > now:
+            return c["id"]
+    return None
+
+
+def _expiry_state(state: dict) -> dict:
+    ar = state.get("auto_reset")
+    if not isinstance(ar, dict):
+        ar = {}
+        state["auto_reset"] = ar
+    ex = ar.get("expiry")
+    if not isinstance(ex, dict):
+        ex = {}
+        ar["expiry"] = ex
+    return ex
+
+
+def _expiry_inflight(state: dict, now: float) -> bool:
+    ar = state.get("auto_reset")
+    ex = ar.get("expiry") if isinstance(ar, dict) else None
+    inflight = ex.get("inflight") if isinstance(ex, dict) else None
+    return isinstance(inflight, dict) and _num(inflight.get("at")) and 0 <= now - inflight["at"] < EXPIRY_INFLIGHT_S
+
+
+def _exhaustion_inflight(state: dict, now: float) -> bool:
+    """A recent unsettled ``claim_auto_redeem`` reservation (placeholder dict in ``redeems``)."""
+    ar = state.get("auto_reset")
+    redeems = ar.get("redeems") if isinstance(ar, dict) else None
+    return any(isinstance(r, dict) and _num(r.get("at")) and 0 <= now - r["at"] < EXPIRY_INFLIGHT_S
+               for r in (redeems if isinstance(redeems, list) else []))
+
+
+def _fmt_in(seconds: float) -> str:
+    return f"{seconds / 3600:.0f}h" if seconds < 48 * 3600 else f"{seconds / 86400:.1f}d"
+
+
+def claim_expiry_redeem(state: dict, now: float, cfg: dict, *, supports_credit_id: bool
+                        ) -> tuple[bool, str, Optional[str]]:
+    """Whether to spend the soonest-expiring banked credit now because it would otherwise lapse,
+    and reserve it. MUST be called under ``locked_state``. Returns ``(claimed, reason, credit_id)``.
+
+    Fires only when ALL of these hold:
+
+    - ``auto_reset`` is configured and ``expiry_lead_s`` (default 24 h) is not 0;
+    - a fresh openai-codex snapshot has a valid Weekly window whose reset is in the future;
+    - the credit list is usable (``usable_reset_credits``: fresh and newer than every redemption);
+    - its soonest unexpired credit expires within ``expiry_lead_s`` AND no later than the Weekly
+      reset (otherwise it can still be spent at exhaustion in the next window);
+    - Weekly is at least ``expiry_min_used`` (default 10%) used: that much is restored instead of lost;
+    - no claim of either kind is in flight (a peer's exhaustion redeem may be resetting the
+      window this credit would restore), and no expiry claim failed within ``EXPIRY_RETRY_S``;
+    - Hermes can redeem a specific credit id. Untargeted, the backend may spend a later credit and
+      the expiring one lapses anyway, so without it this refuses and queues one alert per credit.
+
+    Unlike weekly exhaustion this spends below 100% (the caller passes ``force``), and it does
+    not count toward ``auto_reset_max_redeems_per_week``: the credit is lost otherwise.
+    """
+    acfg = cfg.get("auto_reset")
+    if not isinstance(acfg, dict):
+        return False, "auto_reset not configured", None
+    lead, min_used = acfg.get("expiry_lead_s", EXPIRY_LEAD_S), acfg.get("expiry_min_used", EXPIRY_MIN_USED)
+    if not _num(lead) or not _num(min_used) or lead < 0 or not math.isfinite(min_used):
+        return False, "invalid auto_reset.expiry_lead_s/expiry_min_used config", None
+    if lead == 0:
+        return False, "expiry-driven redemption disabled (expiry_lead_s: 0)", None
+    snap = ((state.get("providers") or {}).get("openai-codex") or {}).get("snapshot") or {}
+    fetched_at = snap.get("fetched_at")
+    if not snap or snap.get("unavailable") or not _num(fetched_at) or fetched_at > now \
+            or now - fetched_at > cfg["stale_after_s"]:
+        return False, "no fresh snapshot", None
+    windows = snap.get("windows")
+    weekly = next((w for w in windows if isinstance(w, dict) and w.get("label") == "Weekly"
+                   and is_account_window(w)), None) if isinstance(windows, list) else None
+    if weekly is None:
+        return False, "no Weekly window in snapshot", None
+    used, reset = weekly.get("used"), weekly.get("resets_at")
+    if not _num(used) or not math.isfinite(used) or weekly.get("stale"):
+        return False, "invalid Weekly usage data", None
+    if not _num(reset) or not math.isfinite(reset) or reset <= now:
+        return False, "no usable Weekly reset", None
+    listed = usable_reset_credits(state, now, cfg)
+    if listed is None:
+        return False, "reset-credit list missing, stale, or older than the last redemption", None
+    target = next((c for c in listed["credits"] if c.get("expires_at") is not None and c["expires_at"] > now), None)
+    if target is None:
+        return False, "no expiring banked credit", None
+    expires = target["expires_at"]
+    when = f"{datetime.fromtimestamp(expires):%a %m-%d %H:%M} (in {_fmt_in(expires - now)})"
+    if expires - now > lead:
+        return False, f"next credit expires {when}, outside expiry_lead_s", None
+    if reset < expires:
+        return False, f"Weekly resets before the credit expires {when}; it stays spendable next window", None
+    if used < min_used:
+        return False, f"Weekly {used:.0f}% < expiry_min_used {min_used:.0f}%; credit expiring {when}", None
+    if _expiry_inflight(state, now):
+        return False, "an expiry-driven redemption is already in flight", None
+    if _exhaustion_inflight(state, now):
+        return False, "a weekly-exhaustion redemption is in flight", None
+    ex = _expiry_state(state)
+    failed = ex.get("failed_at")
+    if _num(failed) and 0 <= now - failed < EXPIRY_RETRY_S:
+        return False, "retrying a failed expiry-driven redemption later", None
+    reason = f"credit expiring {when} before the Weekly reset; Weekly at {used:.0f}%"
+    if not supports_credit_id:
+        alerted = ex.get("alerted_unsupported")
+        alerted = alerted if isinstance(alerted, list) else []
+        if target["id"] not in alerted:
+            ex["alerted_unsupported"] = (alerted + [target["id"]])[-20:]
+            queue(state, f"⚠️ quota-router: a banked codex reset credit will lapse {when}: the plugin "
+                         f"cannot reach Hermes's Codex helpers to redeem it by credit_id, so it was "
+                         f"not auto-redeemed. Run /usage reset --force to spend one now.")
+        return False, f"{reason}, but targeted (credit_id) redemption is unavailable", None
+    ex["inflight"] = {"at": now, "credit_id": target["id"], "claim": reason}
+    return True, reason, target["id"]
+
+
+def settle_expiry_redeem(state: dict, now: float, reason: str, outcome: str, credit_id: Optional[str],
+                         settled_at: Optional[float] = None) -> None:
+    """Settle a ``claim_expiry_redeem`` reservation. Must be under ``locked_state``. Success is
+    recorded in ``auto_reset.expiry.redeemed`` (not the weekly cap); a failure starts the
+    ``EXPIRY_RETRY_S`` back-off. Either way the credit list is marked for re-fetch and one alert
+    is queued."""
+    ex = _expiry_state(state)
+    ex["inflight"] = None
+    if outcome == "reset":
+        redeemed = ex.get("redeemed")
+        redeemed = [r for r in redeemed if isinstance(r, dict) and _num(r.get("at")) and r["at"] >= now - 60 * 86400] \
+            if isinstance(redeemed, list) else []
+        ex["redeemed"] = redeemed + [{"at": now, "credit_id": credit_id}]
+        ex.pop("failed_at", None)
+    else:
+        ex["failed_at"] = now
+    state["auto_reset"]["last"] = {"at": now, "reason": reason, "outcome": outcome, "kind": "expiry"}
+    _mark_reset_credits_stale(state, now if settled_at is None else max(now, settled_at))
+    verb = "auto-redeemed" if outcome == "reset" else f"auto-redeem not done ({outcome}) for"
+    queue(state, f"⚠️ quota-router: {verb} an expiring banked codex reset credit ({reason})")
+
+
+def reset_credits_text(state: dict, now: float) -> Optional[str]:
+    slot = _reset_credits_slot(state)
+    credits = [c for c in slot.get("credits") or [] if isinstance(c, dict)
+               and (c.get("expires_at") is None or (_num(c["expires_at"]) and c["expires_at"] > now))]
+    if not _num(slot.get("fetched_at")):
+        return None
+    text = f"reset credits: {len(credits)} available"
+    nxt = next((c["expires_at"] for c in credits if c.get("expires_at") is not None), None)
+    if nxt is not None:
+        text += f"; next expires {datetime.fromtimestamp(nxt):%a %m-%d %H:%M} (in {_fmt_in(nxt - now)})"
+    return text + f"  [list {int((now - slot['fetched_at']) // 60)}m old]"
 
 
 def clear_block_on_success(state: dict, provider: str, now: float) -> bool:
@@ -1152,6 +1444,9 @@ def render_status(state: dict, now: float, cfg: dict) -> str:
                 out.append(f"        {w['label']:<24} {w['used']:5.1f}%  resets {reset}{stale_tag}")
         for d in snap.get("details") or []:
             out.append(f"    {d}")
+        credits_line = reset_credits_text(state, now) if p == "openai-codex" else None
+        if credits_line:
+            out.append(f"    {credits_line}")
         b = state["blocks"].get(p)
         if active_block(b, now):
             out.append(f"    OBSERVED BLOCK until {datetime.fromtimestamp(b['until']):%a %H:%M}: {b.get('message', '')[:120]}")

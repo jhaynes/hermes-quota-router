@@ -497,17 +497,17 @@ def status_json_line(fetch: bool = False) -> str:
     return "QRJSON " + json.dumps(payload)
 
 
-def export_line() -> str:
+def export_line(since: Optional[float] = None) -> str:
     """Build the ``QRJSON <payload>`` line for ``export``. Read-only: never fetches, never
-    drains the queue, never writes state."""
-    return _export_line_with_since(None)
-
-
-def _export_line_with_since(since: Optional[float]) -> str:
+    drains the queue, never writes state. ``since`` filters samples to ``ts > since``."""
     import socket
     core = _core()
     payload = core.export_payload(core.read_state(core.state_path()), since, socket.gethostname())
     return "QRJSON " + json.dumps(payload)
+
+
+def _export_line_with_since(since: Optional[float]) -> str:
+    return export_line(since)
 
 
 def _since_value(raw: Optional[str]) -> Optional[float]:

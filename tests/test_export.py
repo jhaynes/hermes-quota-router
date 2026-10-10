@@ -37,7 +37,6 @@ def env(tmp_path, monkeypatch):
     core = _load("quota_router_core", "core.py", monkeypatch)
     core.state_path = lambda hermes_home=None: home / "cache" / "quota-router" / "state.json"
     plugin = _load("qr_plugin_export", "__init__.py", monkeypatch)
-    plugin.core = core
     return core, plugin
 
 
@@ -262,6 +261,50 @@ def test_malformed_skipped_not_raised(env):
     payload = core.export_payload(st, -math.inf, HOST)
     assert [(s["window"], s["ts"], s["used_pct"]) for s in payload["samples"]] == \
         [("Current week", NOW, 42.0)]
+
+
+# ── regression: a non-hashable snapshot window label must not crash export ────────
+# A corrupted/hand-edited state.json can carry a list or dict as a window's label.
+# The contract says malformed containers are skipped, never raised (no TypeError).
+@pytest.mark.parametrize("bad_label", [["bad", "label"], {"k": 1}, 42, None])
+def test_unhashable_or_non_str_window_label_skipped(env, bad_label):
+    core, _ = env
+    st = base_state()
+    st["providers"]["anthropic"]["snapshot"]["windows"].append(
+        {"label": bad_label, "used": 1.0, "scope": "account", "resets_at": None})
+    # the corrupt window contributes no account label; the well-formed ones still export
+    payload = core.export_payload(st, -math.inf, HOST)
+    assert {s["window"] for s in payload["samples"]} == \
+        {"Current week", "Current session"}
+
+
+def test_snapshot_window_without_label_skipped(env):
+    core, _ = env
+    st = base_state()
+    st["providers"]["anthropic"]["snapshot"]["windows"].insert(
+        0, {"used": 1.0, "scope": "account"})          # no "label" key at all
+    st["providers"]["anthropic"]["snapshot"]["windows"].append(
+        {"used": 2.0, "scope": "account"})             # non-dict entry entirely
+    st["providers"]["anthropic"]["snapshot"]["windows"].append("garbage")
+    payload = core.export_payload(st, -math.inf, HOST)
+    assert {s["window"] for s in payload["samples"]} == \
+        {"Current week", "Current session"}
+
+
+# ── public entry point: export_line(since=...) is the single QRJSON builder ───────
+def test_export_line_public_entry_point(env, capsys):
+    core, plugin = env
+    st = base_state()
+    write_state(core, st)
+    line_default = plugin.export_line()
+    line_since = plugin.export_line(since=NOW - 1)
+    assert line_default.startswith("QRJSON {") and line_since.startswith("QRJSON {")
+    assert json.loads(line_default[7:])["samples"] == [
+        {"ts": 1, "provider": "anthropic", "window": "Current session", "used_pct": 10.0,
+         "resets_at": None},
+        {"ts": 1, "provider": "anthropic", "window": "Current week", "used_pct": 40.0,
+         "resets_at": None},
+    ]
 
 
 # ── acceptance 11 is the full suite; here: payload purity (no state mutation) ─────

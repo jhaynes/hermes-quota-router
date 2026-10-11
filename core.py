@@ -74,12 +74,16 @@ DEFAULTS = {
     "auto_reset_max_redeems_per_week": 1,  # guard against repeated bad data spending the bank
     # Each banked credit expires (30 days after grant on the live account). Expiry-driven
     # redemption (claim_expiry_redeem) spends the soonest-expiring credit, by id and with force,
-    # when it would otherwise lapse: it expires within auto_reset.expiry_lead_s (default 24 h)
-    # and before the current Weekly window resets, and Weekly is at least
-    # auto_reset.expiry_min_used (default 10%) used. The credit list is re-fetched this often:
+    # as soon as it would otherwise lapse: it expires before the current Weekly window resets
+    # (so it is unusable in any later window) and Weekly is at least auto_reset.expiry_min_used
+    # (default 10%) used. Waiting longer restores nothing — inside this window the credit is
+    # lost either way, and spending early returns the fresh allowance with the whole remaining
+    # window to use it. Set auto_reset.expiry_lead_s to a positive number of seconds to cap how
+    # early it may fire (0 = off, the historical 24 h behaviour is expiry_lead_s: 86400).
+    # The credit list is re-fetched this often:
     "reset_credits_refresh_s": 60 * 60,
 }
-EXPIRY_LEAD_S = 24 * 3600
+EXPIRY_LEAD_S = 0.0
 EXPIRY_MIN_USED = 10.0
 EXPIRY_RETRY_S = 30 * 60        # after a failed expiry-driven attempt
 EXPIRY_INFLIGHT_S = 15 * 60     # a claim older than this cannot still be in flight
@@ -1326,19 +1330,23 @@ def claim_expiry_redeem(state: dict, now: float, cfg: dict, *, supports_credit_i
 
     Fires only when ALL of these hold:
 
-    - ``auto_reset`` is configured and ``expiry_lead_s`` (default 24 h) is not 0;
+    - ``auto_reset`` is configured;
     - a fresh openai-codex snapshot has a valid Weekly window whose reset is in the future;
     - the credit list is usable (``usable_reset_credits``: fresh and newer than every redemption);
-    - its soonest unexpired credit expires within ``expiry_lead_s`` AND no later than the Weekly
-      reset (otherwise it can still be spent at exhaustion in the next window);
+    - its soonest unexpired credit expires no later than the Weekly reset (otherwise it can
+      still be spent at exhaustion in the next window);
     - Weekly is at least ``expiry_min_used`` (default 10%) used: that much is restored instead of lost;
+    - ``expiry_lead_s`` (default 0 = no cap) is either 0 or at least the time to expiry;
     - no claim of either kind is in flight (a peer's exhaustion redeem may be resetting the
       window this credit would restore), and no expiry claim failed within ``EXPIRY_RETRY_S``;
     - Hermes can redeem a specific credit id. Untargeted, the backend may spend a later credit and
       the expiring one lapses anyway, so without it this refuses and queues one alert per credit.
 
     Unlike weekly exhaustion this spends below 100% (the caller passes ``force``), and it does
-    not count toward ``auto_reset_max_redeems_per_week``: the credit is lost otherwise.
+    not count toward ``auto_reset_max_redeems_per_week``: the credit is lost otherwise. It fires
+    as soon as the above holds rather than near expiry: within this window the credit lapses
+    anyway, so spending early loses nothing and returns the fresh allowance with the whole
+    remaining window to use it.
     """
     acfg = cfg.get("auto_reset")
     if not isinstance(acfg, dict):
@@ -1346,8 +1354,6 @@ def claim_expiry_redeem(state: dict, now: float, cfg: dict, *, supports_credit_i
     lead, min_used = acfg.get("expiry_lead_s", EXPIRY_LEAD_S), acfg.get("expiry_min_used", EXPIRY_MIN_USED)
     if not _num(lead) or not _num(min_used) or lead < 0 or not math.isfinite(min_used):
         return False, "invalid auto_reset.expiry_lead_s/expiry_min_used config", None
-    if lead == 0:
-        return False, "expiry-driven redemption disabled (expiry_lead_s: 0)", None
     snap = ((state.get("providers") or {}).get("openai-codex") or {}).get("snapshot") or {}
     fetched_at = snap.get("fetched_at")
     if not snap or snap.get("unavailable") or not _num(fetched_at) or fetched_at > now \
@@ -1371,7 +1377,7 @@ def claim_expiry_redeem(state: dict, now: float, cfg: dict, *, supports_credit_i
         return False, "no expiring banked credit", None
     expires = target["expires_at"]
     when = f"{datetime.fromtimestamp(expires):%a %m-%d %H:%M} (in {_fmt_in(expires - now)})"
-    if expires - now > lead:
+    if lead and expires - now > lead:
         return False, f"next credit expires {when}, outside expiry_lead_s", None
     if reset < expires:
         return False, f"Weekly resets before the credit expires {when}; it stays spendable next window", None

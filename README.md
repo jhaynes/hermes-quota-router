@@ -245,11 +245,11 @@ Weekly exhaustion is capped at one redemption per week and may not recur before 
 ```yaml
 auto_reset:
   weekly_threshold: 97.0
-  expiry_lead_s: 86400      # redeem a credit expiring within this many seconds (0 = off)
   expiry_min_used: 10.0     # ... if Weekly is at least this percent used
+  # expiry_lead_s: 86400    # optional cap: never redeem more than this long before expiry
 ```
 
-- **When it fires:** the soonest unexpired credit expires within `expiry_lead_s`, and no later than the current Weekly reset. Otherwise the credit is still spendable after the reset and can be used at exhaustion then. Waiting until close to expiry maximises the usage the credit restores.
+- **When it fires:** as soon as the soonest unexpired credit expires no later than the current Weekly reset and Weekly is at least `expiry_min_used` used. Inside this window the credit is lost either way, so spending it early loses nothing and returns the fresh allowance with the whole remaining window to use it. Waiting until close to expiry only shortens the throttle-free time. If the credit outlives the reset, the router waits: it is still spendable after the reset and can be used at exhaustion then. Set `expiry_lead_s` (e.g. 86400 for the earlier 24-hour-lead behaviour) to cap how early it may fire, or a positive value with `expiry_min_used` to keep a deliberate buffer.
 - **Inputs it requires:** a fresh snapshot and a credit list fetched after the latest redemption or in-flight claim. An older list may still show a credit that was just spent.
 - **How it redeems:** it targets the credit by id (`credit_id` on the consume POST, as the Codex CLI does) and without the exhaustion guard. The redemption is deliberate, and an untargeted redeem could spend a later credit and still let this one lapse.
 - **Accounting:** these redemptions do not count toward `auto_reset_max_redeems_per_week`. A failed attempt (including a backend `nothing_to_reset`) retries after 30 minutes against a re-fetched list. One claim can be in flight at a time.

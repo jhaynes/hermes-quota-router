@@ -105,7 +105,7 @@ def claim(st, now=NOW, cfg=CFG, supported=True):
     return core.claim_expiry_redeem(st, now, cfg, supports_credit_id=supported)
 
 
-def test_redeems_a_credit_expiring_within_the_lead_before_the_weekly_reset():
+def test_redeems_a_credit_expiring_before_the_weekly_reset():
     st = state(week=34.0, credits=[credit("later", NOW + 9 * D), credit("soon", NOW + 10 * H)])
     ok, why, cid = claim(st)
     assert ok and cid == "soon"
@@ -113,9 +113,19 @@ def test_redeems_a_credit_expiring_within_the_lead_before_the_weekly_reset():
     assert st["auto_reset"]["expiry"]["inflight"]["credit_id"] == "soon"
 
 
-def test_waits_while_the_credit_is_outside_the_lead():
-    ok, why, cid = claim(state(week=90.0, credits=[credit("a", NOW + 25 * H)]))
-    assert not ok and cid is None and "lead" in why
+def test_redeems_immediately_when_the_credit_expires_before_the_weekly_reset():
+    """Waiting restores nothing: inside this window the credit lapses anyway, so spending it now
+    returns the fresh allowance with the whole remaining window to use it."""
+    st = state(week=34.0, week_reset=NOW + 4 * D, credits=[credit("a", NOW + 3 * D)])
+    ok, why, cid = claim(st)
+    assert ok and cid == "a"
+
+
+def test_honours_expiry_lead_s_when_configured_above_zero():
+    st = state(week=90.0, credits=[credit("a", NOW + 25 * H)])
+    cfg = dict(CFG, auto_reset={"weekly_threshold": 97.0, "expiry_lead_s": 24 * 3600})
+    ok, why, _ = claim(st, cfg=cfg)
+    assert not ok and "lead" in why
 
 
 def test_waits_when_the_weekly_window_resets_before_the_credit_expires():
@@ -252,7 +262,6 @@ def test_without_credit_id_support_it_does_not_redeem_and_alerts_once():
 
 @pytest.mark.parametrize("acfg,needle", [
     (None, "not configured"),
-    ({"weekly_threshold": 97.0, "expiry_lead_s": 0}, "disabled"),
     ({"weekly_threshold": 97.0, "expiry_lead_s": "x"}, "invalid"),
     ({"weekly_threshold": 97.0, "expiry_min_used": float("nan")}, "invalid"),
 ])

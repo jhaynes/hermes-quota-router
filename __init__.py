@@ -552,7 +552,8 @@ def _cli_setup(sub):
                                             "resume (needs throttle.stamp_resume: true; cron path)")
     sr.add_argument("--dry-run", action="store_true", help="Report what would be marked; write nothing "
                                                            "(works with stamp_resume off)")
-    sr.add_argument("--json", action="store_true")
+    sr.add_argument("--json", action="store_true", help="Print one QRSTAMP <payload> line (the result, or "
+                                                        "{\"off\"|\"error\": reason} when it does not scan)")
     e = sp.add_parser("export", help="Print one QRJSON line of history samples for downstream "
                                      "consumers (read-only; account windows only)")
     e.add_argument("--since", default=None, metavar="UNIX_TS",
@@ -602,31 +603,35 @@ def _stamp_resume(args, core, thr, t: dict, path, now: float) -> int:
     at all is an opt-out either way). Prints ``quota-router:`` lines for stamps
     made, and for a refusal or a per-profile failure once per distinct message (the cron repeats)."""
     dry = bool(args.dry_run)
+
+    def report(key: str, msg: str) -> None:
+        print("QRSTAMP " + json.dumps({key: msg}) if args.json else
+              (f"resume stamp: off ({msg})" if key == "off" else f"resume stamp: {msg}"))
+
     if not t.get("configured"):
-        print("resume stamp: off (no throttle block)")
+        report("off", "no throttle block")
         return 0
     errs = core.validate_throttle(t, _cfg())
     if not dry and (errs or not t.get("enabled") or t.get("stamp_resume") is not True):
-        why = errs[0] if errs else "needs throttle.enabled and throttle.stamp_resume: true"
-        print(f"resume stamp: off ({why})")
+        report("off", errs[0] if errs else "needs throttle.enabled and throttle.stamp_resume: true")
         return 0
     if dry and errs:
-        print(f"resume stamp: throttle config invalid ({errs[0]})")
+        report("error", f"throttle config invalid ({errs[0]})")
         return 2
     res = thr.run_stamp(core.root_home(), t, dry_run=dry)
     print("QRSTAMP " + json.dumps(res) if args.json else thr.render_stamp(res))
     if dry:
         return 0
-    lines = thr.stamp_alerts(res)
-    failures = [ln for ln in lines if " marked " not in ln]
+    items = thr.stamp_alert_items(res)
+    failures = [ln for ln, failed in items if failed]
     with core.locked_state(path) as st:
         rec = st.setdefault("throttle", {}).setdefault("resume_stamp", {})
         seen = set(rec.get("alerted") or [])
         rec["alerted"] = failures
         rec["last"] = {"at": now, "refused": res["refused"],
                        "stamped": {p: r.get("stamp", 0) for p, r in res["profiles"].items()}}
-    for ln in lines:
-        if ln not in failures or ln not in seen:
+    for ln, failed in items:
+        if not failed or ln not in seen:
             print(ln)
     return 0
 

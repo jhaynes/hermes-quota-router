@@ -1531,6 +1531,7 @@ THROTTLE_DEFAULTS = {
     "protected_provider": "anthropic",
     "ladder": None,                 # ordered levels; None means the legacy levels + protected_provider
     "prefer_short_windows": False,  # opt-in: spend replenishing session headroom before weekly-only
+    "stamp_resume": False,          # opt-in: mark throttled profiles' chats to follow config on resume
     "enter_projected": 95.0,        # rule a
     "enter_used": 85.0,             # rule b
     "early_projected": 85.0,        # rule c (with acceleration)
@@ -1778,6 +1779,8 @@ def validate_throttle(t: dict, cfg: Optional[dict] = None) -> list[str]:
     """Config errors for the throttle block: the ladder rules, or exactly the legacy B1 check."""
     if not isinstance(t.get("prefer_short_windows", False), bool):
         return ["throttle.prefer_short_windows must be a boolean"]
+    if not isinstance(t.get("stamp_resume", False), bool):
+        return ["throttle.stamp_resume must be a boolean"]
     if t.get("ladder") is not None:
         if t.get("levels"):
             return ["set throttle.ladder or throttle.levels, not both"]

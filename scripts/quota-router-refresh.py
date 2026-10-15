@@ -4,7 +4,8 @@ transitions only) is delivered. Silent when quiet.
 
 ``throttle apply`` runs even when ``refresh`` failed, so holds expire and the stale-data rules run.
 It is a no-op on a host without a ``plugins.entries.quota-router.throttle`` block, and in shadow
-mode (``throttle.enabled: false``) it only decides and logs.
+mode (``throttle.enabled: false``) it only decides and logs. ``throttle stamp-resume`` is a no-op
+unless ``throttle.stamp_resume: true`` (README "Resumed sessions").
 """
 import os
 import subprocess
@@ -14,7 +15,7 @@ from pathlib import Path
 hermes = os.environ.get("QR_HERMES_BIN") or str(Path.home() / ".local/bin/hermes")
 timeout = float(os.environ.get("QR_STEP_TIMEOUT") or 300)
 failed = False
-for argv in (["refresh"], ["throttle", "apply"]):
+for argv in (["refresh"], ["throttle", "apply"], ["throttle", "stamp-resume"]):
     step = f"quota-router {' '.join(argv)}"
     try:
         r = subprocess.run([hermes, "quota-router", *argv], capture_output=True, text=True, timeout=timeout)

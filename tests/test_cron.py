@@ -93,18 +93,22 @@ def test_live_refresh_skips_a_provider_in_backoff(tmp_path, monkeypatch):
         assert REAL_STATE.stat().st_mtime == real_mtime
 
 
-def _fake_hermes(tmp_path, refresh_rc=0, apply_rc=0):
+def _fake_hermes(tmp_path, refresh_rc=0, apply_rc=0, stamp_rc=0):
     log = tmp_path / "calls.log"
     exe = tmp_path / "hermes"
     exe.write_text(f"""#!/bin/sh
 echo "$@" >> {log}
-case "$2" in
-  refresh) echo "quota-router: refresh line"; echo "noise"; echo "boom" >&2; exit {refresh_rc};;
-  throttle) echo "quota-router: throttle line"; echo "noise"; exit {apply_rc};;
+case "$2 $3" in
+  refresh*) echo "quota-router: refresh line"; echo "noise"; echo "boom" >&2; exit {refresh_rc};;
+  "throttle apply") echo "quota-router: throttle line"; echo "noise"; exit {apply_rc};;
+  "throttle stamp-resume") echo "quota-router: stamp line"; echo "resume stamp: off (x)"; exit {stamp_rc};;
 esac
 """)
     exe.chmod(exe.stat().st_mode | stat.S_IEXEC)
     return exe, log
+
+
+STEPS = ["quota-router refresh", "quota-router throttle apply", "quota-router throttle stamp-resume"]
 
 
 def _run_script(exe, **extra_env):
@@ -113,19 +117,20 @@ def _run_script(exe, **extra_env):
                           capture_output=True, text=True, timeout=60, env=env)
 
 
-def test_cron_script_runs_refresh_then_throttle_apply(tmp_path):
+def test_cron_script_runs_refresh_then_throttle_apply_then_stamp(tmp_path):
     exe, log = _fake_hermes(tmp_path)
     r = _run_script(exe)
     assert r.returncode == 0
-    assert log.read_text().splitlines() == ["quota-router refresh", "quota-router throttle apply"]
-    assert r.stdout.splitlines() == ["quota-router: refresh line", "quota-router: throttle line"]
+    assert log.read_text().splitlines() == STEPS
+    assert r.stdout.splitlines() == ["quota-router: refresh line", "quota-router: throttle line",
+                                     "quota-router: stamp line"]
 
 
 def test_cron_script_applies_even_when_refresh_fails(tmp_path):
     exe, log = _fake_hermes(tmp_path, refresh_rc=3)
     r = _run_script(exe)
     assert r.returncode == 1
-    assert log.read_text().splitlines() == ["quota-router refresh", "quota-router throttle apply"]
+    assert log.read_text().splitlines() == STEPS
     assert "quota-router refresh failed (exit 3): boom" in r.stdout
     assert "quota-router: throttle line" in r.stdout
 
@@ -135,14 +140,22 @@ def test_cron_script_reports_a_failed_apply(tmp_path):
     r = _run_script(exe)
     assert r.returncode == 1
     assert "quota-router throttle apply failed (exit 4)" in r.stdout
+    assert "quota-router: stamp line" in r.stdout
+
+
+def test_cron_script_reports_a_failed_stamp(tmp_path):
+    exe, _log = _fake_hermes(tmp_path, stamp_rc=5)
+    r = _run_script(exe)
+    assert r.returncode == 1
+    assert "quota-router throttle stamp-resume failed (exit 5)" in r.stdout
 
 
 def test_cron_script_applies_even_when_refresh_hangs(tmp_path):
     exe, log = _fake_hermes(tmp_path)
-    exe.write_text(exe.read_text().replace('refresh) echo', 'refresh) sleep 5; echo'))
+    exe.write_text(exe.read_text().replace('refresh*) echo', 'refresh*) sleep 5; echo'))
     r = _run_script(exe, QR_STEP_TIMEOUT="1")
     assert r.returncode == 1
-    assert log.read_text().splitlines() == ["quota-router refresh", "quota-router throttle apply"]
+    assert log.read_text().splitlines() == STEPS
     assert "quota-router refresh failed (timed out after 1s)" in r.stdout
     assert "quota-router: throttle line" in r.stdout
 
@@ -151,5 +164,6 @@ def test_cron_script_reports_a_missing_binary_for_every_step(tmp_path):
     r = _run_script(tmp_path / "no-such-hermes")
     assert r.returncode == 1
     assert [l.split(" (")[0] for l in r.stdout.splitlines()] == [
-        "quota-router refresh failed", "quota-router throttle apply failed"]
+        "quota-router refresh failed", "quota-router throttle apply failed",
+        "quota-router throttle stamp-resume failed"]
     assert "Traceback" not in r.stderr

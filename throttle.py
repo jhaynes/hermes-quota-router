@@ -351,6 +351,242 @@ def _leaked_sessions(home: Path, profile: str, provider: str, since: float) -> O
         return None
 
 
+# ── resume stamping (opt-in ``throttle.stamp_resume``) ─────────────────────────
+#
+# Hermes' TUI/desktop gateway restores a stored session's model/provider on resume, and that restore
+# becomes a session pin which the per-turn config sync never moves. So a chat that was resumed keeps
+# the route it had, and a throttle flip never reaches it. Rows marked ``follow_profile_config`` (the
+# Bot Chat contract) resume onto the profile's current config instead, and keep later explicit picks
+# only until config moves again. Stamping that marker onto the throttled profiles' TUI/desktop rows
+# makes their next resume follow the router. Guards: rows already following config, rows with recorded
+# explicit-pick provenance, room plumbing/hidden rows, unparseable ``model_config`` and rows whose
+# stored route is not one the ladder configures (an explicit ``/model`` pick elsewhere) are left alone,
+# and nothing is written unless Hermes' own resume reader confirms the stamped row follows config.
+
+STAMP_KEY = "follow_profile_config"
+STAMP_SOURCES = ("tui", "desktop")
+STAMP_BUSY_TIMEOUT_S = 5.0
+STAMP_COUNTS = ("stamp", "already", "explicit_pick", "off_ladder", "plumbing", "unparseable", "no_model",
+                "contract")
+
+
+class StampRefused(Exception):
+    """Hermes core no longer honours the stamp as this plugin expects: stamp nothing."""
+
+
+def profile_state_db(home: Path, profile: str) -> Path:
+    return (Path(home) if profile == ROOT_PROFILE else Path(home) / "profiles" / profile) / "state.db"
+
+
+def ladder_routes(t: dict) -> list[tuple[str, str, str]]:
+    """``(raw provider, canonical provider, model)`` for every level's primary and fallback entries
+    (a ``main`` fallback is the level's own primary, already listed)."""
+    core = _core()
+    out = []
+    for rung in core.throttle_ladder(t):
+        for provider, model in core.level_chain(rung["spec"]):
+            raw, model = _norm_provider(provider), str(model or "").strip()
+            if raw and raw != "main" and model:
+                out.append((raw, core.canonical_provider(raw), model))
+    return list(dict.fromkeys(out))
+
+
+def route_matches(provider: Any, model: Any, routes: list[tuple[str, str, str]]) -> bool:
+    """Whether a stored ``(provider, model)`` is one of the ladder's routes. Providers compare as Hermes
+    routes them; a bare ``custom`` (how the agent names any custom entry) matches any non-tracked route
+    serving that model, and a row with no stored provider matches on the model alone."""
+    model = str(model or "").strip()
+    if not model:
+        return False
+    raw = _norm_provider(provider)
+    canon = _core().canonical_provider(raw) if raw else ""
+    tracked = ("anthropic", "openai-codex")
+    for r_raw, r_canon, r_model in routes:
+        if r_model != model:
+            continue
+        if not raw or canon == r_canon or raw == r_raw:
+            return True
+        if (raw == "custom" or canon == "custom") and r_canon not in tracked:
+            return True
+    return False
+
+
+def _row_model_config(row: dict) -> Optional[dict]:
+    raw = row.get("model_config")
+    if raw in (None, ""):
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except (TypeError, ValueError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def classify_stamp_row(row: dict, routes: list[tuple[str, str, str]]) -> str:
+    """``stamp`` for a row to mark, otherwise the reason it is left alone (``STAMP_COUNTS``)."""
+    mc = _row_model_config(row)
+    if mc is None:
+        return "unparseable"
+    if mc.get(STAMP_KEY) or str(row.get("title") or "").strip() == "Bot Chat":
+        return "already"   # Hermes already resumes these onto the profile config
+    if mc.get("room_plumbing") or row.get("hidden"):
+        return "plumbing"
+    if isinstance(mc.get("composer_override_profile"), dict):
+        return "explicit_pick"   # an explicit pick with provenance; Hermes drops it once config moves
+    model = str(row.get("model") or mc.get("model") or "").strip()
+    if not model:
+        return "no_model"
+    provider = mc.get("provider") or row.get("billing_provider")
+    return "stamp" if route_matches(provider, model, routes) else "off_ladder"
+
+
+def stamped_row(row: dict) -> dict:
+    out = dict(row)
+    out["model_config"] = json.dumps({**(_row_model_config(row) or {}), STAMP_KEY: True})
+    return out
+
+
+def hermes_stamp_contract() -> Callable[[dict], bool]:
+    """Hermes' own resume reader: a stamped row must count as profile-following and restore no stored
+    route. Importing the gateway module is the only way to ask it; raises ``StampRefused`` when the
+    reader is missing (an incompatible Hermes) so nothing is stamped blind. The import repoints
+    ``sys.stdout`` (its JSON-RPC guard) and the excepthooks; this CLI process gets them back."""
+    import threading
+    saved = sys.stdout, sys.excepthook, threading.excepthook
+    try:
+        from tui_gateway import server as gw
+        follows, overrides = gw._row_follows_profile, gw._stored_session_runtime_overrides
+    except Exception as exc:
+        raise StampRefused(f"Hermes resume reader unavailable ({type(exc).__name__}: {str(exc)[:120]})") from None
+    finally:
+        sys.stdout, sys.excepthook, threading.excepthook = saved
+
+    def check(row: dict) -> bool:
+        return bool(follows(row)) and overrides(row) == {}
+
+    probe = {"id": "quota-router-probe", "source": "tui", "title": "", "model": "probe-model",
+             "billing_provider": "anthropic", "model_config": json.dumps({STAMP_KEY: True})}
+    try:
+        ok = check(probe)
+    except Exception as exc:
+        raise StampRefused(f"Hermes resume reader failed ({type(exc).__name__}: {str(exc)[:120]})") from None
+    if not ok:
+        raise StampRefused(f"Hermes no longer resumes {STAMP_KEY} rows onto the profile config")
+    return check
+
+
+def _session_rows(con: sqlite3.Connection) -> list[dict]:
+    cols = {r[1] for r in con.execute("pragma table_info(sessions)")}
+    want = [c for c in ("id", "source", "title", "model", "billing_provider", "model_config", "hidden") if c in cols]
+    if not {"id", "source", "model", "model_config"} <= set(want):
+        raise sqlite3.OperationalError("sessions table lacks id/source/model/model_config")
+    marks = ",".join("?" * len(STAMP_SOURCES))
+    cur = con.execute(f"select {', '.join(want)} from sessions where source in ({marks})", STAMP_SOURCES)
+    return [dict(zip(want, r)) for r in cur.fetchall()]
+
+
+def stamp_db(db: Path, routes: list[tuple[str, str, str]], contract: Callable[[], Callable[[dict], bool]],
+             *, dry_run: bool) -> dict:
+    """Classify (and unless ``dry_run`` stamp) one profile's TUI/desktop rows. Candidates are re-read and
+    written in one ``BEGIN IMMEDIATE`` transaction, so no Hermes write lands between the guard and the
+    stamp; each UPDATE also compares the old ``model_config``. ``contract`` is called only when there
+    is something to stamp. Result: counts per ``STAMP_COUNTS`` plus ``error``."""
+    counts: dict[str, int] = dict.fromkeys(STAMP_COUNTS, 0)
+    if not db.exists():
+        return {**counts, "error": None, "missing": True}
+    con = sqlite3.connect(str(db), timeout=STAMP_BUSY_TIMEOUT_S, isolation_level=None)
+    try:
+        rows = _session_rows(con)   # unlocked pre-scan: load Hermes' reader outside the write lock
+        if not any(classify_stamp_row(r, routes) == "stamp" for r in rows):
+            for r in rows:
+                counts[classify_stamp_row(r, routes)] += 1
+            return {**counts, "error": None}
+        check = contract()
+        if not dry_run:
+            con.execute("BEGIN IMMEDIATE")
+        try:
+            for r in _session_rows(con) if not dry_run else rows:
+                kind = classify_stamp_row(r, routes)
+                if kind == "stamp":
+                    new = stamped_row(r)
+                    try:
+                        ok = check(new)
+                    except Exception:
+                        ok = False
+                    if not ok:
+                        kind = "contract"
+                    elif not dry_run:
+                        cur = con.execute("update sessions set model_config = ? where id = ? and model_config is ?",
+                                          (new["model_config"], r["id"], r["model_config"]))
+                        if cur.rowcount != 1:
+                            kind = "contract"
+                counts[kind] += 1
+            if not dry_run:
+                con.execute("COMMIT")
+        except BaseException:
+            if not dry_run and con.in_transaction:
+                con.execute("ROLLBACK")
+            raise
+        return {**counts, "error": None}
+    finally:
+        con.close()
+
+
+def run_stamp(home: Path, t: dict, *, dry_run: bool = False,
+              contract: Callable[[], Callable[[dict], bool]] = hermes_stamp_contract) -> dict:
+    """Stamp every throttled profile's ``state.db``. ``{"refused": msg|None, "profiles": {name: result}}``;
+    a refused contract stops the whole run before any write."""
+    routes = ladder_routes(t)
+    loaded: list = []
+
+    def once():
+        if not loaded:
+            loaded.append(contract())
+        return loaded[0]
+
+    out: dict = {"refused": None, "dry_run": dry_run, "profiles": {}}
+    for profile in [str(p) for p in t.get("profiles") or []]:
+        try:
+            out["profiles"][profile] = stamp_db(profile_state_db(home, profile), routes, once, dry_run=dry_run)
+        except StampRefused as exc:
+            out["refused"] = str(exc)
+            break
+        except sqlite3.Error as exc:
+            out["profiles"][profile] = {**dict.fromkeys(STAMP_COUNTS, 0),
+                                        "error": f"{type(exc).__name__}: {str(exc)[:160]}"}
+    return out
+
+
+def stamp_alerts(res: dict) -> list[str]:
+    """Deliverable lines: stamps made, a refused contract, per-profile failures."""
+    if res.get("refused"):
+        return [f"quota-router: resume stamp refused, nothing stamped: {res['refused']}"]
+    lines = []
+    for profile, r in res["profiles"].items():
+        if r.get("error"):
+            lines.append(f"quota-router: resume stamp for {profile} failed ({r['error']})")
+        elif r.get("stamp") and not res.get("dry_run"):
+            lines.append(f"quota-router: resume stamp marked {r['stamp']} {profile} session(s) to follow config")
+    return lines
+
+
+def render_stamp(res: dict) -> str:
+    head = "resume stamp (dry run): would mark" if res.get("dry_run") else "resume stamp: marked"
+    out = []
+    if res.get("refused"):
+        out.append(f"resume stamp refused, nothing stamped: {res['refused']}")
+    for profile, r in res["profiles"].items():
+        if r.get("missing"):
+            out.append(f"  {profile}: no state.db")
+            continue
+        if r.get("error"):
+            out.append(f"  {profile}: failed ({r['error']})")
+            continue
+        rest = ", ".join(f"{k.replace('_', ' ')} {r[k]}" for k in STAMP_COUNTS[1:] if r.get(k))
+        out.append(f"  {profile}: {head} {r.get('stamp', 0)}" + (f"; left alone: {rest}" if rest else ""))
+    return "\n".join(out) or "resume stamp: no throttled profiles"
+
+
 def throttle_status(state: dict, t: dict, home: Path, now: float) -> dict:
     """Selected level, reasons, per-provider state and per-profile results. The leak count, per gate
     provider, is the sessions a throttled profile started on that provider since it became

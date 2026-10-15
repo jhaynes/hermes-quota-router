@@ -431,8 +431,8 @@ def classify_stamp_row(row: dict, routes: list[tuple[str, str, str]]) -> str:
         return "already"   # Hermes already resumes these onto the profile config
     if mc.get("room_plumbing") or row.get("hidden"):
         return "plumbing"
-    if isinstance(mc.get("composer_override_profile"), dict):
-        return "explicit_pick"   # an explicit pick with provenance; Hermes drops it once config moves
+    if mc.get("composer_override_profile") is not None:
+        return "explicit_pick"   # an explicit pick with provenance (any present value; Hermes writes a dict)
     model = str(row.get("model") or mc.get("model") or "").strip()
     if not model:
         return "no_model"
@@ -581,10 +581,10 @@ def stamp_alerts(res: dict) -> list[str]:
 
 
 def render_stamp(res: dict) -> str:
+    if res.get("refused"):
+        return f"resume stamp refused, nothing stamped: {res['refused']}"
     head = "resume stamp (dry run): would mark" if res.get("dry_run") else "resume stamp: marked"
     out = []
-    if res.get("refused"):
-        out.append(f"resume stamp refused, nothing stamped: {res['refused']}")
     for profile, r in res["profiles"].items():
         if r.get("missing"):
             out.append(f"  {profile}: no state.db")

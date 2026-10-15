@@ -291,6 +291,23 @@ def test_alert_items_tag_failures_structurally(env):
         ("quota-router: resume stamp refused, nothing stamped: x", True)]
 
 
+def test_any_composer_override_profile_counts_as_an_explicit_pick(env):
+    """A present but non-dict ``composer_override_profile`` (corrupt) still means "picked": never stamp it."""
+    for value in ("anthropic/opus-x", ["opus-x"], 1, {}):
+        row = {"id": "x", "source": "tui", "model": "opus-x", "billing_provider": "anthropic",
+               "model_config": json.dumps({"composer_override_profile": value})}
+        assert env.thr.classify_stamp_row(row, env.thr.ladder_routes(env.t)) == "explicit_pick", value
+    row["model_config"] = json.dumps({"composer_override_profile": None})
+    assert env.thr.classify_stamp_row(row, env.thr.ladder_routes(env.t)) == "stamp"
+
+
+def test_render_refused_is_one_line_even_in_dry_run(env):
+    for dry in (False, True):
+        res = {"refused": "reader gone", "dry_run": dry,
+               "profiles": {"default": {**dict.fromkeys(env.thr.STAMP_COUNTS, 0), "error": None}}}
+        assert env.thr.render_stamp(res) == "resume stamp refused, nothing stamped: reader gone"
+
+
 def test_nothing_to_stamp_classifies_each_row_once(env, monkeypatch):
     db = env.home / "profiles" / "worker" / "state.db"
     make_db(db, [{"id": "s", "model": "gpt-elsewhere", "billing_provider": "openrouter"},

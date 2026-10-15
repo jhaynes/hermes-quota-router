@@ -222,6 +222,14 @@ def test_route_matching(env):
     assert not m("anthropic", "", routes)
 
 
+def test_route_matches_uses_the_watched_provider_list(env, monkeypatch):
+    """A bare ``custom`` row never matches a tracked (watched) provider's route; that list is core's."""
+    routes = [("acme", "acme", "m1")]
+    assert env.thr.route_matches("custom", "m1", routes)
+    monkeypatch.setattr(env.core, "WATCHED", ("anthropic", "openai-codex", "acme"))
+    assert not env.thr.route_matches("custom", "m1", routes)
+
+
 def test_cli_is_a_silent_no_op_unless_opted_in(env, monkeypatch, capsys):
     make_db(env.home / "profiles" / "worker" / "state.db", ROWS)
     before = (env.home / "profiles" / "worker" / "state.db").read_bytes()
@@ -234,6 +242,23 @@ def test_cli_is_a_silent_no_op_unless_opted_in(env, monkeypatch, capsys):
         out = capsys.readouterr().out
         assert out.startswith("resume stamp: off") and "quota-router:" not in out
     assert (env.home / "profiles" / "worker" / "state.db").read_bytes() == before
+
+
+def test_cli_without_a_throttle_block_is_off_even_in_dry_run(env, monkeypatch, capsys):
+    """No ``throttle`` block is an opt-out, not an invalid config: rc 0 with or without ``--dry-run``."""
+    monkeypatch.setattr(env.thr, "run_stamp", lambda *a, **k: pytest.fail("must not scan without a block"))
+    t = env.core.throttle_config({})
+    for dry in (False, True):
+        assert env.plugin._stamp_resume(SimpleNamespace(dry_run=dry, json=False), env.core, env.thr, t,
+                                        env.core.state_path(), NOW) == 0
+        assert capsys.readouterr().out == "resume stamp: off (no throttle block)\n"
+
+
+def test_cli_dry_run_still_errors_on_an_invalid_config(env, capsys):
+    t = env.core.throttle_config({"ladder": LADDER, "profiles": ["worker"], "stamp_resume": "yes"})
+    assert env.plugin._stamp_resume(SimpleNamespace(dry_run=True, json=False), env.core, env.thr, t,
+                                    env.core.state_path(), NOW) == 2
+    assert "throttle config invalid (throttle.stamp_resume must be a boolean)" in capsys.readouterr().out
 
 
 def test_cli_stamps_and_alerts_refusals_once(env, monkeypatch, capsys):

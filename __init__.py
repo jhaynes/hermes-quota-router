@@ -598,10 +598,14 @@ def _throttle_handler(args) -> int:
 
 def _stamp_resume(args, core, thr, t: dict, path, now: float) -> int:
     """``throttle stamp-resume``: a silent no-op unless the throttle is enabled with ``stamp_resume: true``
-    and a valid config (``--dry-run`` ignores the switches). Prints ``quota-router:`` lines for stamps
+    and a valid config (``--dry-run`` ignores the switches but not an invalid config; no ``throttle`` block
+    at all is an opt-out either way). Prints ``quota-router:`` lines for stamps
     made, and for a refusal or a per-profile failure once per distinct message (the cron repeats)."""
     dry = bool(args.dry_run)
-    errs = core.validate_throttle(t, _cfg()) if t.get("configured") else ["no throttle block"]
+    if not t.get("configured"):
+        print("resume stamp: off (no throttle block)")
+        return 0
+    errs = core.validate_throttle(t, _cfg())
     if not dry and (errs or not t.get("enabled") or t.get("stamp_resume") is not True):
         why = errs[0] if errs else "needs throttle.enabled and throttle.stamp_resume: true"
         print(f"resume stamp: off ({why})")

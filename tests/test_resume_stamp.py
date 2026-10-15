@@ -261,6 +261,48 @@ def test_cli_dry_run_still_errors_on_an_invalid_config(env, capsys):
     assert "throttle config invalid (throttle.stamp_resume must be a boolean)" in capsys.readouterr().out
 
 
+def test_cli_json_off_and_invalid_paths_print_one_qrstamp_line(env, monkeypatch, capsys):
+    """``--json`` keeps stdout machine-readable on every path, not only after a scan."""
+    monkeypatch.setattr(env.thr, "run_stamp", lambda *a, **k: pytest.fail("must not scan"))
+    cases = [
+        (env.core.throttle_config({}), False, 0, {"off": "no throttle block"}),
+        (env.core.throttle_config({"ladder": LADDER, "profiles": ["worker"], "enabled": False,
+                                   "stamp_resume": True}), False, 0,
+         {"off": "needs throttle.enabled and throttle.stamp_resume: true"}),
+        (env.core.throttle_config({"ladder": LADDER, "profiles": ["worker"], "stamp_resume": "yes"}), True, 2,
+         {"error": "throttle config invalid (throttle.stamp_resume must be a boolean)"}),
+    ]
+    for t, dry, rc, payload in cases:
+        assert env.plugin._stamp_resume(SimpleNamespace(dry_run=dry, json=True), env.core, env.thr, t,
+                                        env.core.state_path(), NOW) == rc
+        out = capsys.readouterr().out.splitlines()
+        assert len(out) == 1 and out[0].startswith("QRSTAMP ") and json.loads(out[0][8:]) == payload
+
+
+def test_alert_items_tag_failures_structurally(env):
+    """Dedupe keys off a structural flag, not the message prose."""
+    res = {"refused": None, "dry_run": False, "profiles": {
+        "a": {"stamp": 2, "error": None}, "b": {"stamp": 0, "error": "OperationalError: database is locked"}}}
+    assert env.thr.stamp_alert_items(res) == [
+        ("quota-router: resume stamp marked 2 a session(s) to follow config", False),
+        ("quota-router: resume stamp for b failed (OperationalError: database is locked)", True)]
+    assert env.thr.stamp_alerts(res) == [ln for ln, _ in env.thr.stamp_alert_items(res)]
+    assert env.thr.stamp_alert_items({"refused": "x", "profiles": {}}) == [
+        ("quota-router: resume stamp refused, nothing stamped: x", True)]
+
+
+def test_nothing_to_stamp_classifies_each_row_once(env, monkeypatch):
+    db = env.home / "profiles" / "worker" / "state.db"
+    make_db(db, [{"id": "s", "model": "gpt-elsewhere", "billing_provider": "openrouter"},
+                 {"id": "t", "model": "opus-x", "billing_provider": "anthropic",
+                  "model_config": json.dumps({"follow_profile_config": True})}])
+    calls = []
+    real = env.thr.classify_stamp_row
+    monkeypatch.setattr(env.thr, "classify_stamp_row", lambda r, routes: calls.append(r["id"]) or real(r, routes))
+    res = env.thr.run_stamp(env.home, env.t, contract=lambda: pytest.fail("nothing to stamp"))
+    assert res["profiles"]["worker"]["stamp"] == 0 and sorted(calls) == ["s", "t"]
+
+
 def test_cli_stamps_and_alerts_refusals_once(env, monkeypatch, capsys):
     make_db(env.home / "profiles" / "worker" / "state.db", ROWS)
     t = env.core.throttle_config({"ladder": LADDER, "profiles": ["worker"], "enabled": True, "stamp_resume": True})

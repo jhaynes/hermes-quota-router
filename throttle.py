@@ -499,9 +499,10 @@ def stamp_db(db: Path, routes: list[tuple[str, str, str]], contract: Callable[[]
     con = sqlite3.connect(str(db), timeout=STAMP_BUSY_TIMEOUT_S, isolation_level=None)
     try:
         rows = _session_rows(con)   # unlocked pre-scan: load Hermes' reader outside the write lock
-        if not any(classify_stamp_row(r, routes) == "stamp" for r in rows):
-            for r in rows:
-                counts[classify_stamp_row(r, routes)] += 1
+        kinds = [classify_stamp_row(r, routes) for r in rows]
+        if "stamp" not in kinds:
+            for kind in kinds:
+                counts[kind] += 1
             return {**counts, "error": None}
         check = contract()
         if not dry_run:
@@ -559,17 +560,24 @@ def run_stamp(home: Path, t: dict, *, dry_run: bool = False,
     return out
 
 
-def stamp_alerts(res: dict) -> list[str]:
-    """Deliverable lines: stamps made, a refused contract, per-profile failures."""
+def stamp_alert_items(res: dict) -> list[tuple[str, bool]]:
+    """Deliverable lines as ``(line, is_failure)``: stamps made (``False``), a refused contract and
+    per-profile failures (``True``; the CLI delivers each distinct failure once)."""
     if res.get("refused"):
-        return [f"quota-router: resume stamp refused, nothing stamped: {res['refused']}"]
-    lines = []
+        return [(f"quota-router: resume stamp refused, nothing stamped: {res['refused']}", True)]
+    items = []
     for profile, r in res["profiles"].items():
         if r.get("error"):
-            lines.append(f"quota-router: resume stamp for {profile} failed ({r['error']})")
+            items.append((f"quota-router: resume stamp for {profile} failed ({r['error']})", True))
         elif r.get("stamp") and not res.get("dry_run"):
-            lines.append(f"quota-router: resume stamp marked {r['stamp']} {profile} session(s) to follow config")
-    return lines
+            items.append((f"quota-router: resume stamp marked {r['stamp']} {profile} session(s) to follow config",
+                          False))
+    return items
+
+
+def stamp_alerts(res: dict) -> list[str]:
+    """Deliverable lines: stamps made, a refused contract, per-profile failures."""
+    return [ln for ln, _ in stamp_alert_items(res)]
 
 
 def render_stamp(res: dict) -> str:

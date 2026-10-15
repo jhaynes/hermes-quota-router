@@ -367,7 +367,7 @@ STAMP_KEY = "follow_profile_config"
 STAMP_SOURCES = ("tui", "desktop")
 STAMP_BUSY_TIMEOUT_S = 5.0
 STAMP_COUNTS = ("stamp", "already", "explicit_pick", "off_ladder", "plumbing", "unparseable", "no_model",
-                "contract")
+                "contract", "raced")
 
 
 class StampRefused(Exception):
@@ -454,6 +454,8 @@ def hermes_stamp_contract() -> Callable[[dict], bool]:
     import threading
     saved = sys.stdout, sys.excepthook, threading.excepthook
     try:
+        # Current Hermes defines these in ``tui_gateway.agent_factory`` but only ``server`` binds them to
+        # live globals (``method_ctx.bind_module``); older builds define them in ``server`` itself.
         from tui_gateway import server as gw
         follows, overrides = gw._row_follows_profile, gw._stored_session_runtime_overrides
     except Exception as exc:
@@ -519,7 +521,7 @@ def stamp_db(db: Path, routes: list[tuple[str, str, str]], contract: Callable[[]
                         cur = con.execute("update sessions set model_config = ? where id = ? and model_config is ?",
                                           (new["model_config"], r["id"], r["model_config"]))
                         if cur.rowcount != 1:
-                            kind = "contract"
+                            kind = "raced"   # the row changed under us; next run retries
                 counts[kind] += 1
             if not dry_run:
                 con.execute("COMMIT")

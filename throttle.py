@@ -400,7 +400,7 @@ def route_matches(provider: Any, model: Any, routes: list[tuple[str, str, str]])
         return False
     raw = _norm_provider(provider)
     canon = _core().canonical_provider(raw) if raw else ""
-    tracked = ("anthropic", "openai-codex")
+    tracked = _core().WATCHED
     for r_raw, r_canon, r_model in routes:
         if r_model != model:
             continue

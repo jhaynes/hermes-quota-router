@@ -166,6 +166,7 @@ plugins:
       throttle:
         enabled: false            # shadow mode (default): decide + log, never write
         prefer_short_windows: false # opt in to the window-aware preference above
+        stamp_resume: false       # opt in to "Resumed sessions" below
         profiles: [worker-a, worker-b]
         ladder:                   # highest preference first
           - name: codex
@@ -214,6 +215,33 @@ The legacy two-level form, unchanged:
 - Rollback: `throttle disable`, check `throttle status` shows every profile at the first level, then downgrade the plugin. Restoring a backup is the last resort.
 - Downgrading to 0.3.0 with a `levels:` config: 0.4.0 keeps every throttle field 0.3.0 reads exactly as 0.3.0 writes it. Those are `level`, `since`, `source`, `rule`, `decided_at`, `hold`, `disabled`, the stale-alert dedupe (`stale_alerted_for`), `log`, `applied` and `config_error`. So 0.3.0 carries on with the same level, dwell, hold and disable, and doesn't send a stale alert again. It ignores `throttle.providers`. When 0.4.0 runs again, it re-derives the protected provider's state from what 0.3.0 recorded.
 - Downgrading with a `ladder:` config preserves nothing useful. 0.3.0 doesn't know the `ladder` key, so it sees no `levels`, refuses to apply (`throttle.levels.fast needs provider and model`) and decides for `anthropic` only. A stored ladder level reads as `fast`, and a hold or disable naming a ladder level is taken literally. Switch the config back to `levels:` and clear any hold or disable first.
+
+### Resumed sessions (opt-in `stamp_resume`)
+
+A throttle flip rewrites profile configs, but a TUI/desktop chat that is **resumed** keeps the route it was saved with. Hermes restores the stored model/provider on resume, and that restore becomes a session pin the per-turn config sync never moves. So without help, a chat resumed after a flip stays on the old route (for example, on Claude after the router moved the profile off it).
+
+Hermes already resumes one kind of row onto the profile's current config: rows whose `model_config` carries `follow_profile_config: true` (the Bot Chat contract). `throttle.stamp_resume: true` makes the cron add that marker to the throttled profiles' TUI/desktop session rows, so their next resume follows the router. The cron script runs `hermes quota-router throttle stamp-resume` after `throttle apply`. It does nothing unless both `enabled` and `stamp_resume` are true. `--dry-run` reports what it would mark and writes nothing, whatever the switches; `--json` prints a `QRSTAMP` line.
+
+What gets marked, per throttled profile's `state.db` (the root profile's is `<root>/state.db`):
+
+- Only rows with `source` `tui` or `desktop`. Cron, kanban, messaging-gateway and subagent rows are never touched.
+- Only rows whose stored model/provider is a route the ladder configures (any level's primary or fallback). A bare `custom` provider (how the agent names any custom endpoint) matches a non-tracked ladder route serving the same model. A row on any other route is assumed to be an explicit `/model` pick and left alone.
+- Left alone too: rows already following config (marked, or titled `Bot Chat`), rows carrying `composer_override_profile` (an explicit pick Hermes recorded), room plumbing and hidden rows, rows with no model, and rows whose `model_config` isn't a JSON object. The rest of `model_config` (provider, `base_url`, reasoning config, ...) is kept.
+- Before the first write the plugin asks Hermes' own resume reader (`tui_gateway.server`) whether a marked row follows config and restores no stored route. It asks again for every row it marks. If the reader is missing or answers no, nothing is written anywhere and the cron delivers one `resume stamp refused` line. A row the reader rejects is left alone and counted under `contract`.
+- Candidates are re-read and written in one `BEGIN IMMEDIATE` transaction, and each update also compares the old `model_config`. So a concurrent Hermes write is never overwritten. A locked database (5 s busy timeout) fails that profile for this run; the other profiles still run, and the cron delivers the failure once until it changes.
+- Re-running is a no-op for rows already marked. Each run's counts are kept in the state file under `throttle.resume_stamp.last`.
+
+Caveats:
+
+- **This is a workaround.** The proper fix belongs in Hermes core: a resumed session should follow config changes unless someone explicitly picked its model. Once your Hermes does that, turn `stamp_resume` off; the marker is then redundant but harmless.
+- **It changes how marked chats treat explicit picks.** An explicit `/model` pick made in a marked chat survives a resume only until the profile config next changes. The next throttle flip drops it and the chat follows the new route.
+- **An earlier explicit pick of a ladder route can't be told apart from a resume pin.** Ordinary TUI chats don't record pick provenance, so a chat where you picked, say, the Claude rung by hand looks the same as one the router put there. It gets marked, and its next resume follows the profile config instead of your pick. Picks of routes outside the ladder are safe.
+- **Open chats are not moved.** A chat that is open now keeps its in-memory pin until it is next resumed. Use a session-scoped `/model` switch to move it immediately.
+- **There is a short race window.** If Hermes persists an open chat's runtime between reading its row and writing it back, that write can drop a mark made in between. The next cron run marks the row again, but a resume inside that gap still restores the stored route.
+- **Not every resume path reads the marker.** `hermes -r` (CLI resume) restores the stored route unconditionally, and messaging-gateway sessions are not marked.
+- **Only throttled profiles are marked.** Other profiles' chats are never touched, even if they share a route.
+- **There is no undo command.** Marked rows look like Hermes' own profile-following rows, and the plugin doesn't keep a list of the rows it marked. To undo it by hand, remove `follow_profile_config` from `model_config` for the rows concerned. Doing that to every row would also unmark rows Hermes marked itself.
+- **The first run marks almost everything.** It marks most of a profile's TUI/desktop history at once: most chats run on the configured route, which is a ladder route. Run `--dry-run` first.
 
 ## Auto-redeem banked Codex reset credits
 
@@ -272,7 +300,7 @@ hermes cron create "every 15m" --name "Quota router: usage refresh + alerts" --s
 
 ### Cron script and cadence
 
-`scripts/quota-router-refresh.py` runs `hermes quota-router refresh`, then `hermes quota-router throttle apply` (set `QR_HERMES_BIN` to use another binary). `throttle apply` runs even if `refresh` failed, timed out (`QR_STEP_TIMEOUT`, default 300 s per step) or could not start, so holds expire and the stale-data rules run. On a host without a `throttle` block it's a silent no-op; with `enabled: false` (shadow) it decides and logs only. Only `⚠️`/`quota-router:` lines reach stdout.
+`scripts/quota-router-refresh.py` runs `hermes quota-router refresh`, then `hermes quota-router throttle apply`, then `hermes quota-router throttle stamp-resume` (a no-op unless `stamp_resume: true`; see "Resumed sessions"). Set `QR_HERMES_BIN` to use another binary. Each step runs even if an earlier one failed. So `throttle apply` runs even if `refresh` failed, timed out (`QR_STEP_TIMEOUT`, default 300 s per step) or could not start, so holds expire and the stale-data rules run. On a host without a `throttle` block it's a silent no-op; with `enabled: false` (shadow) it decides and logs only. Only `⚠️`/`quota-router:` lines reach stdout.
 
 The refresh may run every 5 minutes (`hermes cron edit <id> --schedule "every 5m"`). Run shadow mode at 15 minutes first, then 5 minutes. A built-in backoff keeps a failing endpoint from being hammered: after 3 non-ok core fetches for a provider within an hour (from the `fetch_log` ring) with no success since, that provider is fetched at most every 15 minutes, with one `quota-router: <provider> usage fetch backing off to 15m (...)` alert per incident. The next success clears it.
 

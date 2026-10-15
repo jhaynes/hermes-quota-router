@@ -548,6 +548,11 @@ def _cli_setup(sub):
     a1.add_argument("level")
     a1.add_argument("--levels-json", required=True)
     a1.add_argument("--kanban", action="store_true")
+    sr = tsp.add_parser("stamp-resume", help="Mark throttled profiles' TUI/desktop chats to follow config on "
+                                            "resume (needs throttle.stamp_resume: true; cron path)")
+    sr.add_argument("--dry-run", action="store_true", help="Report what would be marked; write nothing "
+                                                           "(works with stamp_resume off)")
+    sr.add_argument("--json", action="store_true")
     e = sp.add_parser("export", help="Print one QRJSON line of history samples for downstream "
                                      "consumers (read-only; account windows only)")
     e.add_argument("--since", default=None, metavar="UNIX_TS",
@@ -565,6 +570,8 @@ def _throttle_handler(args) -> int:
         return 0
     t = _throttle_cfg()
     path = core.state_path()
+    if cmd == "stamp-resume":
+        return _stamp_resume(args, core, thr, t, path, now)
     if cmd == "status":
         s = thr.throttle_status(core.read_state(path), t, core.root_home(), now)
         print("QRTHROTTLE_STATUS " + json.dumps(s) if args.json else thr.render_throttle_status(s))
@@ -586,6 +593,37 @@ def _throttle_handler(args) -> int:
     # to deliver; only the cron path drains (README "Alert queue").
     for ln in thr.run_apply(path, _cfg(), t, thr.subprocess_runner, time.time(), drain=cmd == "apply"):
         print(ln)
+    return 0
+
+
+def _stamp_resume(args, core, thr, t: dict, path, now: float) -> int:
+    """``throttle stamp-resume``: a silent no-op unless the throttle is enabled with ``stamp_resume: true``
+    and a valid config (``--dry-run`` ignores the switches). Prints ``quota-router:`` lines for stamps
+    made, and for a refusal or a per-profile failure once per distinct message (the cron repeats)."""
+    dry = bool(args.dry_run)
+    errs = core.validate_throttle(t, _cfg()) if t.get("configured") else ["no throttle block"]
+    if not dry and (errs or not t.get("enabled") or t.get("stamp_resume") is not True):
+        why = errs[0] if errs else "needs throttle.enabled and throttle.stamp_resume: true"
+        print(f"resume stamp: off ({why})")
+        return 0
+    if dry and errs:
+        print(f"resume stamp: throttle config invalid ({errs[0]})")
+        return 2
+    res = thr.run_stamp(core.root_home(), t, dry_run=dry)
+    print("QRSTAMP " + json.dumps(res) if args.json else thr.render_stamp(res))
+    if dry:
+        return 0
+    lines = thr.stamp_alerts(res)
+    failures = [ln for ln in lines if " marked " not in ln]
+    with core.locked_state(path) as st:
+        rec = st.setdefault("throttle", {}).setdefault("resume_stamp", {})
+        seen = set(rec.get("alerted") or [])
+        rec["alerted"] = failures
+        rec["last"] = {"at": now, "refused": res["refused"],
+                       "stamped": {p: r.get("stamp", 0) for p, r in res["profiles"].items()}}
+    for ln in lines:
+        if ln not in failures or ln not in seen:
+            print(ln)
     return 0
 
 

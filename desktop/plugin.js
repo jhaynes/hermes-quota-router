@@ -275,6 +275,32 @@ function errorChipLabel(error, syncing) {
 	return `${msg}${hint} — click to sync now`;
 }
 
+/**
+ * Status-fetch retry schedule: roughly doubling, capped at 30s (~1 min of
+ * retries in total). Long enough to ride out a backend restart without
+ * flashing the red dot; short enough that a real outage still surfaces.
+ * Index = react-query's 0-based failure count, i.e. the Nth retry.
+ */
+const RETRY_DELAYS_MS = [2_000, 4_000, 8_000, 15_000, 30_000];
+
+/** Delay before retry `failureCount` (0-based); clamps to the table. */
+function retryDelayMs(failureCount) {
+	const i = Math.min(Math.max(0, Math.floor(Number(failureCount) || 0)), RETRY_DELAYS_MS.length - 1);
+	return RETRY_DELAYS_MS[i];
+}
+
+/** Whether to retry after `failureCount` (0-based) failures: once per table entry. */
+function shouldRetry(failureCount) {
+	return Number(failureCount) < RETRY_DELAYS_MS.length;
+}
+
+/** Grey loading-dot tooltip; says which retry is in flight once one has failed. */
+function loadingChipLabel(failureCount) {
+	const n = Math.floor(Number(failureCount) || 0);
+	if (n <= 0) return "Loading quota…";
+	return `Quota Router — retrying (${Math.min(n, RETRY_DELAYS_MS.length)} of ${RETRY_DELAYS_MS.length})…`;
+}
+
 // END PURE
 
 /** One CLI call, timeout-guarded. Returns the raw cli.exec result. */
@@ -331,7 +357,10 @@ function useStatus() {
 		queryFn: () => fetchStatus(["quota-router", "status", "--json"]),
 		refetchInterval: REFETCH_MS,
 		staleTime: STALE_MS,
-		retry: 1,
+		// Retries keep the last good payload on screen; only an exhausted
+		// schedule turns the chip into the red dot.
+		retry: (failureCount) => shouldRetry(failureCount),
+		retryDelay: (failureCount) => retryDelayMs(failureCount),
 	});
 }
 
@@ -465,7 +494,7 @@ function ChipTip({ payload }) {
 }
 
 function QuotaChip() {
-	const { data, isError, error } = useStatus();
+	const { data, isError, error, failureCount } = useStatus();
 	const refresh = useRefresh();
 	if (isError) {
 		// Click forces `status --refresh`; success lands in the query cache and
@@ -492,7 +521,7 @@ function QuotaChip() {
 		});
 	}
 	if (!data || !data.providers) {
-		return jsx(Tip, { label: "Loading quota…", children: jsx(StatusDot, { tone: "muted" }) });
+		return jsx(Tip, { label: loadingChipLabel(failureCount), children: jsx(StatusDot, { tone: "muted" }) });
 	}
 	const summary = chipSummary(data) || "no data";
 	const tone = toneForMode(data.mode);

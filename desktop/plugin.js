@@ -267,6 +267,14 @@ function cacheModel(payload) {
 	};
 }
 
+/** Tooltip for the red error chip: what failed, the fix hint if any, and that a click forces a sync. */
+function errorChipLabel(error, syncing) {
+	if (syncing) return "Quota Router — syncing…";
+	const msg = String(error?.message || "quota-router error");
+	const hint = error?.hint ? ` (fix: ${error.hint})` : "";
+	return `${msg}${hint} — click to sync now`;
+}
+
 // END PURE
 
 /** One CLI call, timeout-guarded. Returns the raw cli.exec result. */
@@ -458,10 +466,29 @@ function ChipTip({ payload }) {
 
 function QuotaChip() {
 	const { data, isError, error } = useStatus();
+	const refresh = useRefresh();
 	if (isError) {
+		// Click forces `status --refresh`; success lands in the query cache and
+		// clears the error. A failed sync keeps the dot red with ITS error.
+		const syncing = refresh.isPending;
 		return jsx(Tip, {
-			label: error?.message || "quota-router error",
-			children: jsx(StatusDot, { tone: "bad" }),
+			label: errorChipLabel(refresh.isError ? refresh.error : error, syncing),
+			children: jsx("button", {
+				type: "button",
+				"aria-label": "Quota Router error — sync now",
+				// aria-disabled, not disabled: a disabled button swallows the
+				// pointer events the tooltip needs to say "syncing…".
+				"aria-disabled": syncing,
+				className: cn(
+					"inline-flex h-full items-center px-1.5 transition-colors",
+					"hover:bg-(--chrome-action-hover)",
+					syncing && "cursor-wait",
+				),
+				onClick: () => {
+					if (!syncing) refresh.mutate();
+				},
+				children: syncing ? jsx(GlyphSpinner, {}) : jsx(StatusDot, { tone: "bad" }),
+			}),
 		});
 	}
 	if (!data || !data.providers) {

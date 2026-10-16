@@ -353,6 +353,9 @@ Once enabled it adds:
   if one exists (`· Fable 100%`). The dot tone follows the router's mode
   (normal/shift/internal). Hover for a full breakdown of every window, any
   active block, and fetch errors; click to open the Quota pane/route.
+  When the widget can't reach the backend, the chip is a red dot: hover for
+  the error, click to force a sync (`status --refresh`). It spins while
+  syncing and turns back into the summary on success.
 - **Quota pane** (right dock) and **`/quota` route** — one card per
   provider: tier badge, a bar per usage window with remaining % and reset
   countdown, a "Model limits" section for scoped windows, a block banner

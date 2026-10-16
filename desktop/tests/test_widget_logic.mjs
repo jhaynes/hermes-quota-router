@@ -26,7 +26,7 @@ function extractPureBlock(src) {
 
 function loadPure() {
 	const body = extractPureBlock(pluginSrc);
-	const exportsList = ["shortName", "remainingPct", "fmtReset", "parseQrjson", "chipSummary", "toneForMode"];
+	const exportsList = ["shortName", "remainingPct", "fmtReset", "parseQrjson", "chipSummary", "toneForMode", "errorChipLabel"];
 	const wrapped = `${body}\n({ ${exportsList.join(", ")} })`;
 	const context = { console };
 	vm.createContext(context);
@@ -270,4 +270,15 @@ test("hitTone / fmtHit / fmtTokens", () => {
 	assert.equal(cachePure.fmtTokens(12300), "12.3K");
 	assert.equal(cachePure.fmtTokens(19_000_000), "19.0M");
 	assert.equal(cachePure.fmtTokens(1_250_000_000), "1.25B");
+});
+
+test("errorChipLabel says what failed, the fix hint, and that a click syncs", () => {
+	const err = { message: "quota-router backend missing or outdated on this host", hint: "hermes plugins enable quota-router" };
+	const label = pure.errorChipLabel(err, false);
+	assert.match(label, /backend missing or outdated/);
+	assert.match(label, /hermes plugins enable quota-router/);
+	assert.match(label, /click to sync now$/);
+	assert.equal(pure.errorChipLabel({ message: "cli.exec timeout" }, false), "cli.exec timeout — click to sync now");
+	assert.equal(pure.errorChipLabel(null, false), "quota-router error — click to sync now");
+	assert.equal(pure.errorChipLabel(err, true), "Quota Router — syncing…");
 });

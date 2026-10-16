@@ -26,7 +26,7 @@ function extractPureBlock(src) {
 
 function loadPure() {
 	const body = extractPureBlock(pluginSrc);
-	const exportsList = ["shortName", "remainingPct", "fmtReset", "parseQrjson", "chipSummary", "toneForMode", "errorChipLabel"];
+	const exportsList = ["shortName", "remainingPct", "fmtReset", "parseQrjson", "chipSummary", "toneForMode", "errorChipLabel", "retryDelayMs", "shouldRetry", "loadingChipLabel"];
 	const wrapped = `${body}\n({ ${exportsList.join(", ")} })`;
 	const context = { console };
 	vm.createContext(context);
@@ -281,4 +281,39 @@ test("errorChipLabel says what failed, the fix hint, and that a click syncs", ()
 	assert.equal(pure.errorChipLabel({ message: "cli.exec timeout" }, false), "cli.exec timeout — click to sync now");
 	assert.equal(pure.errorChipLabel(null, false), "quota-router error — click to sync now");
 	assert.equal(pure.errorChipLabel(err, true), "Quota Router — syncing…");
+});
+
+// Drive the schedule the way @tanstack/query-core's retryer does: on each
+// failure it asks retry(n) / retryDelay(n) with n = failures so far minus one
+// (0 for the first retry), then increments n.
+function simulateRetries(retry, retryDelay) {
+	const delays = [];
+	for (let n = 0; n < 100; n++) {
+		if (!retry(n)) break;
+		delays.push(retryDelay(n));
+	}
+	return delays;
+}
+
+test("retry schedule backs off, grows, caps at 30s, and gives up in about a minute", () => {
+	const delays = simulateRetries(pure.shouldRetry, pure.retryDelayMs);
+	assert.ok(delays.length >= 3 && delays.length <= 8, `retry count ${delays.length}`);
+	for (let i = 1; i < delays.length; i++) assert.ok(delays[i] > delays[i - 1], `delay ${i} grows`);
+	assert.ok(delays[0] >= 1_000 && delays[0] <= 5_000, "first retry soon, not instant");
+	assert.ok(Math.max(...delays) <= 30_000, "capped at 30s");
+	const total = delays.reduce((a, b) => a + b, 0);
+	// Covers a backend restart (~6-10s observed), surfaces a real outage within ~2 min.
+	assert.ok(total >= 20_000 && total <= 120_000, `total backoff ${total}ms`);
+	// Out-of-range counts clamp instead of returning undefined.
+	assert.equal(pure.retryDelayMs(999), Math.max(...delays));
+	assert.equal(pure.retryDelayMs(-1), delays[0]);
+	assert.equal(pure.retryDelayMs(undefined), delays[0]);
+});
+
+test("loadingChipLabel shows plain loading, then which retry is in flight", () => {
+	const retries = simulateRetries(pure.shouldRetry, pure.retryDelayMs).length;
+	assert.equal(pure.loadingChipLabel(0), "Loading quota…");
+	assert.equal(pure.loadingChipLabel(undefined), "Loading quota…");
+	assert.equal(pure.loadingChipLabel(1), `Quota Router — retrying (1 of ${retries})…`);
+	assert.equal(pure.loadingChipLabel(retries + 3), `Quota Router — retrying (${retries} of ${retries})…`);
 });

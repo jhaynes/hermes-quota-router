@@ -263,13 +263,49 @@ def _redeem_codex_credit(credit_id: str):
         return "unavailable", f"{type(exc).__name__}: {str(exc)[:200]}"
 
 
+def _fetch_usage(provider: str):
+    """Keep the native fetch first; recover account quota hidden by model-only benches.
+
+    This compatibility fallback belongs to the plugin, not inference selection. Retire it
+    when Hermes' account-scoped quota resolver no longer excludes model-cooled rows.
+    Read persisted rows rather than load_pool(): loading may heal/persist OAuth grants.
+    Explicit read-only fetches never refresh a failed token or clear any pool status.
+    """
+    from agent.account_usage import fetch_account_usage
+
+    snap = fetch_account_usage(provider)
+    if snap is not None or provider != "openai-codex":
+        return snap
+    try:
+        from agent.credential_pool import PooledCredential
+        from hermes_cli.auth import read_credential_pool
+        from hermes_cli.auth_codex import _codex_pool_route_base_url
+
+        rows = read_credential_pool(provider)
+        for row in rows:
+            if not isinstance(row, dict) or row.get("last_status") not in (None, "ok"):
+                continue  # Never bypass a credential-wide auth/billing/quota bench.
+            entry = PooledCredential.from_dict(provider, row)
+            token = entry.runtime_api_key.strip()
+            if not token:
+                continue  # Borrowed metadata-only rows cannot be used without hydration.
+            snap = fetch_account_usage(provider, base_url=_codex_pool_route_base_url(entry.runtime_base_url),
+                                       api_key=token, read_only=True)
+            if snap is not None and not getattr(snap, "unavailable_reason", None):
+                return snap
+    except Exception:  # noqa: BLE001 -- optional compatibility path must retain native no_data
+        # Missing helpers on older Hermes or an unreadable pool retain native no_data.
+        # Do not log exceptions that may contain credential-bearing request details.
+        return None
+    return None
+
+
 def refresh(now: float | None = None, snapshots: dict | None = None, drain: bool = False,
             outcomes: dict | None = None, only: set | None = None) -> list[str]:
     core = _core()
     now = time.time() if now is None else now
     fetching_live = snapshots is None
     if snapshots is None:
-        from agent.account_usage import fetch_account_usage
         snapshots = {}
         outcomes = {}
         cfg0 = _cfg()
@@ -281,7 +317,7 @@ def refresh(now: float | None = None, snapshots: dict | None = None, drain: bool
             if not due[p]:
                 continue
             try:
-                snap = fetch_account_usage(p)
+                snap = _fetch_usage(p)
             except Exception as exc:
                 logger.warning("quota-router: usage fetch for %s failed: %s", p, exc)
                 outcomes[p] = (False, "fetch_error", f"{type(exc).__name__}: {exc}")

@@ -153,6 +153,27 @@ function fmtAgo(seconds) {
 	return `${Math.floor(s / 86400)}d ago`;
 }
 
+/** Newest provider snapshot time (epoch s), or null. The status payload has no
+ *  top-level fetched_at: each provider carries its own. */
+function newestFetchedAt(payload) {
+	const fetched = Object.values(payload?.providers || {})
+		.map((p) => p?.fetched_at)
+		.filter((x) => x != null && x !== "" && Number.isFinite(Number(x)))
+		.map(Number);
+	return fetched.length ? Math.max(...fetched) : null;
+}
+
+/** Right-pane footer: host, local HH:MM and age of the newest provider fetch. */
+function paneFooter(payload, nowMs) {
+	const newest = newestFetchedAt(payload);
+	const at = newest != null ? new Date(newest * 1000) : null;
+	const hhmm = at
+		? `${String(at.getHours()).padStart(2, "0")}:${String(at.getMinutes()).padStart(2, "0")}`
+		: "—";
+	const ageS = at ? Math.max(0, Math.round((nowMs - at.getTime()) / 1000)) : null;
+	return `${payload?.host || "?"} · fetched ${hhmm} · ${ageS == null ? "?" : ageS}s old · poll 120s`;
+}
+
 /** Structured model for the chip's hover card: one stacked section per
  *  provider, core windows first then model limits, every value toned. */
 function tipModel(payload, nowMs) {
@@ -186,10 +207,7 @@ function tipModel(payload, nowMs) {
 		});
 	}
 	const nowS = nowMs / 1000;
-	const fetched = Object.values(payload?.providers || {})
-		.map((p) => p?.fetched_at)
-		.filter((x) => Number.isFinite(Number(x)));
-	const newest = fetched.length ? Math.max(...fetched.map(Number)) : null;
+	const newest = newestFetchedAt(payload);
 	const footerParts = [payload?.host, newest != null ? `fetched ${fmtAgo(nowS - newest)}` : ""];
 	if (payload?.pending_count > 0) footerParts.push(`${payload.pending_count} alerts awaiting cron`);
 	return {
@@ -719,11 +737,6 @@ function QuotaView() {
 			}),
 		});
 	}
-	const fetchedAt = data.fetched_at ? new Date(data.fetched_at * 1000) : null;
-	const ageS = fetchedAt ? Math.max(0, Math.round((now - fetchedAt.getTime()) / 1000)) : null;
-	const hhmm = fetchedAt
-		? `${String(fetchedAt.getHours()).padStart(2, "0")}:${String(fetchedAt.getMinutes()).padStart(2, "0")}`
-		: "—";
 	return jsxs("div", {
 		className: "flex h-full flex-col gap-2 p-3",
 		children: [
@@ -748,7 +761,7 @@ function QuotaView() {
 				children: [
 					jsx("div", {
 						className: "text-[0.6875rem] text-(--ui-text-secondary)",
-						children: `${data.host || "?"} · fetched ${hhmm} · ${ageS == null ? "?" : ageS}s old · poll 120s`,
+						children: paneFooter(data, now),
 					}),
 					jsx(Button, {
 						onClick: () => refresh.mutate(),

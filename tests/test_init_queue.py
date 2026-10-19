@@ -230,3 +230,56 @@ def test_status_payload_json_line_round_trips_and_no_secrets(tmp_path, monkeypat
     parsed = json.loads(line[len("QRJSON "):])
     assert parsed["v"] == 1 and "anthropic" in parsed["providers"]
     assert "Bearer" not in line and "sk-ant-" not in line and "oat01" not in line
+
+
+def test_codex_refresh_reads_model_cooled_pool_credential_without_mutation(tmp_path, monkeypatch):
+    """A model entitlement bench must not hide account quota when the singleton is unusable."""
+    import copy
+
+    from agent import account_usage as au
+    from agent import credential_pool as cp
+    from hermes_cli import auth
+
+    plugin, core = _load_plugin(tmp_path, monkeypatch)
+    now = time.time()
+    row = {"id": "quota-row", "label": "quota", "auth_type": "oauth", "priority": 0, "source": "manual",
+           "access_token": "fixture-access", "refresh_token": "fixture-refresh", "last_status": "ok",
+           "base_url": "https://chatgpt.com/backend-api/codex",
+           "model_cooldowns": {"unrelated-model": now + 86400}, "request_count": 7}
+    rows = [row]
+    before = copy.deepcopy(rows)
+    pool = cp.CredentialPool("openai-codex", [cp.PooledCredential.from_dict("openai-codex", row)])
+    monkeypatch.setattr(cp, "load_pool", lambda provider: pool)
+    monkeypatch.setattr(auth, "read_credential_pool", lambda provider: rows)
+    monkeypatch.setattr(cp, "get_secret_str", lambda *args: "")
+    monkeypatch.setattr(plugin, "_cfg", core.DEFAULTS.copy)
+    monkeypatch.setattr(plugin, "_fetch_codex_reset_credits", dict)
+
+    def no_singleton(**kwargs):
+        raise au.AuthError("fixture singleton unavailable")
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("quota fallback must not refresh, persist, or clear cooldowns")
+
+    monkeypatch.setattr(au, "resolve_codex_runtime_credentials", no_singleton)
+    monkeypatch.setattr(pool, "_persist", forbidden)
+    monkeypatch.setattr(pool, "_refresh_entry", forbidden)
+    monkeypatch.setattr(pool, "_resync_stale_entry", lambda entry: entry)
+    calls = []
+
+    def get_json(url, headers, **kwargs):
+        calls.append((url, headers["Authorization"]))
+        return {"rate_limit": {"primary_window": {"used_percent": 23,
+                                                    "limit_window_seconds": 18000,
+                                                    "reset_at": int(now + 3600)}}}
+
+    monkeypatch.setattr(au, "_get_json", get_json)
+    # The real, unchanged Hermes selector excludes this row for model-less inference.
+    assert pool.select() is None
+    plugin.refresh(now=now, only={"openai-codex"})
+    state = core.read_state(core.state_path())["providers"]["openai-codex"]
+    assert state["fetch"]["core"]["error"] is None
+    assert state["snapshot"]["windows"][0]["used"] == 23
+    assert calls == [("https://chatgpt.com/backend-api/wham/usage", "Bearer fixture-access")]
+    assert rows == before
+    assert pool.entries()[0].to_dict() == cp.PooledCredential.from_dict("openai-codex", before[0]).to_dict()

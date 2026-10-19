@@ -190,6 +190,47 @@ test("tipModel surfaces block and fetch error, tolerates empty payload", () => {
 	assert.equal(empty.providers.length, 0);
 });
 
+// ---- pane footer (the payload has no top-level fetched_at; only providers do) ----
+
+const footerPure = (() => {
+	const body = extractPureBlock(pluginSrc);
+	const context = { console };
+	vm.createContext(context);
+	return vm.runInContext(`${body}\n({ paneFooter })`, context, { filename: "plugin-pure-footer.js" });
+})();
+
+function hhmmOf(epochS) {
+	const d = new Date(epochS * 1000);
+	return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+}
+
+test("paneFooter reports the newest provider fetch, not a missing top-level fetched_at", () => {
+	const payload = JSON.parse(JSON.stringify(statusV1));
+	delete payload.fetched_at; // the real status payload never carries it
+	const pids = Object.keys(payload.providers);
+	assert.ok(pids.length >= 2, "fixture has two providers");
+	const newest = payload.now - 75;
+	payload.providers[pids[0]].fetched_at = payload.now - 53 * 3600;
+	payload.providers[pids[1]].fetched_at = newest;
+	const footer = footerPure.paneFooter(payload, payload.now * 1000);
+	assert.equal(footer, `${payload.host} · fetched ${hhmmOf(newest)} · 75s old · poll 120s`);
+	assert.doesNotMatch(footer, /—|\?/);
+});
+
+test("paneFooter ignores non-finite provider timestamps and degrades without any", () => {
+	const payload = JSON.parse(JSON.stringify(statusV1));
+	const pids = Object.keys(payload.providers);
+	payload.providers[pids[0]].fetched_at = null;
+	payload.providers[pids[1]].fetched_at = payload.now - 5;
+	assert.match(footerPure.paneFooter(payload, payload.now * 1000), / · 5s old · /);
+	for (const pid of pids) payload.providers[pid].fetched_at = "garbage";
+	assert.equal(footerPure.paneFooter(payload, payload.now * 1000), `${payload.host} · fetched — · ?s old · poll 120s`);
+	// A future timestamp (clock skew) never renders a negative age.
+	payload.providers[pids[0]].fetched_at = payload.now + 30;
+	assert.match(footerPure.paneFooter(payload, payload.now * 1000), / · 0s old · /);
+	assert.equal(footerPure.paneFooter({ providers: {} }, Date.now()), "? · fetched — · ?s old · poll 120s");
+});
+
 // ---- cache efficiency (fixture = REAL `status --json --refresh` output of this branch) ----
 // Regenerate: scripts/make_widget_fixture.py <captured cli output> > fixtures/status_v1_cli_output.txt
 

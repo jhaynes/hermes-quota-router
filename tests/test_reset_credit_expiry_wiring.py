@@ -169,3 +169,46 @@ def test_a_peer_redemption_settled_during_our_get_blocks_our_claim(tmp_path, mon
     st = core.read_state(core.state_path())
     assert core.reset_credits_due(st, NOW + 4, core.DEFAULTS)
     assert not (st["auto_reset"].get("expiry") or {}).get("inflight")
+
+
+def _no_native_credential(monkeypatch, calls, error=RuntimeError):
+    """Native resolution fails the way a model-cooled pool makes it fail; explicit
+    (base, key) resolution behaves like Hermes: the key back, or a refreshed key on force."""
+    fake = sys.modules["agent.account_usage"]
+
+    def resolve(base_url, api_key, *, force_refresh=False):
+        calls.append(("resolve", api_key, force_refresh))
+        if not api_key:
+            raise error("No available openai-codex credential in credential pool")
+        return ("row-tok-2" if force_refresh else api_key), base_url, None
+    fake._resolve_codex_usage_credentials = resolve
+
+
+def test_reset_credit_list_falls_back_to_an_eligible_pool_row_and_heals_its_401(tmp_path, monkeypatch):
+    plugin, core = _load(tmp_path / ".hermes", monkeypatch)
+    calls = []
+    _fake_hermes(monkeypatch, 5.0, _handler(calls, first_401=True), calls)
+    _no_native_credential(monkeypatch, calls)
+    monkeypatch.setattr(plugin, "_codex_pool_credentials",
+                        lambda: iter([("https://chatgpt.com/backend-api/codex", "row-tok")]))
+    plugin.refresh(now=NOW)
+    gets = [c for c in calls if c[0] == "GET"]
+    assert [g[2] for g in gets] == ["Bearer row-tok", "Bearer row-tok-2"]
+    assert ("resolve", "row-tok", True) in calls
+    st = core.read_state(core.state_path())
+    assert st["providers"]["openai-codex"]["fetch"]["reset_credits"]["error"] is None
+    assert [c["id"] for c in st["providers"]["openai-codex"]["reset_credits"]["credits"]] == ["soon", "late"]
+
+
+def test_reset_credit_fallback_is_only_for_an_unavailable_credential(tmp_path, monkeypatch):
+    """A transient failure in native resolution must not switch to another pool account."""
+    plugin, core = _load(tmp_path / ".hermes", monkeypatch)
+    calls = []
+    _fake_hermes(monkeypatch, 5.0, _handler(calls), calls)
+    _no_native_credential(monkeypatch, calls, error=OSError)
+    monkeypatch.setattr(plugin, "_codex_pool_credentials",
+                        lambda: iter([("https://chatgpt.com/backend-api/codex", "row-tok")]))
+    plugin.refresh(now=NOW)
+    assert not [c for c in calls if c[0] in ("GET", "POST")]
+    err = core.read_state(core.state_path())["providers"]["openai-codex"]["fetch"]["reset_credits"]["error"]
+    assert err and "OSError" in err["message"]

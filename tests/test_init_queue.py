@@ -283,3 +283,63 @@ def test_codex_refresh_reads_model_cooled_pool_credential_without_mutation(tmp_p
     assert calls == [("https://chatgpt.com/backend-api/wham/usage", "Bearer fixture-access")]
     assert rows == before
     assert pool.entries()[0].to_dict() == cp.PooledCredential.from_dict("openai-codex", before[0]).to_dict()
+
+
+def test_codex_refresh_heals_a_rejected_model_cooled_pool_credential(tmp_path, monkeypatch):
+    """A server-side 401 on the only usable row must not leave quota stale until inference
+    happens to use that row: Hermes's own per-credential refresh repairs THAT row, once."""
+    from dataclasses import replace
+
+    from agent import account_usage as au
+    from agent import credential_pool as cp
+    from hermes_cli import auth
+
+    plugin, core = _load_plugin(tmp_path / ".hermes", monkeypatch)
+    now = time.time()
+    row = {"id": "quota-row", "label": "quota", "auth_type": "oauth", "priority": 0, "source": "manual",
+           "access_token": "fixture-access", "refresh_token": "fixture-refresh", "last_status": "ok",
+           "base_url": "https://chatgpt.com/backend-api/codex",
+           "model_cooldowns": {"unrelated-model": now + 86400}, "request_count": 7}
+    benched = dict(row, id="benched-row", access_token="fixture-benched", last_status="exhausted")
+    pool = cp.CredentialPool("openai-codex", [cp.PooledCredential.from_dict("openai-codex", r)
+                                              for r in (row, benched)])
+    monkeypatch.setattr(cp, "load_pool", lambda provider: pool)
+    monkeypatch.setattr(auth, "read_credential_pool", lambda provider: [row, benched])
+    monkeypatch.setattr(cp, "get_secret_str", lambda *args: "")
+    monkeypatch.setattr(plugin, "_cfg", core.DEFAULTS.copy)
+    monkeypatch.setattr(plugin, "_fetch_codex_reset_credits", dict)
+
+    def no_singleton(**kwargs):
+        raise au.AuthError("fixture singleton unavailable")
+
+    def no_singleton_tokens():
+        raise au.AuthError("fixture singleton store unavailable")
+
+    refreshed = []
+
+    def refresh_entry(entry, force=False):   # stands in for the OAuth token POST
+        refreshed.append((entry.id, force))
+        return replace(entry, access_token="fixture-refreshed")
+
+    monkeypatch.setattr(au, "resolve_codex_runtime_credentials", no_singleton)
+    monkeypatch.setattr(au, "_read_codex_tokens", no_singleton_tokens)
+    monkeypatch.setattr(pool, "_refresh_entry", refresh_entry)
+    monkeypatch.setattr(pool, "_resync_stale_entry", lambda entry: entry)
+    calls = []
+
+    def get_json(url, headers, **kwargs):
+        calls.append(headers["Authorization"])
+        if headers["Authorization"] != "Bearer fixture-refreshed":
+            import httpx
+            req = httpx.Request("GET", url)
+            raise httpx.HTTPStatusError("401", request=req, response=httpx.Response(401, request=req))
+        return {"rate_limit": {"primary_window": {"used_percent": 41, "limit_window_seconds": 604800,
+                                                  "reset_at": int(now + 3600)}}}
+
+    monkeypatch.setattr(au, "_get_json", get_json)
+    plugin.refresh(now=now, only={"openai-codex"})
+    state = core.read_state(core.state_path())["providers"]["openai-codex"]
+    assert state["fetch"]["core"]["error"] is None
+    assert state["snapshot"]["windows"][0]["used"] == 41
+    assert refreshed == [("quota-row", True)]          # only the eligible row, never the benched one
+    assert calls == ["Bearer fixture-access", "Bearer fixture-refreshed"]

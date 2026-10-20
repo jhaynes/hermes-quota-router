@@ -211,17 +211,51 @@ def _codex_api():
     return au if all(callable(getattr(au, n, None)) for n in _CODEX_HELPERS) else None
 
 
+def _codex_pool_credentials():
+    """Yield ``(base_url, token)`` for each persisted Codex pool row a model-less quota call may use.
+
+    Hermes' account-scoped resolver selects like model-less inference, so a row with ANY model
+    cooldown is skipped and quota calls find no credential. This is the plugin's compatibility
+    path around that; retire it when that resolver admits model-cooled rows. Rows are read from
+    disk rather than load_pool(), which can heal/persist grants just by loading. A credential-wide
+    auth/billing/quota bench is never bypassed, and metadata-only rows are skipped.
+    """
+    from agent.credential_pool import PooledCredential
+    from hermes_cli.auth import read_credential_pool
+    from hermes_cli.auth_codex import _codex_pool_route_base_url
+
+    for row in read_credential_pool("openai-codex"):
+        if not isinstance(row, dict) or row.get("last_status") not in (None, "ok"):
+            continue
+        entry = PooledCredential.from_dict("openai-codex", row)
+        token = entry.runtime_api_key.strip()
+        if token:
+            yield _codex_pool_route_base_url(entry.runtime_base_url), token
+
+
 def _codex_call(au, fn):
-    """Run ``fn(urls, headers)`` with Codex credentials, retrying once with refreshed ones on 401."""
+    """Run ``fn(urls, headers)`` with Codex credentials, retrying once with refreshed ones on 401.
+
+    When native resolution finds no credential (a RuntimeError, AuthError included), use the
+    first eligible pool row explicitly; Hermes then refreshes THAT row on 401. Other resolution
+    failures (network, refresh errors) propagate rather than switch to a different account.
+    """
     import httpx
-    token, base, account = au._resolve_codex_usage_credentials(None, None)
+    hint_base = hint_key = None
+    try:
+        token, base, account = au._resolve_codex_usage_credentials(None, None)
+    except RuntimeError:
+        hint_base, hint_key = next(iter(_codex_pool_credentials()), (None, None))
+        if not hint_key:
+            raise
+        token, base, account = au._resolve_codex_usage_credentials(hint_base, hint_key)
     for attempt in range(2):
         try:
             return fn(au._codex_backend_urls(base), au._codex_headers(token, account))
         except httpx.HTTPStatusError as exc:
             if exc.response.status_code != 401 or attempt:
                 raise
-            token, base, account = au._resolve_codex_usage_credentials(None, None, force_refresh=True)
+            token, base, account = au._resolve_codex_usage_credentials(hint_base, hint_key, force_refresh=True)
 
 
 def _fetch_codex_reset_credits() -> dict:
@@ -266,10 +300,10 @@ def _redeem_codex_credit(credit_id: str):
 def _fetch_usage(provider: str):
     """Keep the native fetch first; recover account quota hidden by model-only benches.
 
-    This compatibility fallback belongs to the plugin, not inference selection. Retire it
-    when Hermes' account-scoped quota resolver no longer excludes model-cooled rows.
-    Read persisted rows rather than load_pool(): loading may heal/persist OAuth grants.
-    Explicit read-only fetches never refresh a failed token or clear any pool status.
+    Rows come from ``_codex_pool_credentials`` (see there for scope and retirement). Each is
+    fetched as an explicit credential, the live-agent path: on a 401 Hermes force-refreshes
+    that same pool row, exactly as inference would. A read-only fetch could not, so a row the
+    server revoked before its expiry stayed stale until inference happened to use it.
     """
     from agent.account_usage import fetch_account_usage
 
@@ -277,20 +311,8 @@ def _fetch_usage(provider: str):
     if snap is not None or provider != "openai-codex":
         return snap
     try:
-        from agent.credential_pool import PooledCredential
-        from hermes_cli.auth import read_credential_pool
-        from hermes_cli.auth_codex import _codex_pool_route_base_url
-
-        rows = read_credential_pool(provider)
-        for row in rows:
-            if not isinstance(row, dict) or row.get("last_status") not in (None, "ok"):
-                continue  # Never bypass a credential-wide auth/billing/quota bench.
-            entry = PooledCredential.from_dict(provider, row)
-            token = entry.runtime_api_key.strip()
-            if not token:
-                continue  # Borrowed metadata-only rows cannot be used without hydration.
-            snap = fetch_account_usage(provider, base_url=_codex_pool_route_base_url(entry.runtime_base_url),
-                                       api_key=token, read_only=True)
+        for base_url, token in _codex_pool_credentials():
+            snap = fetch_account_usage(provider, base_url=base_url, api_key=token)
             if snap is not None and not getattr(snap, "unavailable_reason", None):
                 return snap
     except Exception:  # noqa: BLE001 -- optional compatibility path must retain native no_data

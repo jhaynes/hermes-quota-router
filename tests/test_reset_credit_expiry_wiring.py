@@ -212,3 +212,21 @@ def test_reset_credit_fallback_is_only_for_an_unavailable_credential(tmp_path, m
     assert not [c for c in calls if c[0] in ("GET", "POST")]
     err = core.read_state(core.state_path())["providers"]["openai-codex"]["fetch"]["reset_credits"]["error"]
     assert err and "OSError" in err["message"]
+
+
+def test_reset_credit_fallback_lookup_failure_keeps_the_original_resolution_error(tmp_path, monkeypatch):
+    """A broken pool read inside the fallback must not mask why native resolution failed."""
+    plugin, core = _load(tmp_path / ".hermes", monkeypatch)
+    calls = []
+    _fake_hermes(monkeypatch, 5.0, _handler(calls), calls)
+    _no_native_credential(monkeypatch, calls)
+
+    def broken_pool():
+        raise ValueError("malformed persisted row")
+        yield  # pragma: no cover - makes this a generator like the real helper
+
+    monkeypatch.setattr(plugin, "_codex_pool_credentials", broken_pool)
+    plugin.refresh(now=NOW)
+    assert not [c for c in calls if c[0] in ("GET", "POST")]
+    err = core.read_state(core.state_path())["providers"]["openai-codex"]["fetch"]["reset_credits"]["error"]
+    assert err and err["message"].startswith("RuntimeError: No available openai-codex credential")

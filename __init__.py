@@ -219,6 +219,10 @@ def _codex_pool_credentials():
     path around that; retire it when that resolver admits model-cooled rows. Rows are read from
     disk rather than load_pool(), which can heal/persist grants just by loading. A credential-wide
     auth/billing/quota bench is never bypassed, and metadata-only rows are skipped.
+
+    Callers fetch these rows as explicit credentials, so a 401 makes Hermes refresh the row,
+    as inference would; if that refresh fails, Hermes benches the row (visible, not silently
+    stale). Keep that consequence in mind when retiring this path.
     """
     from agent.credential_pool import PooledCredential
     from hermes_cli.auth import read_credential_pool
@@ -244,8 +248,11 @@ def _codex_call(au, fn):
     hint_base = hint_key = None
     try:
         token, base, account = au._resolve_codex_usage_credentials(None, None)
-    except RuntimeError:
-        hint_base, hint_key = next(iter(_codex_pool_credentials()), (None, None))
+    except RuntimeError as unavailable:
+        try:
+            hint_base, hint_key = next(iter(_codex_pool_credentials()), (None, None))
+        except Exception:  # noqa: BLE001 -- a broken pool read must not mask why resolution failed
+            raise unavailable from None
         if not hint_key:
             raise
         token, base, account = au._resolve_codex_usage_credentials(hint_base, hint_key)

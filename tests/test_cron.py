@@ -7,6 +7,8 @@ import sys
 import types
 from pathlib import Path
 
+import pytest
+
 _root = Path(__file__).resolve().parents[1]
 _spec = importlib.util.spec_from_file_location("qr_core_cron", _root / "core.py")
 core = importlib.util.module_from_spec(_spec)
@@ -167,3 +169,33 @@ def test_cron_script_reports_a_missing_binary_for_every_step(tmp_path):
         "quota-router refresh failed", "quota-router throttle apply failed",
         "quota-router throttle stamp-resume failed"]
     assert "Traceback" not in r.stderr
+
+
+# ── issue #16: a malformed QR_STEP_TIMEOUT must not abort the run with a traceback ──
+# Unset/empty keeps the 300 s default; a non-numeric or non-finite value (inf/-inf/nan,
+# which float() accepts) warns once and falls back to 300 s; every step still runs and
+# step-failure isolation is unchanged. Zero/negative stay "valid": steps fail fast, no
+# traceback (pre-existing behavior).
+@pytest.mark.parametrize("raw,why", [("abc", "not a number"), ("12x", "not a number"),
+                                     ("inf", "not finite"), ("-inf", "not finite"),
+                                     ("nan", "not finite"), ("1e400", "not finite")])
+def test_cron_script_falls_back_to_300_on_a_bad_step_timeout(tmp_path, raw, why):
+    exe, log = _fake_hermes(tmp_path)
+    r = _run_script(exe, QR_STEP_TIMEOUT=raw)
+    assert r.returncode == 0
+    assert log.read_text().splitlines() == STEPS
+    assert r.stdout.splitlines() == [
+        f"QR_STEP_TIMEOUT={raw!r} is {why}; using 300s",
+        "quota-router: refresh line", "quota-router: throttle line", "quota-router: stamp line"]
+
+
+def test_cron_script_keeps_a_valid_step_timeout_and_default(tmp_path):
+    exe, log = _fake_hermes(tmp_path)
+    r = _run_script(exe, QR_STEP_TIMEOUT="2.5")
+    assert r.returncode == 0
+    assert log.read_text().splitlines() == STEPS
+    assert r.stdout.splitlines() == ["quota-router: refresh line", "quota-router: throttle line",
+                                     "quota-router: stamp line"]   # no warning, no default noise
+    # unset QR_STEP_TIMEOUT also runs silently at the default
+    r = _run_script(exe)
+    assert r.returncode == 0 and "QR_STEP_TIMEOUT" not in r.stdout

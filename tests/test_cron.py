@@ -187,6 +187,7 @@ def test_cron_script_falls_back_to_300_on_a_bad_step_timeout(tmp_path, raw, why)
     assert r.stdout.splitlines() == [
         f"QR_STEP_TIMEOUT={raw!r} is {why}; using 300s",
         "quota-router: refresh line", "quota-router: throttle line", "quota-router: stamp line"]
+    assert "Traceback" not in r.stderr          # controlled fallback, never an abort
 
 
 def test_cron_script_keeps_a_valid_step_timeout_and_default(tmp_path):
@@ -199,3 +200,12 @@ def test_cron_script_keeps_a_valid_step_timeout_and_default(tmp_path):
     # unset QR_STEP_TIMEOUT also runs silently at the default
     r = _run_script(exe)
     assert r.returncode == 0 and "QR_STEP_TIMEOUT" not in r.stdout
+    # an empty value behaves like unset: silent 300 s default, all steps run (distinct from
+    # both the unset branch above and the warning branch of a malformed value)
+    sub = tmp_path / "empty-timeout"
+    sub.mkdir()
+    exe2, log2 = _fake_hermes(sub)
+    r = _run_script(exe2, QR_STEP_TIMEOUT="")
+    assert r.returncode == 0
+    assert log2.read_text().splitlines() == STEPS
+    assert "QR_STEP_TIMEOUT" not in r.stdout and "Traceback" not in r.stderr

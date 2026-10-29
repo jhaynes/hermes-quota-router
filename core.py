@@ -319,7 +319,11 @@ def prune_alerts(sent: dict, now: float) -> None:
 
 
 def _num(v: Any) -> bool:
-    return isinstance(v, (int, float)) and not isinstance(v, bool) and v == v
+    # Finite int/float (bool excluded). NaN failed via v == v; +/-inf must fail too so a
+    # malformed point never reaches export as invalid JSON ``Infinity`` (issue #38).
+    # Ints skip isfinite(): math.isfinite(10**400) raises OverflowError on huge ints.
+    return (isinstance(v, (int, float)) and not isinstance(v, bool)
+            and (isinstance(v, int) or math.isfinite(v)))
 
 
 def _valid_point(p: Any) -> bool:

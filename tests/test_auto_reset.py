@@ -4,6 +4,7 @@ The invariant under test: a banked reset restores the FULL 5h + weekly allowance
 dead 5h window alone must NEVER spend a credit — only weekly exhaustion justifies one.
 """
 import importlib.util
+import math
 from pathlib import Path
 
 _spec = importlib.util.spec_from_file_location("qr_core_auto", Path(__file__).resolve().parents[1] / "core.py")
@@ -194,6 +195,18 @@ def test_old_redeems_do_not_count_toward_cap():
     st["auto_reset"] = {"redeems": [NOW - 8 * 24 * 3600.0]}
     ok, _ = core.claim_auto_redeem(st, NOW, CFG)
     assert ok is True
+
+
+# issue #38 side effect on a shared _num caller: a non-finite redeem timestamp (possible from
+# json.loads("Infinity") on corrupted/hand-edited state) must age out immediately (0.0 =
+# ancient), not count against the weekly cap — pre-fix it compared as recent and blocked the
+# claim for a state no live refresh can produce.
+def test_non_finite_redeem_entries_do_not_block_the_weekly_cap():
+    for bad in (math.inf, -math.inf, float("nan")):
+        st = state(snap(100.0))
+        st["auto_reset"] = {"redeems": [bad]}
+        ok, why = core.claim_auto_redeem(st, NOW, CFG)
+        assert ok is True, (bad, why)
 
 
 def test_claim_reserves_cap_slot():

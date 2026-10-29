@@ -359,6 +359,7 @@ def test_num_rejects_non_finite_without_overflow(env):
     assert core._num(float("nan")) is False
     assert core._num(1) is True and core._num(1.5) is True and core._num(True) is False
     assert core._num(10**400) is True          # huge int: finite, must not OverflowError
+    assert core._num(-(10**400)) is True       # negative counterpart: same no-overflow contract
     assert core._num(None) is False and core._num("1") is False
 
 

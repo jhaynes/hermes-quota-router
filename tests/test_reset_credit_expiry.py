@@ -6,6 +6,7 @@ a count, so before this the plugin could not tell that a credit was about to lap
 exhaustion (the only redeem trigger, capped at one per week) may not recur before expiry.
 """
 import importlib.util
+import math
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -71,6 +72,23 @@ def test_parse_keeps_spendable_credits_soonest_expiring_first():
 def test_parse_rejects_a_payload_without_a_credit_list(bad):
     with pytest.raises(ValueError):
         core.parse_reset_credits(bad)
+
+
+# issue #38 side effect on a shared _num caller: a non-finite available_count (possible from
+# json.loads("Infinity") on a corrupted/hand-edited payload) must fail closed to None, never
+# reach the state/export slot as bare Infinity.
+@pytest.mark.parametrize("bad", [math.inf, -math.inf, float("nan")])
+def test_parse_maps_a_non_finite_available_count_to_none(bad):
+    got = core.parse_reset_credits(payload(credit("a", NOW + 5 * D), available_count=bad))
+    assert got["available_count"] is None
+    assert [c["id"] for c in got["credits"]] == ["a"]   # finite credit parsing unchanged
+
+
+@pytest.mark.parametrize("bad", [math.inf, -math.inf, float("nan")])
+def test_parse_maps_non_finite_credit_timestamps_to_none(bad):
+    got = core.parse_reset_credits(payload({"id": "a", "status": "available",
+                                            "expires_at": bad, "granted_at": bad}))
+    assert got["credits"] == [{"id": "a", "expires_at": None, "granted_at": None}]
 
 
 def test_credits_are_due_when_absent_old_or_marked_after_a_redeem():

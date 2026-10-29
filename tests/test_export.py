@@ -293,6 +293,75 @@ def test_snapshot_window_without_label_skipped(env):
         {"Current week", "Current session"}
 
 
+# ── regression (issue #38): non-finite points are skipped, never serialized ──────
+# _num rejected NaN via v == v but accepted +/-inf, so a point carrying inf reached the
+# payload and json.dumps emitted bare Infinity, which strict JSON parsers reject. A
+# corrupted/hand-edited state.json is the only way such a point exists; export must fail
+# closed by skipping it (same contract as the other malformed-point cases).
+INF = float("inf")
+
+
+def test_non_finite_ts_skipped(env):
+    core, _ = env
+    st = base_state()
+    st["history"] = {"anthropic": {"Current week": [
+        [INF, 40.0, None], [-INF, 41.0, None], [float("nan"), 42.0, None], [NOW, 43.0, None]]}}
+    payload = core.export_payload(st, -math.inf, HOST)
+    assert [(s["ts"], s["used_pct"]) for s in payload["samples"]] == [(NOW, 43.0)]
+
+
+@pytest.mark.parametrize("bad", [INF, -INF, float("nan")])
+def test_non_finite_used_pct_skipped(env, bad):
+    core, _ = env
+    st = base_state()
+    st["history"] = {"anthropic": {"Current week": [[1, bad, None]]}}
+    payload = core.export_payload(st, -math.inf, HOST)
+    assert payload["samples"] == []
+
+
+@pytest.mark.parametrize("bad", [INF, -INF, float("nan")])
+def test_non_finite_resets_at_skipped(env, bad):
+    core, _ = env
+    st = base_state()
+    st["history"] = {"anthropic": {"Current week": [[1, 40.0, bad]]}}
+    payload = core.export_payload(st, -math.inf, HOST)
+    assert payload["samples"] == []
+
+
+def test_non_finite_points_never_reach_export_json(env, capsys):
+    """Strict-parser + allow_nan=False assertion on the real CLI output (issue #38)."""
+    core, plugin = env
+    st = base_state()
+    st["history"] = {"anthropic": {"Current week": [
+        [INF, 40.0, None], [1, INF, None], [2, 41.0, -INF],
+        [3, float("nan"), None], [NOW, 42.0, None]]}}
+    write_state(core, st)                     # json.dumps writes Infinity/NaN tokens
+    assert run_cli(env, "export") == 0
+    out = capsys.readouterr().out
+    lines = out.splitlines()
+    assert len(lines) == 1 and lines[0].startswith("QRJSON ")
+    body = lines[0][len("QRJSON "):]
+    assert "Infinity" not in body and "NaN" not in body
+    # strict JSON: any Infinity/-Infinity/NaN token raises; Python's json.loads alone would
+    # silently accept them, so pass parse_constant as a hard tripwire.
+    def _reject(tok):
+        raise ValueError(f"non-JSON-standard constant {tok}")
+    payload = json.loads(body, parse_constant=_reject)
+    assert [(s["ts"], s["used_pct"], s["resets_at"]) for s in payload["samples"]] == \
+        [(NOW, 42.0, None)]
+    json.dumps(payload, allow_nan=False)      # serialization assertion: finite re-encodable
+
+
+def test_num_rejects_non_finite_without_overflow(env):
+    core, _ = env
+    assert core._num(float("inf")) is False
+    assert core._num(-INF) is False
+    assert core._num(float("nan")) is False
+    assert core._num(1) is True and core._num(1.5) is True and core._num(True) is False
+    assert core._num(10**400) is True          # huge int: finite, must not OverflowError
+    assert core._num(None) is False and core._num("1") is False
+
+
 # ── public entry point: export_line(since=...) is the single QRJSON builder ───────
 def test_export_line_public_entry_point(env, capsys):
     core, plugin = env
